@@ -122,11 +122,14 @@ class MigrationOrchestrator:
         # ---- 3. apply structural DDL -----------------------------------------
         schemas = sorted({name.split(".")[0] for t in schema.tables for name in (t.name,)})
 
-        # Optional destructive reset: drop the target schemas we are about to
-        # migrate into so a previous run does not collide. The user opts in.
+        # Optional destructive reset: drop the target objects we are about to
+        # recreate so a previous run does not collide. The user opts in.
         if self.reset_target and schemas:
-            for s in schemas:
-                self.target.execute(f"DROP SCHEMA IF EXISTS {self.target.quote_ident(s)} CASCADE")
+            if self.target.dialect == "postgres":
+                for s in schemas:
+                    self.target.execute(f"DROP SCHEMA IF EXISTS {self.target.quote_ident(s)} CASCADE")
+            else:
+                self._reset_tsql_target(schemas)
 
         for s in schemas:
             if self.target.dialect == "postgres":
@@ -187,6 +190,52 @@ class MigrationOrchestrator:
         return report
 
     # ------------------------------------------------------------------
+    def _reset_tsql_target(self, schemas: list[str]) -> None:
+        """Drop user objects in the given T-SQL schemas so a re-run is clean.
+
+        `dbo` (and other owner schemas) cannot themselves be dropped, so the
+        objects inside them are removed instead: foreign keys first, then
+        tables, then views / functions / procedures / triggers.
+        """
+        in_list = ", ".join(f"N'{s.replace(chr(39), chr(39) + chr(39))}'" for s in schemas)
+
+        fks = self.target.fetch(
+            f"""
+            SELECT QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name),
+                   QUOTENAME(fk.name)
+            FROM sys.foreign_keys fk
+            JOIN sys.tables t ON t.object_id = fk.parent_object_id
+            WHERE SCHEMA_NAME(t.schema_id) IN ({in_list})
+            """
+        )
+        for parent_table, fk_name in fks:
+            self.target.execute(f"ALTER TABLE {parent_table} DROP CONSTRAINT {fk_name}")
+
+        while True:
+            rows = self.target.fetch(
+                f"""
+                SELECT TOP (1) QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)
+                FROM sys.tables t
+                WHERE SCHEMA_NAME(t.schema_id) IN ({in_list})
+                """
+            )
+            if not rows:
+                break
+            self.target.execute(f"DROP TABLE {rows[0][0]}")
+
+        for type_code, kind in (("'V'", "view"), ("'P'", "procedure"),
+                                ("'FN','IF','TF'", "function"), ("'TR'", "trigger")):
+            rows = self.target.fetch(
+                f"""
+                SELECT QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name)
+                FROM sys.objects o
+                WHERE o.type IN ({type_code})
+                    AND SCHEMA_NAME(o.schema_id) IN ({in_list})
+                """
+            )
+            for (obj_name,) in rows:
+                self.target.execute(f"DROP {kind.upper()} {obj_name}")
+
     def _apply_table(self, report: MigrationReport, schema, table) -> None:
         from engine.translators.sql_builder import build_table_ddl
         stmts, warnings = build_table_ddl(table, self.target.dialect, schema.dialect)

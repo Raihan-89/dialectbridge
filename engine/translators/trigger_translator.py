@@ -267,10 +267,10 @@ def _plpgsql_trigger_to_tsql(trigger: Trigger) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
     definition = trigger.definition
 
-    m = re.search(r"\$\$\s*(?:BEGIN\s+)?(.*?)\s*RETURN\s+\w+;\s*END\s*;\s*\$\$", definition, re.IGNORECASE | re.DOTALL)
+    m = re.search(r"\$[A-Za-z_0-9]*\$\s*(?:BEGIN\s+)?(.*?)\s*RETURN\s+\w+;\s*END\s*;\s*\$[A-Za-z_0-9]*\$", definition, re.IGNORECASE | re.DOTALL)
     body = m.group(1) if m else None
     if body is None:
-        m2 = re.search(r"\$\$(.*?)\$\$", definition, re.IGNORECASE | re.DOTALL)
+        m2 = re.search(r"\$[A-Za-z_0-9]*\$(.*?)\$[A-Za-z_0-9]*\$", definition, re.IGNORECASE | re.DOTALL)
         body = m2.group(1) if m2 else None
     if body is None:
         return None, ["Could not extract trigger function body"]

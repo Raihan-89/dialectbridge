@@ -419,6 +419,16 @@ def _qualify_table_refs(text: str, table_names: list[str], target: str) -> str:
     those identifiers are already quoted.
     """
     for tname in sorted(table_names, key=len, reverse=True):
+        if "." in tname:
+            # schema.table refs (e.g. `dbo.Orders` from a T-SQL trigger/view
+            # body) must be quoted in full, or PostgreSQL lowercases the parts.
+            text = re.sub(
+                rf"(?<![\w\"\[]){re.escape(tname)}(?![\w.])",
+                _qident(tname, target),
+                text,
+                flags=re.IGNORECASE,
+            )
+    for tname in sorted(table_names, key=len, reverse=True):
         bare = tname.split(".")[-1]
         qualified = _qident(tname, target)
         text = re.sub(

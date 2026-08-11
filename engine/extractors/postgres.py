@@ -116,6 +116,7 @@ FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
     AND p.prokind IN ('f', 'w')
+    AND p.prorettype NOT IN (SELECT oid FROM pg_type WHERE typname IN ('trigger', 'event_trigger'))
 ORDER BY n.nspname, p.proname
 """
 
@@ -132,7 +133,8 @@ _TRIGGERS_SQL = """
 SELECT
     t.tgname,
     n.nspname || '.' || c.relname AS table_name,
-    pg_get_triggerdef(t.oid, true)
+    pg_get_triggerdef(t.oid, true),
+    COALESCE(pg_get_functiondef(t.tgfoid), '')
 FROM pg_trigger t
 JOIN pg_class c ON c.oid = t.tgrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -184,7 +186,7 @@ def extract_schema(conn) -> Database:
             table=row[1],
             timing=_trigger_timing(row[2]),
             events=_trigger_events(row[2]),
-            definition=row[2],
+            definition=row[2] + ("\n\n" + row[3] if row[3] else ""),
         )
         for row in conn.fetch(_TRIGGERS_SQL)
     ]

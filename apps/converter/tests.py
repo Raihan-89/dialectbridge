@@ -2,9 +2,12 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework import status
 
+from engine.schema import Column, Database, Table, Trigger
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from engine.translators.ddl_translator import convert_ddl
 from engine.translators.procedure_translator import translate_routine
+from engine.translators.sql_builder import build_database_ddl
+from engine.translators.trigger_translator import translate_trigger
 from .models import ConversionJob
 
 
@@ -132,6 +135,68 @@ $function$
         self.assertIn("CREATE FUNCTION [dbo].[add_one] (@x INT)", converted)
         self.assertIn("RETURNS INT", converted)
         self.assertIn("RETURN @x + 1;", converted)
+
+
+class TriggerTranslationTests(TestCase):
+    def test_tsql_trigger_to_plpgsql_qualifies_tables(self):
+        db = Database(name="sample", dialect="tsql")
+        db.tables = [
+            Table(name="dbo.Orders", columns=[Column("OrderID", "INT")]),
+            Table(name="dbo.OrderAudit", columns=[Column("OrderID", "INT"), Column("LoggedAt", "DATETIME2")]),
+        ]
+        db.triggers = [
+            Trigger(
+                name="trg_OrderAudit",
+                table="dbo.Orders",
+                timing="AFTER",
+                events=["INSERT"],
+                definition=(
+                    "CREATE TRIGGER trg_OrderAudit\nON dbo.Orders\nAFTER INSERT\nAS\nBEGIN\n"
+                    "    SET NOCOUNT ON;\n"
+                    "    INSERT INTO dbo.OrderAudit (OrderID, LoggedAt)\n"
+                    "    SELECT OrderID, GETDATE() FROM inserted;\nEND"
+                ),
+            )
+        ]
+        ddl, warnings = build_database_ddl(db, "postgres")
+        trigger_sql = next(s for s in ddl if "TRIGGER trg_OrderAudit" in s)
+        self.assertEqual(warnings, [])
+        self.assertIn('ON "dbo"."Orders" FOR EACH ROW', trigger_sql)
+        self.assertIn('INSERT INTO "dbo"."OrderAudit"', trigger_sql)
+        self.assertIn("VALUES(NEW.\"OrderID\"", trigger_sql)
+        self.assertIn("CURRENT_TIMESTAMP", trigger_sql)
+        self.assertIn("CREATE OR REPLACE FUNCTION trg_OrderAudit_fn()", trigger_sql)
+
+    def test_plpgsql_trigger_to_tsql_with_function_dollar_quote(self):
+        pg_trigger = Trigger(
+            name="trg_orderaudit",
+            table="dbo.Orders",
+            timing="AFTER",
+            events=["INSERT"],
+            definition=(
+                'CREATE TRIGGER trg_orderaudit AFTER INSERT ON dbo."Orders" '
+                'FOR EACH ROW EXECUTE FUNCTION dbo.trg_orderaudit_fn()\n\n'
+                "CREATE OR REPLACE FUNCTION dbo.trg_orderaudit_fn()\n"
+                " RETURNS trigger\n"
+                " LANGUAGE plpgsql\n"
+                "AS $function$\n"
+                "BEGIN\n"
+                '    INSERT INTO "dbo"."OrderAudit" ("OrderID", "LoggedAt") '
+                'VALUES(NEW."OrderID", CURRENT_TIMESTAMP);\n'
+                "    RETURN NEW;\n"
+                "END;\n"
+                "$function$\n"
+            ),
+        )
+        converted, warnings = translate_trigger(pg_trigger, "tsql")
+        self.assertTrue(converted, warnings)
+        self.assertEqual(warnings, [])
+        self.assertIn("CREATE TRIGGER trg_orderaudit", converted)
+        self.assertIn("ON dbo.Orders", converted)
+        self.assertIn("AFTER INSERT", converted)
+        self.assertIn("FROM inserted", converted)
+        self.assertIn("GETDATE()", converted)
+        self.assertNotIn("NEW.", converted)
 
 
 class ConvertAPITests(TestCase):
