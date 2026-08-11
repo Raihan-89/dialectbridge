@@ -1,0 +1,67 @@
+{% extends "converter/base.html" %}
+{% block title %}Database Connections{% endblock %}
+
+{% block content %}
+<h2>Database Connections</h2>
+<p>Saved live connections used by the migration engine. Passwords are stored obfuscated and never displayed.</p>
+
+{% if messages %}
+    {% for message in messages %}
+        <div class="{{ message.tags }}">{{ message }}</div>
+    {% endfor %}
+{% endif %}
+
+<h3>Add Connection</h3>
+<form method="post" style="display: grid; gap: 8px; max-width: 520px;">
+    {% csrf_token %}
+    <label>Name <input type="text" name="name" required></label>
+    <label>Engine
+        <select name="engine" required>
+            {% for value, label in engine_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+    </label>
+    <label>Role
+        <select name="role">
+            {% for value, label in role_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+    </label>
+    <label>Host <input type="text" name="host" required placeholder="127.0.0.1"></label>
+    <label>Port <input type="number" name="port" placeholder="0 = driver default (1433/5432)"></label>
+    <label>Database <input type="text" name="database" required></label>
+    <label>Username <input type="text" name="username" required></label>
+    <label>Password <input type="password" name="password"></label>
+    <input type="hidden" name="action" value="create">
+    <button type="submit">Save Connection</button>
+</form>
+
+<h3>Saved Connections</h3>
+{% if connections %}
+<table>
+    <tr><th>Name</th><th>Engine</th><th>Role</th><th>Host</th><th>Database</th><th>Actions</th></tr>
+    {% for conn in connections %}
+    <tr>
+        <td>{{ conn.name }}</td>
+        <td>{{ conn.get_engine_display }}</td>
+        <td>{{ conn.get_role_display }}</td>
+        <td>{{ conn.host }}:{{ conn.effective_port }}</td>
+        <td>{{ conn.database }}</td>
+        <td>
+            <form method="post" style="display: inline;">{% csrf_token %}
+                <input type="hidden" name="action" value="test">
+                <input type="hidden" name="connection_id" value="{{ conn.pk }}">
+                <button type="submit">Test</button>
+            </form>
+            <form method="post" style="display: inline;" onsubmit="return confirm('Delete {{ conn.name }}?');">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="delete">
+                <input type="hidden" name="connection_id" value="{{ conn.pk }}">
+                <button type="submit" style="background:#b91c1c;">Delete</button>
+            </form>
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+{% else %}
+<p>No connections yet — add one above.</p>
+{% endif %}
+{% endblock %}

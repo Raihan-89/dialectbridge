@@ -1,5 +1,113 @@
 from django.conf import settings
+from django.core import signing
 from django.db import models
+
+
+class DatabaseConnection(models.Model):
+    """
+    A saved live database connection (source or target) used by the
+    migration engine. Passwords are stored obfuscated with Django's signing
+    machinery (keyed on SECRET_KEY) rather than in plain text.
+    """
+
+    class Engine(models.TextChoices):
+        MSSQL = "mssql", "SQL Server (MSSQL)"
+        POSTGRES = "postgres", "PostgreSQL"
+
+    class Role(models.TextChoices):
+        SOURCE = "source", "Source"
+        TARGET = "target", "Target"
+
+    name = models.CharField(max_length=100)
+    engine = models.CharField(max_length=16, choices=Engine.choices)
+    role = models.CharField(max_length=16, choices=Role.choices, default=Role.SOURCE)
+    host = models.CharField(max_length=255)
+    port = models.PositiveIntegerField(default=0, help_text="Leave 0 to use the driver default.")
+    database = models.CharField(max_length=255)
+    username = models.CharField(max_length=100)
+    password = models.CharField(max_length=512, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="database_connections",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["name", "created_by"], name="uniq_connection_name_per_user"),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.engine} → {self.host}:{self.port}/{self.database})"
+
+    def effective_port(self) -> int:
+        return self.port or (1433 if self.engine == self.Engine.MSSQL else 5432)
+
+    def get_password(self) -> str:
+        if not self.password:
+            return ""
+        try:
+            return signing.loads(self.password)
+        except signing.BadSignature:
+            return ""
+
+    def set_password(self, raw: str) -> None:
+        self.password = signing.dumps(raw)
+
+
+class MigrationJob(models.Model):
+    """
+    A single end-to-end database migration run between two saved connections.
+    Holds the full per-object report so results can be inspected later.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+        PARTIAL = "partial", "Completed with errors"
+
+    name = models.CharField(max_length=200, blank=True)
+    source = models.ForeignKey(
+        DatabaseConnection, on_delete=models.CASCADE, related_name="source_migrations"
+    )
+    target = models.ForeignKey(
+        DatabaseConnection, on_delete=models.CASCADE, related_name="target_migrations"
+    )
+    copy_data = models.BooleanField(default=True, help_text="Copy table data, not just schema.")
+    reset_target = models.BooleanField(
+        default=False,
+        help_text="Drop target schemas being migrated into before running (destructive to prior runs).",
+    )
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    report = models.JSONField(default=dict, blank=True)
+    warnings = models.JSONField(default=list, blank=True)
+    error_message = models.TextField(blank=True)
+
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="migration_jobs",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.name or 'Migration'} {self.source} → {self.target} [{self.status}]"
 
 
 class ConversionJob(models.Model):

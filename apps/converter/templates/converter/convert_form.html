@@ -13,6 +13,18 @@
     </select>
     <br><br>
 
+    <label for="statement_type">Statement type</label><br>
+    <select name="statement_type" id="statement_type">
+        {% for value, label in statement_type_choices %}
+            {% if value in supported_statement_types %}
+                <option value="{{ value }}" {% if statement_type == value %}selected{% endif %}>{{ label }}</option>
+            {% else %}
+                <option value="{{ value }}" disabled title="Translator coming soon">{{ label }} (coming soon)</option>
+            {% endif %}
+        {% endfor %}
+    </select>
+    <br><br>
+
     <label for="source_sql">Source SQL</label><br>
     <textarea name="source_sql" id="source_sql" rows="10">{{ source_sql|default:"" }}</textarea>
     <br><br>
@@ -20,10 +32,17 @@
     <button type="submit">Convert</button>
 </form>
 
+<details style="margin-top: 8px;">
+    <summary>Load a sample</summary>
+    <button type="button" data-sample="ddl">Sample DDL (T-SQL)</button>
+    <button type="button" data-sample="dml">Sample DML (T-SQL)</button>
+</details>
+
 {% if job %}
     <h2>Result</h2>
     {% if job.succeeded %}
-        <pre>{{ job.converted_sql }}</pre>
+        <button type="button" id="copy-result">Copy</button>
+        <pre id="result">{{ job.converted_sql }}</pre>
         {% if job.warnings %}
             <h3>Warnings</h3>
             {% for w in job.warnings %}
@@ -34,4 +53,43 @@
         <div class="error">Conversion failed: {{ job.error_message }}</div>
     {% endif %}
 {% endif %}
+
+<script>
+const samples = {
+    ddl: `CREATE TABLE Departments (
+    DepartmentID INT IDENTITY(1,1) PRIMARY KEY,
+    DepartmentName NVARCHAR(100) NOT NULL
+);
+CREATE TABLE Employees (
+    EmployeeID INT IDENTITY(1,1) PRIMARY KEY,
+    FirstName NVARCHAR(50) NOT NULL,
+    Salary MONEY,
+    IsActive BIT DEFAULT 1,
+    EmployeeGuid UNIQUEIDENTIFIER DEFAULT NEWID(),
+    DepartmentID INT FOREIGN KEY REFERENCES Departments(DepartmentID)
+);`,
+    dml: `SELECT TOP 10
+    EmployeeID,
+    FirstName,
+    ISNULL(Salary, 0) AS Salary,
+    GETDATE() AS QueryTime
+FROM Employees
+WHERE HireDate > GETDATE()
+ORDER BY EmployeeID;`,
+};
+
+document.querySelectorAll("[data-sample]").forEach(btn => {
+    btn.addEventListener("click", () => {
+        document.getElementById("source_sql").value = samples[btn.dataset.sample];
+        document.getElementById("statement_type").value = btn.dataset.sample;
+    });
+});
+
+const copyBtn = document.getElementById("copy-result");
+if (copyBtn) {
+    copyBtn.addEventListener("click", () => {
+        navigator.clipboard.writeText(document.getElementById("result").textContent);
+    });
+}
+</script>
 {% endblock %}

@@ -1,0 +1,55 @@
+{% extends "converter/base.html" %}
+{% block title %}Migrate Database{% endblock %}
+
+{% block content %}
+<h2>Database Migration</h2>
+<p>Pick a source and a target connection and run the full migration: schema, data, views, functions, procedures and triggers — with row-count verification at the end.</p>
+
+{% if messages %}
+    {% for message in messages %}
+        <div class="{{ message.tags }}">{{ message }}</div>
+    {% endfor %}
+{% endif %}
+
+{% if connections %}
+<form method="post" style="display: grid; gap: 8px; max-width: 520px;">
+    {% csrf_token %}
+    <label>Name (optional) <input type="text" name="name" placeholder="My migration"></label>
+    <label>Source
+        <select name="source" required>
+            <option value="">— select source —</option>
+            {% for conn in connections %}<option value="{{ conn.pk }}">{{ conn.name }} ({{ conn.get_engine_display }})</option>{% endfor %}
+        </select>
+    </label>
+    <label>Target
+        <select name="target" required>
+            <option value="">— select target —</option>
+            {% for conn in connections %}<option value="{{ conn.pk }}">{{ conn.name }} ({{ conn.get_engine_display }})</option>{% endfor %}
+        </select>
+    </label>
+    <label><input type="checkbox" name="copy_data" checked> Copy table data</label>
+    <label><input type="checkbox" name="reset_target"> Drop target schemas before migrating (destructive)</label>
+    <button type="submit">Run Migration</button>
+</form>
+{% else %}
+<p>No connections saved yet. <a href="{% url 'connections' %}">Add one first</a>.</p>
+{% endif %}
+
+<h3>Recent Migrations</h3>
+{% if recent_jobs %}
+<table>
+    <tr><th>Name</th><th>Source → Target</th><th>Status</th><th>Run</th><th></th></tr>
+    {% for job in recent_jobs %}
+    <tr>
+        <td>{{ job.name }}</td>
+        <td>{{ job.source.name }} → {{ job.target.name }}</td>
+        <td>{{ job.get_status_display }}</td>
+        <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
+        <td><a href="{% url 'migrate-detail' job.pk %}">View</a></td>
+    </tr>
+    {% endfor %}
+</table>
+{% else %}
+<p>No migrations yet.</p>
+{% endif %}
+{% endblock %}

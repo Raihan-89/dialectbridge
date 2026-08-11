@@ -139,6 +139,24 @@ def _fix_inline_foreign_key_syntax(sql: str, warnings: list[str]) -> tuple[str, 
         )
     return sql, warnings
 
+def _fix_tsql_boolean_defaults(sql: str, warnings: list[str]) -> tuple[str, list[str]]:
+    """
+    Reverse of _fix_boolean_defaults: PostgreSQL's 'BOOLEAN DEFAULT true/false'
+    comes out of sqlglot's tsql writer as 'BIT DEFAULT (1 = 1)' / '(1 = 0)'.
+    SQL Server wants plain 'DEFAULT 1' / 'DEFAULT 0' — the parenthesized
+    boolean-expression form only adds noise and isn't required.
+    """
+    pattern = re.compile(r'DEFAULT\s+\(\s*1\s*=\s*([01])\s*\)', flags=re.IGNORECASE)
+
+    def _replace(match):
+        value = match.group(1)
+        warnings.append(f"Fixed boolean default: 'DEFAULT (1 = {value})' -> 'DEFAULT {value}'")
+        return f"DEFAULT {value}"
+
+    sql = pattern.sub(_replace, sql)
+    return sql, warnings
+
+
 def _ensure_statement_separators(sql: str, warnings: list[str]) -> tuple[str, list[str]]:
     """
     Insert missing semicolons between consecutive top-level CREATE TABLE
@@ -214,6 +232,8 @@ def convert_ddl(source_sql: str, source_dialect: str, target_dialect: str) -> Co
         final_sql, warnings = _fix_boolean_defaults(final_sql, warnings)
         final_sql, warnings = _fix_bytea_length(final_sql, warnings)
         final_sql, warnings = _fix_inline_foreign_key_syntax(final_sql, warnings)
+    elif target_dialect == "tsql":
+        final_sql, warnings = _fix_tsql_boolean_defaults(final_sql, warnings)
 
     return ConversionResult(sql=final_sql, warnings=warnings)
 

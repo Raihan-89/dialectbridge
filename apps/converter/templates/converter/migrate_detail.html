@@ -1,0 +1,82 @@
+{% extends "converter/base.html" %}
+{% block title %}Migration Report{% endblock %}
+
+{% block content %}
+<h2>{{ job.name }}</h2>
+<p>
+    <strong>{{ job.source.name }}</strong> → <strong>{{ job.target.name }}</strong>
+    · Status: <strong>{{ job.get_status_display }}</strong>
+    · {{ job.started_at|date:"Y-m-d H:i:s" }} – {{ job.finished_at|date:"Y-m-d H:i:s" }}
+</p>
+
+{% if job.error_message %}
+    <div class="error">Error: {{ job.error_message }}</div>
+{% endif %}
+
+{% if job.report %}
+    <h3>Summary</h3>
+    <table>
+        <tr><th>Tables</th><td>{{ job.report.summary.tables }}</td></tr>
+        <tr><th>Views</th><td>{{ job.report.summary.views }}</td></tr>
+        <tr><th>Functions</th><td>{{ job.report.summary.functions }}</td></tr>
+        <tr><th>Procedures</th><td>{{ job.report.summary.procedures }}</td></tr>
+        <tr><th>Triggers</th><td>{{ job.report.summary.triggers }}</td></tr>
+        <tr><th>Rows copied</th><td>{{ job.report.summary.rows_copied }}</td></tr>
+        <tr><th>Rows failed</th><td>{{ job.report.summary.rows_failed }}</td></tr>
+        <tr><th>Schema failures</th><td>{{ job.report.summary.schema_failed }}</td></tr>
+    </table>
+
+    <h3>Verification (row counts)</h3>
+    {% if job.report.verification %}
+    <table>
+        <tr><th>Table</th><th>Source</th><th>Target</th><th>Match</th></tr>
+        {% for v in job.report.verification %}
+        <tr>
+            <td>{{ v.table }}</td>
+            <td>{{ v.source_rows }}</td>
+            <td>{{ v.target_rows }}</td>
+            <td>{% if v.match %}✓{% else %}✗{% endif %}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
+    <h3>Schema Objects</h3>
+    {% if job.report.schema_results %}
+    <table>
+        <tr><th>Status</th><th>Kind</th><th>Name</th><th>Detail</th></tr>
+        {% for r in job.report.schema_results %}
+        <tr>
+            <td>{{ r.status }}</td>
+            <td>{{ r.kind }}</td>
+            <td>{{ r.name }}</td>
+            <td>{{ r.detail }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+
+    <h3>Data Copy</h3>
+    {% if job.report.data_results %}
+    <table>
+        <tr><th>Status</th><th>Table</th><th>Copied</th><th>Failed</th><th>Detail</th></tr>
+        {% for r in job.report.data_results %}
+        <tr>
+            <td>{{ r.status }}</td>
+            <td>{{ r.name }}</td>
+            <td>{{ r.rows_copied }}</td>
+            <td>{{ r.rows_failed }}</td>
+            <td>{{ r.detail }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    {% endif %}
+{% endif %}
+
+{% if job.warnings %}
+    <h3>Warnings</h3>
+    {% for w in job.warnings %}<div class="warning">{{ w }}</div>{% endfor %}
+{% endif %}
+
+<p><a href="{% url 'migrate' %}">← Back to migrations</a></p>
+{% endblock %}
