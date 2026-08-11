@@ -514,17 +514,22 @@ def _expr(text: str) -> str:
 def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
 
+    # pg_get_functiondef output: LANGUAGE plpgsql comes between RETURNS and the
+    # (possibly named) dollar-quoted body; PG procedures have no RETURNS clause.
     header_match = re.search(
         r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+"
-        r"(?:\"?[\w\d_]+\"?(?:\.\"?[\w\d_]+\"?)?\.)?\"?([\w\d_]+)\"?\s*"
-        r"\((.*?)\)\s*RETURNS\s+(.+?)\s+AS\s+\$\$",
+        r"(?:(\"?[\w\d_]+\"?)\.)?\"?([\w\d_]+)\"?\s*"
+        r"\((.*?)\)\s*(?:RETURNS\s+(.+?))?\s+"
+        r"(?:LANGUAGE\s+[\w\d_]+\s+)?AS\s+\$[\w\d_]*\$",
         sql, re.IGNORECASE | re.DOTALL,
     )
     if not header_match:
         return None, ["Could not parse PL/pgSQL header"]
-    name = header_match.group(1)
-    param_text = header_match.group(2)
-    returns = header_match.group(3).strip()
+    schema = (header_match.group(1) or "dbo").strip('"')
+    name = header_match.group(2)
+    param_text = header_match.group(3)
+    returns = header_match.group(4) or ""
+    returns = re.split(r"\s+LANGUAGE\b", returns, maxsplit=1, flags=re.IGNORECASE)[0].strip()
 
     # language block end
     body = _extract_plpgsql_body(sql)
@@ -534,7 +539,6 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
     params, p_warns = _parse_params_reverse(param_text)
     warnings.extend(p_warns)
 
-    is_function = not returns.lower().startswith(("void", "setof record"))
     transformed, t_warns, declared = _transform_plpgsql_body(body)
     warnings.extend(t_warns)
 
@@ -546,26 +550,49 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
         tgt_type = tgt_type or "NVARCHAR(MAX)"
         param_list.append(f"@{pname} {tgt_type}{' OUTPUT' if output else ''}")
 
-    # qualify bare references to declared variables with @ in SET right-hand sides
-    var_names = sorted(list(declared) + [p[0] for p in params if not p[2]], key=len, reverse=True)
+    # Rewrite bare references to parameters/declared variables with @ so they
+    # resolve as T-SQL variables — case-insensitively, skipping SQL keywords,
+    # aliases, and already-qualified (quoted/bracketed) references.
+    var_names = sorted(set(declared) | {p[0] for p in params}, key=len, reverse=True)
     if var_names:
         def _qualify(ln: str) -> str:
-            m = re.match(r"^(SET\s+@\w+\s*=\s*)([^;]*);?$", ln, re.IGNORECASE)
-            if not m:
-                return ln
-            rhs = m.group(2)
-            for name in var_names:
-                rhs = re.sub(r"\b" + re.escape(name) + r"\b", "@" + name, rhs)
-            return m.group(1) + rhs
+            def _repl(m):
+                word = m.group(1)
+                if word.upper() in _TSQL_KEYWORDS:
+                    return m.group(0)
+                canon = next((n for n in var_names if n.lower() == word.lower()), None)
+                if canon is None:
+                    return m.group(0)
+                return "@" + canon
+            return re.sub(
+                r"(?<![.\w\"@\[])([A-Za-z_][A-Za-z0-9_]*)\b",
+                _repl, ln, flags=re.IGNORECASE,
+            )
         transformed = [_qualify(ln) for ln in transformed]
 
     declares = "".join(f"    DECLARE @{k} {v};\n" for k, v in declared.items())
 
-    if is_function:
-        head = f"CREATE FUNCTION dbo.{name} ({', '.join(param_list)})\nRETURNS {_returns_to_tsql(returns)}\nAS\nBEGIN\n"
+    lower_returns = returns.lower()
+    is_scalar_fn = not (
+        lower_returns.startswith(("void", "setof "))
+        or "table(" in lower_returns
+    )
+    if is_scalar_fn:
+        ret_type, ret_warn = convert_type(returns, "postgres", "tsql")
+        if ret_warn:
+            warnings.append(f"RETURNS {returns}: {ret_warn}")
+        head = (
+            f"CREATE FUNCTION [{schema}].[{name}] ({', '.join(param_list)})\n"
+            f"RETURNS {ret_type or 'NVARCHAR(MAX)'}\nAS\nBEGIN\n"
+        )
         tail = "END;"
     else:
-        head = f"CREATE PROCEDURE dbo.{name} ({', '.join(param_list)})\nAS\nBEGIN\n    SET NOCOUNT ON;\n"
+        # void / SETOF / TABLE(...) — all return a result set; the closest
+        # working T-SQL equivalent is a stored procedure.
+        head = (
+            f"CREATE PROCEDURE [{schema}].[{name}] ({', '.join(param_list)})\n"
+            f"AS\nBEGIN\n    SET NOCOUNT ON;\n"
+        )
         tail = "END;"
 
     converted = head + declares + "\n".join(transformed) + "\n" + tail
@@ -573,7 +600,8 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
 
 
 def _extract_plpgsql_body(sql: str) -> str | None:
-    m = re.search(r"\$\$(.*?)\$\$\s*LANGUAGE", sql, re.IGNORECASE | re.DOTALL)
+    # pg_get_functiondef uses a named dollar-quote (AS $function$ ... $function$).
+    m = re.search(r"\$[\w\d_]*\$(.*?)\$[\w\d_]*\$", sql, re.IGNORECASE | re.DOTALL)
     if not m:
         return None
     return m.group(1)
@@ -594,15 +622,6 @@ def _parse_params_reverse(param_text: str) -> tuple[list[tuple[str, str, bool]],
         if m:
             params.append((m.group(1), m.group(2), output))
     return params, []
-
-
-def _returns_to_tsql(returns: str) -> str:
-    r = returns.lower()
-    if "table(" in r:
-        return "TABLE (" + returns[returns.index("("):]
-    if r.startswith("setof "):
-        return "TABLE (...)"
-    return returns
 
 
 def _transform_plpgsql_body(body: str) -> tuple[list[str], list[str], dict[str, str]]:
@@ -740,10 +759,22 @@ def _transform_plpgsql_body(body: str) -> tuple[list[str], list[str], dict[str, 
 
 def _expr_rev(text: str) -> str:
     text = translate_functions(text, "postgres", "tsql")
+    text = re.sub(r'"([\w\s\d_]+)"', r"[\1]", text)
+    text = re.sub(r"::[\w\s.]+", "", text)
     text = re.sub(r"ROW_COUNT\s*\(\s*\)", "@@ROWCOUNT", text, flags=re.IGNORECASE)
     text = re.sub(r"LASTVAL\s*\(\s*\)", "SCOPE_IDENTITY()", text, flags=re.IGNORECASE)
     text = re.sub(r"pg_sleep\s*\(([^)]+)\)", "WAITFOR DELAY '00:00:00.001'", text, flags=re.IGNORECASE)
     return text
+
+
+_TSQL_KEYWORDS = frozenset(
+    "select from where join on as group by order having sum count avg min max top distinct "
+    "into insert update delete values and or not null is like between in exists case when then "
+    "else end inner outer left right full cross union all set table create alter drop index view "
+    "procedure function trigger if while begin declare print raiserror throw waitfor commit rollback "
+    "exec execute use default primary foreign references constraint unique check identity asc desc "
+    "with collate convert cast return returns limit offset".split()
+)
 
 
 # ---------------------------------------------------------------------------

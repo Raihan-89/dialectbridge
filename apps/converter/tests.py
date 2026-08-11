@@ -4,6 +4,7 @@ from rest_framework import status
 
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from engine.translators.ddl_translator import convert_ddl
+from engine.translators.procedure_translator import translate_routine
 from .models import ConversionJob
 
 
@@ -96,6 +97,41 @@ class EngineServiceTests(TestCase):
                 direction="mssql_to_postgres",
                 statement_type="procedure",
             )
+
+    def test_plpgsql_to_tsql_table_function_becomes_procedure(self):
+        pg_fn = """CREATE OR REPLACE FUNCTION dbo.sp_getcustomerorders(customerid integer)
+ RETURNS TABLE("OrderID" integer, "OrderDate" timestamp without time zone, "Status" character varying, "Total" numeric)
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+RETURN QUERY SELECT o."OrderID", o."OrderDate", o."Status", SUM(oi."LineTotal") AS Total FROM "dbo"."Orders" o JOIN "dbo"."OrderItems" oi ON o."OrderID" = oi."OrderID" WHERE o."CustomerID" = CustomerID GROUP BY o."OrderID", o."OrderDate", o."Status";
+END;
+$function$
+"""
+        converted, warnings = translate_routine(pg_fn, source="function", target="tsql")
+        self.assertTrue(converted, warnings)
+        self.assertEqual(warnings, [])
+        self.assertIn("CREATE PROCEDURE [dbo].[sp_getcustomerorders] (@customerid INT)", converted)
+        self.assertIn("[dbo].[OrderItems]", converted)
+        self.assertIn("@customerid", converted)
+        self.assertNotIn("::", converted)
+        self.assertNotIn('"', converted)
+
+    def test_plpgsql_scalar_function_becomes_tsql_function(self):
+        pg_fn = """CREATE OR REPLACE FUNCTION dbo.add_one(x integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+RETURN x + 1;
+END;
+$function$
+"""
+        converted, warnings = translate_routine(pg_fn, source="function", target="tsql")
+        self.assertTrue(converted, warnings)
+        self.assertIn("CREATE FUNCTION [dbo].[add_one] (@x INT)", converted)
+        self.assertIn("RETURNS INT", converted)
+        self.assertIn("RETURN @x + 1;", converted)
 
 
 class ConvertAPITests(TestCase):
