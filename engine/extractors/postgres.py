@@ -8,7 +8,8 @@ table by OID, so identifiers with spaces/uppercase never break parsing.
 from __future__ import annotations
 
 from engine.schema import (
-    Column, Constraint, Database, ForeignKey, Index, Routine, Table, Trigger,
+    Column, Constraint, Database, ForeignKey, Index, Routine, Sequence, Table,
+    Trigger, View,
 )
 
 _TABLES_SQL = """
@@ -208,10 +209,11 @@ def _extract_table(conn, oid: int, qualified: str) -> Table:
         is_identity = attidentity in ("a", "d")
         identity_seed = identity_increment = None
         if is_identity:
+            schema, tbl = qualified.rsplit(".", 1)
             seq = conn.fetchone(
                 "SELECT seqstart, seqincrement FROM pg_sequence "
                 "WHERE seqrelid = pg_get_serial_sequence(%s, %s)::regclass",
-                (qualified, name),
+                (f"{conn.quote_ident(schema)}.{conn.quote_ident(tbl)}", name),
             )
             if seq:
                 identity_seed, identity_increment = int(seq[0]), int(seq[1])

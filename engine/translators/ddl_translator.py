@@ -157,6 +157,29 @@ def _fix_tsql_boolean_defaults(sql: str, warnings: list[str]) -> tuple[str, list
     return sql, warnings
 
 
+def _simplify_literal_cast_defaults(sql: str, warnings: list[str]) -> tuple[str, list[str]]:
+    """
+    PostgreSQL string-literal casts (e.g. 'Pending'::character varying) come
+    out of sqlglot as 'DEFAULT CAST('Pending' AS VARCHAR)'. That is valid
+    T-SQL, but it loses the varchar length and adds noise — reduce it back
+    to a plain literal, which SQL Server coerces implicitly.
+    """
+    pattern = re.compile(
+        r"DEFAULT\s+CAST\(\s*'((?:[^']|'')*)'\s+AS\s+\w+(?:\([^)]*\))?\s*\)",
+        flags=re.IGNORECASE,
+    )
+
+    def _replace(match):
+        literal = match.group(1).replace("''", "'")
+        warnings.append(
+            f"Simplified literal cast default: 'DEFAULT CAST(... AS ...)' -> 'DEFAULT '{literal}''"
+        )
+        return f"DEFAULT '{literal}'"
+
+    sql = pattern.sub(_replace, sql)
+    return sql, warnings
+
+
 def _ensure_statement_separators(sql: str, warnings: list[str]) -> tuple[str, list[str]]:
     """
     Insert missing semicolons between consecutive top-level CREATE TABLE
@@ -234,6 +257,7 @@ def convert_ddl(source_sql: str, source_dialect: str, target_dialect: str) -> Co
         final_sql, warnings = _fix_inline_foreign_key_syntax(final_sql, warnings)
     elif target_dialect == "tsql":
         final_sql, warnings = _fix_tsql_boolean_defaults(final_sql, warnings)
+        final_sql, warnings = _simplify_literal_cast_defaults(final_sql, warnings)
 
     return ConversionResult(sql=final_sql, warnings=warnings)
 

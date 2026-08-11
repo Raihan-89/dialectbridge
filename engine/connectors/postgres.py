@@ -82,9 +82,10 @@ class PostgresConnector(DatabaseConnector):
         order_clause = ""
         if order_columns:
             order_clause = " ORDER BY " + ", ".join(f'"{c}"' for c in order_columns)
+        tbl = self.quote_ident(table_name)
 
         if not order_columns:
-            rows = self.fetch(f"SELECT {qident} FROM {table_name} LIMIT {batch_size}")
+            rows = self.fetch(f"SELECT {qident} FROM {tbl} LIMIT {batch_size}")
             if rows:
                 yield rows
             return
@@ -97,12 +98,12 @@ class PostgresConnector(DatabaseConnector):
                     f'("{c}" > %s)' if i == 0 else f'("{c}" = %s)' for i, c in enumerate(order_columns)
                 )
                 sql = (
-                    f"SELECT {qident} FROM {table_name} WHERE {conds} {order_clause} "
+                    f"SELECT {qident} FROM {tbl} WHERE {conds} {order_clause} "
                     f"LIMIT {batch_size}"
                 )
                 rows = self.fetch(sql, tuple(last_key))
             else:
-                sql = f"SELECT {qident} FROM {table_name} {order_clause} LIMIT {batch_size}"
+                sql = f"SELECT {qident} FROM {tbl} {order_clause} LIMIT {batch_size}"
                 rows = self.fetch(sql)
             if not rows:
                 break

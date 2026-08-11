@@ -47,6 +47,37 @@ class EngineDDLTests(TestCase):
         )
         self.assertTrue(any("MANUAL REVIEW REQUIRED" in w for w in result.warnings))
 
+    def test_postgres_to_tsql_strips_pg_casts_from_defaults(self):
+        result = convert_ddl(
+            """CREATE TABLE Orders (
+                OrderID INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                Status VARCHAR(20) DEFAULT 'Pending'::character varying,
+                CreatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );""",
+            source_dialect="postgres",
+            target_dialect="tsql",
+        )
+        self.assertTrue(result.sql)
+        self.assertIn("DEFAULT 'Pending'", result.sql)
+        self.assertNotIn("::", result.sql)
+        self.assertIn("DEFAULT GETDATE()", result.sql)
+
+    def test_postgres_to_tsql_computed_column_has_no_type(self):
+        result = convert_ddl(
+            """CREATE TABLE OrderItems (
+                OrderItemID INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                Quantity INT NOT NULL,
+                UnitPrice NUMERIC(19,4) NOT NULL,
+                LineTotal NUMERIC(19,4) GENERATED ALWAYS AS ((Quantity)::numeric * UnitPrice) STORED
+            );""",
+            source_dialect="postgres",
+            target_dialect="tsql",
+        )
+        self.assertTrue(result.sql)
+        self.assertNotIn("::", result.sql)
+        col_def = result.sql[result.sql.index("LineTotal"):result.sql.index("Quantity")]
+        self.assertNotIn("NUMERIC", col_def)
+
 
 class EngineServiceTests(TestCase):
     def test_dml_routed_through_facade(self):

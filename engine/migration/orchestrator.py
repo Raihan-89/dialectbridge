@@ -129,7 +129,16 @@ class MigrationOrchestrator:
                 self.target.execute(f"DROP SCHEMA IF EXISTS {self.target.quote_ident(s)} CASCADE")
 
         for s in schemas:
-            self._apply(report, "schema", f"CREATE SCHEMA IF NOT EXISTS {self.target.quote_ident(s)}", object_name=s)
+            if self.target.dialect == "postgres":
+                stmt = f"CREATE SCHEMA IF NOT EXISTS {self.target.quote_ident(s)}"
+            else:
+                # SQL Server has no CREATE SCHEMA IF NOT EXISTS; dbo always
+                # exists and re-runs must be tolerant.
+                stmt = (
+                    f"IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'{s.replace(chr(39), chr(39)+chr(39))}') "
+                    f"EXEC(N'CREATE SCHEMA {self.target.quote_ident(s)}')"
+                )
+            self._apply(report, "schema", stmt, object_name=s)
 
         for table in schema.all_tables_in_dependency_order():
             self._apply_table(report, schema, table)
