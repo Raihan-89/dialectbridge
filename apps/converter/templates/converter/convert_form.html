@@ -1,0 +1,37 @@
+{% extends "converter/base.html" %}
+{% block title %}Convert SQL{% endblock %}
+{% block content %}
+<h1>SQL Conversion Engine</h1>
+
+<form method="post">
+    {% csrf_token %}
+    <label for="direction">Direction</label><br>
+    <select name="direction" id="direction">
+        {% for value, label in direction_choices %}
+            <option value="{{ value }}" {% if direction == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+    </select>
+    <br><br>
+
+    <label for="source_sql">Source SQL</label><br>
+    <textarea name="source_sql" id="source_sql" rows="10">{{ source_sql|default:"" }}</textarea>
+    <br><br>
+
+    <button type="submit">Convert</button>
+</form>
+
+{% if job %}
+    <h2>Result</h2>
+    {% if job.succeeded %}
+        <pre>{{ job.converted_sql }}</pre>
+        {% if job.warnings %}
+            <h3>Warnings</h3>
+            {% for w in job.warnings %}
+                <div class="warning">{{ w }}</div>
+            {% endfor %}
+        {% endif %}
+    {% else %}
+        <div class="error">Conversion failed: {{ job.error_message }}</div>
+    {% endif %}
+{% endif %}
+{% endblock %}

@@ -139,6 +139,39 @@ def _fix_inline_foreign_key_syntax(sql: str, warnings: list[str]) -> tuple[str, 
         )
     return sql, warnings
 
+def _ensure_statement_separators(sql: str, warnings: list[str]) -> tuple[str, list[str]]:
+    """
+    Insert missing semicolons between consecutive top-level CREATE TABLE
+    statements. sqlglot's tsql reader tolerates missing semicolons between
+    statements, but its postgres reader does NOT — without a separator it
+    silently fails to parse and falls back to passing the text through
+    completely unconverted, with no exception raised. This must run before
+    sqlglot.transpile() for both directions, since a source SQL Server
+    script the person pastes may also be missing semicolons.
+    """
+    matches = list(re.finditer(r'\bCREATE\s+TABLE\b', sql, flags=re.IGNORECASE))
+    if len(matches) <= 1:
+        return sql, warnings
+
+    boundaries = [m.start() for m in matches]
+    segments = []
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(sql)
+        segments.append(sql[start:end])
+
+    fixed_segments = []
+    inserted = False
+    for seg in segments:
+        stripped = seg.rstrip()
+        if stripped and not stripped.endswith(';'):
+            stripped += ';'
+            inserted = True
+        fixed_segments.append(stripped)
+
+    if inserted:
+        warnings.append("Inserted missing semicolons between CREATE TABLE statements")
+
+    return '\n'.join(fixed_segments), warnings
 
 def convert_ddl(source_sql: str, source_dialect: str, target_dialect: str) -> ConversionResult:
     """
@@ -156,23 +189,27 @@ def convert_ddl(source_sql: str, source_dialect: str, target_dialect: str) -> Co
     else:
         overrides, review_list, pre_rewrites = {}, [], {}
 
-    # 1. Detect manual-review types from the ORIGINAL source, before anything
-    #    gets rewritten or mangled.
-    warnings = _detect_manual_review_types(source_sql, review_list)
+    # 1. Ensure statements are semicolon-separated — must happen first,
+    #    since it affects how sqlglot parses everything downstream.
+    safe_source, warnings = _ensure_statement_separators(source_sql, [])
 
-    # 2. Pre-rewrite types sqlglot would otherwise mangle into garbage.
-    safe_source = _pre_transpile_rewrite(source_sql, pre_rewrites)
+    # 2. Detect manual-review types from the (separator-fixed) source, before
+    #    anything gets rewritten or mangled.
+    warnings = _detect_manual_review_types(safe_source, review_list) + warnings
 
-    # 3. Run sqlglot's transpile.
+    # 3. Pre-rewrite types sqlglot would otherwise mangle into garbage.
+    safe_source = _pre_transpile_rewrite(safe_source, pre_rewrites)
+
+    # 4. Run sqlglot's transpile.
     raw_converted = sqlglot.transpile(
         safe_source, read=source_dialect, write=target_dialect, pretty=True
     )
     converted_sql = "\n".join(raw_converted)
 
-    # 4. Post-process: fix types sqlglot leaves unchanged (survive intact).
+    # 5. Post-process: fix types sqlglot leaves unchanged (survive intact).
     final_sql, warnings = _apply_type_overrides(converted_sql, overrides, warnings)
 
-    # 5. Post-process: target-dialect-specific syntax fixes.
+    # 6. Post-process: target-dialect-specific syntax fixes.
     if target_dialect == "postgres":
         final_sql, warnings = _fix_boolean_defaults(final_sql, warnings)
         final_sql, warnings = _fix_bytea_length(final_sql, warnings)

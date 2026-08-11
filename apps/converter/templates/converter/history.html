@@ -1,0 +1,25 @@
+{% extends "converter/base.html" %}
+{% block title %}Conversion History{% endblock %}
+{% block content %}
+<h1>Conversion History</h1>
+<table>
+    <tr>
+        <th>When</th>
+        <th>Direction</th>
+        <th>Type</th>
+        <th>Status</th>
+        <th>Warnings</th>
+    </tr>
+    {% for job in jobs %}
+    <tr>
+        <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
+        <td>{{ job.get_direction_display }}</td>
+        <td>{{ job.get_statement_type_display }}</td>
+        <td>{% if job.succeeded %}✅ OK{% else %}❌ Failed{% endif %}</td>
+        <td>{{ job.warnings|length }}</td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="5">No conversions yet.</td></tr>
+    {% endfor %}
+</table>
+{% endblock %}
