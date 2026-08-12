@@ -18,10 +18,13 @@ Two capabilities in one Django app:
 - Data type mapping with warning flags for types that have no clean equivalent (never silently converted)
 - Manual-review warnings for anything the engine can't translate safely
 - Per-object migration report with source vs target row-count verification
+- Background web migrations with persisted phase/percentage progress and live polling
+- Complete migration history: each migration serial links back to its saved full report
 - Captured migration errors on a dedicated **Errors** page (`/errors/`), filterable by object kind / job / keyword
 - Optional destructive `reset_target` mode for clean re-runs
 - Web UI + REST API
 - Conversion history / audit trail
+- Responsive portal for desktop, tablet and mobile
 - Passwords stored obfuscated (Django `signing`), never in plain text
 
 ---
@@ -101,7 +104,10 @@ Supported statement types (text mode): `ddl`, `dml`.
 
 1. Save your connections under **Connections** (`/connections/`) — source and target.
 2. Go to **Migrate** (`/migrate/`), pick source + target, optionally copy data and reset the target.
-3. Run and inspect the report: schema results, data results, row-count verification, warnings.
+3. Click **Run Migration**. The portal immediately opens the persisted job page and updates its phase and percentage while the migration runs in a background thread.
+4. Inspect the saved report: schema results, data results, row-count verification, warnings and captured errors. You can reopen it later by clicking its migration serial number.
+
+Only one web-started migration may run at a time. The REST create endpoint remains synchronous and returns the finished report.
 
 API:
 
@@ -122,6 +128,7 @@ POST /api/migrations/             {source: <id>, target: <id>, copy_data: true, 
 | Manage connections | `/connections/` |
 | Run migration | `/migrate/` |
 | Migration report | `/migrate/{id}/` |
+| Migration progress JSON | `/migrate/{id}/status/` |
 | Migration errors | `/errors/` |
 
 ## API Endpoints
@@ -161,6 +168,8 @@ extract schema -> convert to target DDL -> apply structural DDL -> copy data
   -> apply FKs/checks/views/procs/triggers -> verify row counts -> report
 ```
 
+Routine kinds are preserved by the live migration engine: functions remain functions and stored procedures remain stored procedures in both directions. PostgreSQL procedures cannot directly stream SQL Server-style result sets, so migrated procedures expose those result sets through `INOUT refcursor` parameters; reverse migration removes the cursor plumbing and restores ordinary SQL Server result `SELECT`s.
+
 ---
 
 ## Documentation
@@ -174,4 +183,8 @@ extract schema -> convert to target DDL -> apply structural DDL -> copy data
 - Text conversion mode supports `ddl`/`dml` only; stored procedure and trigger statement types are available through the **migration engine**, not yet through the paste-SQL converter.
 - Types with no clean equivalent (e.g. `GEOGRAPHY`, `SQL_VARIANT`, `HIERARCHYID`, PG `ARRAY`/`HSTORE`/range types) are flagged for manual review rather than converted.
 - Trigger translation is best-effort — statement-level vs row-level semantics are surfaced as warnings.
-- Migrations run synchronously; very large databases will block the request until complete.
+- PostgreSQL routines cannot execute SQL Server transaction-control statements internally. `BEGIN/COMMIT/ROLLBACK TRANSACTION` is removed with a warning because the PostgreSQL call already runs within the caller's transaction.
+- SQL Server procedure result sets are represented as PostgreSQL `refcursor` outputs. Call PostgreSQL procedures inside a transaction and fetch the returned cursors.
+- Web migrations use an in-process background thread. This is suitable for the current single-process portal; production multi-worker/restart-safe deployments should move jobs to a durable queue such as Celery/RQ.
+- The REST migration-create endpoint is synchronous.
+- `db.sqlite3` stores portal users, saved connections, job history and reports. Deleting it deletes that portal data; run `python manage.py migrate` to recreate empty tables.

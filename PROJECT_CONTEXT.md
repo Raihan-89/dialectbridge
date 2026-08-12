@@ -105,7 +105,7 @@ Deliberate ordering choices:
 - **`reset_target` option** (destructive, user opts in): drops target schemas/objects before migrating so re-runs are clean.
 - **PostgreSQL `search_path`** is set to the migrated schemas so views/routines that reference tables by bare name still resolve.
 
-The report (`MigrationReport`) contains per-object results (kind, name, status, detail, rows copied/failed), a row-count verification table, warnings, and a summary. This is stored as JSON on `MigrationJob.report`.
+The report (`MigrationReport`) contains per-object results (kind, name, status, detail, rows copied/failed), a row-count verification table, warnings, and a summary. This is stored as JSON on `MigrationJob.report`. An optional progress callback reports the major phases (extract, convert, structural DDL, data copy, objects, verification and report persistence) to the web job.
 
 ---
 
@@ -142,11 +142,11 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
   - `_translate_default` / `_translate_expr` — best-effort regex expression translation (GETDATE→CURRENT_TIMESTAMP, NEWID→gen_random_uuid, casts, N-literal stripping, bracket<->quote identifiers).
   - `_qualify_body_refs` / `_qualify_table_refs` — rewrites **bare table/column references inside view/function/procedure/trigger bodies** so case-sensitive PostgreSQL quoting resolves them; masks string literals, already-quoted identifiers and `AS alias` clauses so aliases are never rewritten.
 - **`procedure_translator.py`** — T-SQL <-> PL/pgSQL routine translator.
-  - `_tsql_to_plpgsql` — parses header/params/RETURNS, transforms body line-by-line while tracking BEGIN/END, IF/ELSE, WHILE, TRY/CATCH nesting. Handles DECLARE/SET vars, assignment SELECTs, PRINT/RAISERROR (→ `RAISE EXCEPTION` with `%` placeholders + args), RETURN, WAITFOR, result SELECTs→RETURN QUERY, temp tables. Infers `RETURNS TABLE(...)` column types from the source schema. Returns `(converted, warnings)` — never silently drops a statement.
+  - `_tsql_to_plpgsql` — parses header/params/RETURNS, transforms body line-by-line while tracking BEGIN/END, IF/ELSE, WHILE, TRY/CATCH nesting. Handles DECLARE/SET vars, assignment SELECTs, PRINT/RAISERROR (→ `RAISE EXCEPTION` with `%` placeholders + args), RETURN, WAITFOR and temp tables. Genuine SQL Server functions remain PostgreSQL functions. Genuine procedures remain `CREATE PROCEDURE`; each result-returning SELECT becomes an `OPEN ... FOR SELECT` backed by an `INOUT refcursor` parameter because PostgreSQL procedures cannot directly stream result sets.
   - Real-world `OBJECT_DEFINITION` quirks handled: `[schema].[name]` qualifiers, bracketed param types (`@p [int]`, `[decimal](18,2)`), `WITH SCHEMABINDING`/`WITH EXECUTE AS` clauses after `RETURNS`, and statements without terminating semicolons. `_normalize_statement_ends` inserts `;` after `RAISERROR(...)` (balanced-paren aware) and single-line `THROW`/`PRINT`; the loop additionally flushes at paren depth 0 when the next line starts a keyword that can never continue the buffered statement (`RETURN`, a second `SET`, a fresh `SELECT`, ...) while honoring continuations — `SET` after `UPDATE/INSERT/DELETE/MERGE` and `SELECT` after `WITH`/`INSERT` (INSERT...SELECT, CTEs) never split. Multi-line `UPDATE ... SET`, `WITH cte AS (`, and multi-line subqueries stay one statement.
   - Scalar return types are mapped through `convert_type` (`[int]`→INTEGER, `[decimal](18,2)`→NUMERIC(18,2), `[nvarchar](max)`→TEXT); expression-level `SELECT TOP n` (including inside scalar subqueries) becomes a trailing `LIMIT n`, and `+` is treated as string concatenation (`||`) only when a string literal is present so arithmetic like `@i + 1` keeps its plus.
   - Block engine: stack-based IF/WHILE tracking supports single-statement then/else branches (incl. `IF (cond) stmt;` on one line), `ELSE IF`, `ELSE BEGIN`, inline `BEGIN ... END` blocks on one line, `END ELSE` on one line, single-line `IF (cond) stmt; ELSE stmt;` (split on the top-level `ELSE`, CASE-ELSE excluded), and cascading `END IF;`. `BEGIN/COMMIT/ROLLBACK TRANSACTION` are **dropped with a warning** (PL/pgSQL functions can't run transaction control and already run in one implicit transaction).
-  - `_plpgsql_to_tsql` — reverse: variables get `@` prefixes (skipping SQL keywords), scalar functions become `CREATE FUNCTION`, void/SETOF/TABLE functions become `CREATE PROCEDURE`.
+  - `_plpgsql_to_tsql` — reverse: variables get `@` prefixes (skipping SQL keywords), explicit `IN`/`OUT`/`INOUT` modes and defaults are parsed correctly, functions remain functions where appropriate, and PostgreSQL procedures become `CREATE PROCEDURE`. Converter-owned result cursors disappear on round-trip and `OPEN cursor FOR SELECT` becomes an ordinary SQL Server result SELECT. Same-name parameter/column predicates are repaired (`[ProductID] = @ProductID`) without corrupting qualified columns.
   - `translate_routine(sql, source, target, tables)` is the public entry.
 - **`trigger_translator.py`** — T-SQL <-> PL/pgSQL triggers.
   - T-SQL AFTER/INSTEAD OF triggers (statement-level, `inserted`/`deleted` pseudo-tables) → PG `FOR EACH ROW` trigger function with `NEW`/`OLD`. Rewrites `INSERT ... SELECT ... FROM inserted` → `INSERT ... VALUES (NEW.x, ...)`, `IN (... IN (SELECT x FROM inserted))` → `= NEW.x`. Warns when multi-row semantics can't be bridged.
@@ -181,7 +181,7 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
 | Model | Purpose |
 |---|---|
 | `DatabaseConnection` | Saved live DB connection (source or target). Password stored **obfuscated** via Django `signing` (keyed on SECRET_KEY), never in plain text. `effective_port()` defaults 1433 (MSSQL) / 5432 (PG). |
-| `MigrationJob` | A single end-to-end migration run between two saved connections. Status: pending/running/completed/failed/partial. Holds the full per-object `report` JSON, `warnings`, `error_message`. |
+| `MigrationJob` | A single end-to-end migration run between two saved connections. Status: pending/running/completed/failed/partial. Holds the full per-object `report` JSON, `warnings`, `error_message`, plus persisted `progress_percent` and `progress_stage`. |
 | `ConversionJob` | Audit trail of one text-conversion request: direction, statement type, source SQL, converted SQL, warnings, succeeded flag, error message. |
 | `MigrationError` | Per-object failure captured from a migration's report for analysis: FK to `MigrationJob`, `object_kind` (table/index/constraint/view/function/procedure/trigger/data/object), `object_name`, `error_type` (`sql_error`/`data_copy`), `message`, `detail`, timestamp. |
 
@@ -205,8 +205,9 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
 | Convert form | `/` | Paste SQL, pick direction + statement type, see result + warnings. Sample DDL/DML loaders. |
 | History | `/history/` | List of past conversion jobs. |
 | Connections | `/connections/` | Create/test/delete saved connections. |
-| Migrate | `/migrate/` | Pick source + target connections, run full migration, recent runs list. |
-| Migration report | `/migrate/{pk}/` | Summary, row-count verification table, schema/data results, warnings. |
+| Migrate | `/migrate/` | Pick source + target connections, start a background web migration, and browse complete history by serial number. Prevents a second web migration while one is running. |
+| Migration report | `/migrate/{pk}/` | Persisted summary, live progress while running, row-count verification, schema/data results, warnings and captured errors. |
+| Migration status | `/migrate/{pk}/status/` | Lightweight JSON polled by the report page (`status`, stage, percentage, finished flag). |
 | Errors | `/errors/` | Per-object migration failures across all jobs, filterable by kind/job/keyword, with counts per object kind. |
 
 ### Bridge (`migration_service.py`)
@@ -214,6 +215,7 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
 - `connector_for(connection)` — builds a live connector from a saved `DatabaseConnection` (decrypts password).
 - `test_connection(connection)` — returns server/version info.
 - `run_migration(source, target, copy_data, reset_target)` — runs the `MigrationOrchestrator` and returns the serialized report.
+- `run_migration(...)` accepts an optional progress callback used by the background web runner. The API path continues to run synchronously.
 - `record_migration_errors(job, report)` — syncs `MigrationError` rows for a job: deletes the job's prior errors, walks the report's `schema_results`/`data_results`, and records each failure (data rows failed → `data_copy`, otherwise `sql_error`).
 
 ---
@@ -223,7 +225,7 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
 - `apps/converter/tests.py` — engine unit/integration tests: DDL both directions, manual-review flagging, computed columns, service facade, procedure translation (PG→T-SQL table function → procedure, scalar function), trigger translation both directions, API endpoint tests (200/501/422), `MigrationError` capture + errors page, and regression tests for the real-world migration fixes (MAX→TEXT, boolean filtered-index predicates, real check-constraint names, view aliases, typed params, RETURNS conversion, transaction/RAISERROR handling, balanced IF/ELSE, SELECT TOP→LIMIT, bracketed `OBJECT_DEFINITION` params/returns, `WITH SCHEMABINDING`, no-semicolon statements, nested subquery TOP, string concat vs numeric `+`, no-semicolon `SET`/assignment + `RETURN` splits, single-line `IF...ELSE`, inline `BEGIN...END ELSE BEGIN...END`, `END ELSE`, multi-line UPDATE/CTE preservation).
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched keyset inserts, `reset_target` schema drops.
 
-Run: `venv/bin/python manage.py test` (36 tests, all pass).
+Current verification: `python manage.py test apps.converter` runs **61 tests**; `python manage.py check` reports no issues.
 
 ---
 
@@ -233,8 +235,11 @@ Run: `venv/bin/python manage.py test` (36 tests, all pass).
 - Text-conversion mode (`service.py`) supports only `ddl`/`dml`; `procedure`/`trigger` statement types are **disabled in the web UI** ("coming soon") and return 501 from the API — even though the migration engine translates those object types.
 - Manual-review types are **flagged with warnings, never silently converted**.
 - Trigger translation is best-effort: statement-level vs row-level semantics and multi-row `FROM inserted/deleted` patterns produce warnings for manual review.
-- Migrations run **synchronously** in the request (large databases will block the request).
-- `db.sqlite3` is the app's own storage; source/target databases are connected to at runtime by the user's saved credentials.
+- Web-started migrations run in an in-process daemon thread, redirect immediately to the job report, persist coarse phase/percentage updates, and are polled by the browser. One running web job is allowed at a time. This is not a durable distributed task queue: a process restart can interrupt an active job. The REST create endpoint remains synchronous.
+- Stored procedures remain stored procedures in both directions. SQL Server result sets use PostgreSQL `INOUT refcursor` outputs and are restored to normal SELECT result sets on reverse migration.
+- PostgreSQL routines cannot contain SQL Server transaction control. BEGIN/COMMIT/ROLLBACK TRANSACTION is removed with an explicit warning; trigger self-delete behavior used by an INSTEAD OF DELETE conversion may also be removed when PostgreSQL performs it implicitly.
+- The shared template provides a responsive desktop/tablet/mobile UI, direction-specific DDL/DML samples, collapsible mobile navigation, scroll-safe tables/code, progress display and accessible reduced-motion behavior.
+- `db.sqlite3` is the portal's own storage for users, saved connections, conversion history, migration jobs/reports and captured errors; deleting it loses those records. Run `python manage.py migrate` after creating/recreating it. Source/target databases remain external and are connected at runtime using saved credentials.
 
 ---
 
@@ -244,3 +249,5 @@ Run: `venv/bin/python manage.py test` (36 tests, all pass).
 venv/bin/python manage.py runserver        # start Django dev server
 venv/bin/python manage.py test             # run the test suite
 ```
+
+After a fresh clone or if `db.sqlite3` was removed, run `python manage.py migrate` before starting the server. Migration `0005_migrationjob_progress` adds the persisted progress fields.
