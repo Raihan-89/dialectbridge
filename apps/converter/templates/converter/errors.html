@@ -1,12 +1,12 @@
 {% extends "converter/base.html" %}
 {% block title %}Migration Errors — SQL Conversion Engine{% endblock %}
-{% block nav_migrate %}active{% endblock %}
+{% block nav_errors %}active{% endblock %}
 {% block content %}
 <h1 class="page-title">Migration Errors</h1>
 <p class="subtitle">Failures captured from migration runs, stored per object for analysis.</p>
 
 <div class="card">
-    <form method="get" class="form-grid" style="grid-template-columns: 200px 200px 1fr auto; align-items: end;">
+    <form method="get" class="form-grid filter-grid">
         <div class="field">
             <label for="kind">Kind</label>
             <select name="kind" id="kind">

@@ -902,6 +902,20 @@ class ConvertAPITests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("BIT DEFAULT 1", response.json()["converted_sql"])
 
+    def test_reverse_direction_postgres_dml_works(self):
+        response = self._convert({
+            "source_sql": "SELECT employee_id, COALESCE(salary, 0) AS salary FROM employees ORDER BY employee_id LIMIT 10;",
+            "direction": "postgres_to_mssql",
+            "statement_type": "dml",
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("TOP 10", response.json()["converted_sql"])
+
+    def test_convert_page_contains_direction_specific_postgres_sample(self):
+        response = self.client.get(reverse("convert-form"))
+        self.assertContains(response, "postgres_to_mssql")
+        self.assertContains(response, "LIMIT 10;")
+
 
 class MigrationProgressViewTests(TestCase):
     def setUp(self):
@@ -937,3 +951,15 @@ class MigrationProgressViewTests(TestCase):
         detail = self.client.get(reverse("migrate-detail", args=[self.job.pk]))
         self.assertContains(detail, "Saved migration")
         self.assertContains(detail, "Tables")
+
+
+class PortalNavigationTests(TestCase):
+    def test_errors_page_marks_errors_navigation_active(self):
+        response = self.client.get(reverse("errors"))
+        self.assertContains(response, 'href="/errors/" class="active"')
+        self.assertNotContains(response, 'href="/migrate/" class="active"')
+
+    def test_shared_layout_has_responsive_navigation(self):
+        response = self.client.get(reverse("convert-form"))
+        self.assertContains(response, 'class="btn btn-ghost nav-toggle"')
+        self.assertContains(response, 'id="main-nav"')
