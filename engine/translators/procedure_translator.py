@@ -41,7 +41,10 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
     header_match = re.search(
         r"CREATE\s+(?:OR\s+ALTER\s+)?(PROCEDURE|PROC|FUNCTION)\s+"
         r"(?:\[?[\w\d_]+\]?\.)?\[?([\w\d_]+)\]?"
-        r"(?:\s*\((.*)\)|\s+(@.*?))?"
+        # Parenthesized parameter lists may themselves contain parentheses
+        # (DECIMAL(18,2)); require the closing paren to be followed by a
+        # header keyword so body predicates are never mistaken for params.
+        r"(?:\s*\((.*?)\)(?=\s*(?:WITH|AS|RETURNS)\b)|\s+(@.*?))?"
         r"(?=\s*(?:WITH|AS|RETURNS)\b|\s*$)",
         sql, re.IGNORECASE | re.DOTALL,
     )

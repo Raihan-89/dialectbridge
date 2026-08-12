@@ -21,6 +21,7 @@ from engine.translators.functions import translate_functions
 from engine.translators.procedure_translator import (
     _transform_plpgsql_body,
     _transform_tsql_body,
+    _expr,
     _translate_top,
     _split_args_balanced,
 )
@@ -121,9 +122,9 @@ def _split_structural(body: str) -> list[str]:
 
 
 def _expr_tsql_to_pg(text: str) -> str:
-    text = translate_functions(text, "tsql", "postgres")
-    text = re.sub(r"@([A-Za-z_][A-Za-z0-9_]*)", r"\1", text)
-    return text
+    # Keep trigger expressions on the same fully isolated T-SQL -> PG path as
+    # routines (identifier quoting, variables, functions, TOP and concat).
+    return _expr(text)
 
 
 def _expr_pg_to_tsql(text: str) -> str:

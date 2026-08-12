@@ -84,6 +84,21 @@ class EngineDDLTests(TestCase):
 
 
 class EngineServiceTests(TestCase):
+    def test_tsql_parenthesized_params_do_not_consume_procedure_body(self):
+        tsql = """CREATE PROCEDURE [dbo].[sp_search]
+(@searchterm NVARCHAR(MAX), @CategoryID INT, @minprice NUMERIC(18,2))
+AS BEGIN
+IF @searchterm IS NULL SET @searchterm = '';
+DECLARE @StartRow INT = 1;
+SELECT * FROM [dbo].[ProductMaster] WHERE [CategoryID] = @CategoryID;
+END"""
+        converted, warnings = translate_routine(tsql, source="procedure", target="postgres")
+        self.assertTrue(converted, warnings)
+        self.assertFalse(any("type 'IS'" in warning or "type 'AND'" in warning for warning in warnings))
+        self.assertIn("searchterm TEXT", converted)
+        self.assertIn("CategoryID INTEGER", converted)
+        self.assertIn("minprice NUMERIC(18,2)", converted)
+
     def test_postgres_unbounded_routine_types_map_without_warnings(self):
         pg_fn = """CREATE FUNCTION dbo.f(searchterm character varying, amount numeric)
 RETURNS numeric LANGUAGE plpgsql AS $$ BEGIN RETURN amount; END; $$"""
@@ -163,6 +178,21 @@ $function$
 
 
 class TriggerTranslationTests(TestCase):
+    def test_tsql_trigger_bracket_identifiers_are_postgres_quoted(self):
+        trig = Trigger(
+            name="trg_price", table="dbo.ProductPriceHistory", timing="AFTER", events=["UPDATE"],
+            definition="""CREATE TRIGGER trg_price ON [dbo].[ProductPriceHistory]
+AFTER UPDATE AS BEGIN
+UPDATE ph SET [IsCurrent] = 0 FROM [dbo].[ProductPriceHistory] ph
+INNER JOIN inserted i ON ph.[ProductID] = i.[ProductID];
+END""",
+        )
+        converted, warnings = translate_trigger(trig, "postgres")
+        self.assertTrue(converted, warnings)
+        self.assertNotIn("[", converted)
+        self.assertIn('UPDATE ph SET "IsCurrent" = 0', converted)
+        self.assertIn('FROM "dbo"."ProductPriceHistory" ph', converted)
+
     def test_plpgsql_trigger_converts_control_flow_booleans_and_row_refs(self):
         trig = Trigger(
             name="trg_product", table="dbo.Product", timing="AFTER", events=["UPDATE"],
