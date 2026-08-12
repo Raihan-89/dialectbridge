@@ -16,6 +16,20 @@
         <span class="badge badge-neutral">{{ job.started_at|date:"Y-m-d H:i:s" }} – {{ job.finished_at|date:"Y-m-d H:i:s" }}</span>
     </div>
 
+    {% if job.status == 'running' or job.status == 'pending' %}
+    <div id="migration-progress" data-status-url="{% url 'migrate-status' job.pk %}" style="margin-bottom:24px;">
+        <h3>Migration progress</h3>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ job.progress_percent }}">
+            <div class="progress-bar" style="width:{{ job.progress_percent }}%"></div>
+        </div>
+        <div class="progress-meta">
+            <span id="progress-stage">{{ job.progress_stage|default:'Starting migration' }}</span>
+            <strong id="progress-percent">{{ job.progress_percent }}%</strong>
+        </div>
+        <p class="subtitle" style="margin:10px 0 0;">You may leave this page. Migration #{{ job.pk }} and its complete report are saved in history.</p>
+    </div>
+    {% endif %}
+
     {% if job.error_message %}
         <div class="alert alert-error">Error: {{ job.error_message }}</div>
     {% endif %}
@@ -165,4 +179,27 @@
 
     <p><a href="{% url 'migrate' %}">← Back to migrations</a></p>
 </div>
+{% if job.status == 'running' or job.status == 'pending' %}
+<script>
+(() => {
+    const panel = document.getElementById('migration-progress');
+    const poll = async () => {
+        try {
+            const response = await fetch(panel.dataset.statusUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+            const data = await response.json();
+            const bar = panel.querySelector('.progress-bar');
+            bar.style.width = `${data.progress_percent}%`;
+            bar.parentElement.setAttribute('aria-valuenow', data.progress_percent);
+            document.getElementById('progress-stage').textContent = data.progress_stage;
+            document.getElementById('progress-percent').textContent = `${data.progress_percent}%`;
+            if (data.finished) window.location.reload();
+            else window.setTimeout(poll, 1200);
+        } catch (_) {
+            window.setTimeout(poll, 2500);
+        }
+    };
+    window.setTimeout(poll, 600);
+})();
+</script>
+{% endif %}
 {% endblock %}

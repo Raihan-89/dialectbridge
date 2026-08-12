@@ -34,13 +34,15 @@ def test_connection(connection: DatabaseConnection) -> dict:
 
 
 def run_migration(source: DatabaseConnection, target: DatabaseConnection,
-                  copy_data: bool = True, reset_target: bool = False) -> dict:
+                  copy_data: bool = True, reset_target: bool = False,
+                  progress_callback=None) -> dict:
     """Run a full migration and return the serialized report dict."""
     source_conn = connector_for(source)
     target_conn = connector_for(target)
     try:
         report = MigrationOrchestrator(
-            source_conn, target_conn, copy_data=copy_data, reset_target=reset_target
+            source_conn, target_conn, copy_data=copy_data, reset_target=reset_target,
+            progress_callback=progress_callback,
         ).run()
         return report.to_dict()
     finally:

@@ -14,6 +14,11 @@
 <div class="grid-2">
     <div class="card">
         <h2>Run Migration</h2>
+        {% if running_job %}
+        <div class="alert alert-warning">
+            Migration <a href="{% url 'migrate-detail' running_job.pk %}"><strong>#{{ running_job.pk }} — {{ running_job.name }}</strong></a> is currently running.
+        </div>
+        {% endif %}
         {% if connections %}
         <form method="post" class="form-grid">
             {% csrf_token %}
@@ -37,7 +42,9 @@
             </div>
             <label class="checkbox-line"><input type="checkbox" name="copy_data" checked> Copy table data</label>
             <label class="checkbox-line"><input type="checkbox" name="reset_target"> <span>Drop target schemas before migrating <span class="badge badge-warn">destructive</span></span></label>
-            <button type="submit" class="btn">Run Migration</button>
+            <button type="submit" class="btn" id="run-migration" {% if running_job %}disabled{% endif %}>
+                {% if running_job %}Migration in progress…{% else %}Run Migration{% endif %}
+            </button>
         </form>
         {% else %}
         <div class="empty-state">
@@ -48,12 +55,13 @@
     </div>
 
     <div class="card">
-        <h2>Recent Migrations</h2>
+        <h2>Migration History</h2>
         {% if recent_jobs %}
         <div class="table-wrap">
             <table>
                 <thead>
                     <tr>
+                        <th>Serial</th>
                         <th>Name</th>
                         <th>Source → Target</th>
                         <th>Status</th>
@@ -64,6 +72,7 @@
                 <tbody>
                     {% for job in recent_jobs %}
                     <tr>
+                        <td><a class="mono" href="{% url 'migrate-detail' job.pk %}"><strong>#{{ job.pk }}</strong></a></td>
                         <td><strong>{{ job.name }}</strong></td>
                         <td>{{ job.source.name }} → {{ job.target.name }}</td>
                         <td>

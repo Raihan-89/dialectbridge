@@ -1,5 +1,9 @@
+import threading
+
 from django.contrib import messages
+from django.db import close_old_connections
 from django.db.models import Q
+from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 
@@ -111,6 +115,10 @@ def connections_view(request):
 def migrate_view(request):
     """Run a migration between two saved connections and show the report."""
     if request.method == "POST":
+        active = MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first()
+        if active:
+            messages.warning(request, f"Migration #{active.pk} is already running.")
+            return redirect("migrate-detail", pk=active.pk)
         source = get_object_or_404(DatabaseConnection, pk=request.POST.get("source"))
         target = get_object_or_404(DatabaseConnection, pk=request.POST.get("target"))
         copy_data = request.POST.get("copy_data") == "on"
@@ -127,27 +135,13 @@ def migrate_view(request):
             created_by=request.user if request.user.is_authenticated else None,
         )
         job.save()
-
-        try:
-            report = migration_service.run_migration(
-                source, target, copy_data=copy_data, reset_target=reset_target
-            )
-            job.report = report
-            job.warnings = report.get("warnings", [])
-            job.status = MigrationJob.Status.COMPLETED if report.get("success") else MigrationJob.Status.PARTIAL
-            migration_service.record_migration_errors(job, report)
-        except Exception as exc:
-            job.status = MigrationJob.Status.FAILED
-            job.error_message = str(exc)
-        finally:
-            job.finished_at = timezone.now()
-            job.save()
-
+        threading.Thread(target=_run_migration_job, args=(job.pk,), daemon=True).start()
         return redirect("migrate-detail", pk=job.pk)
 
     context = {
         "connections": DatabaseConnection.objects.all(),
-        "recent_jobs": MigrationJob.objects.all()[:10],
+        "recent_jobs": MigrationJob.objects.all(),
+        "running_job": MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first(),
     }
     return render(request, "converter/migrate.html", context)
 
@@ -155,6 +149,52 @@ def migrate_view(request):
 def migrate_detail_view(request, pk):
     job = get_object_or_404(MigrationJob, pk=pk)
     return render(request, "converter/migrate_detail.html", {"job": job})
+
+
+def migrate_status_view(request, pk):
+    job = get_object_or_404(MigrationJob, pk=pk)
+    return JsonResponse({
+        "id": job.pk,
+        "status": job.status,
+        "status_label": job.get_status_display(),
+        "progress_percent": job.progress_percent,
+        "progress_stage": job.progress_stage,
+        "finished": job.status in {
+            MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL, MigrationJob.Status.FAILED,
+        },
+    })
+
+
+def _run_migration_job(job_id: int) -> None:
+    """Run a web-started migration outside the request and persist progress."""
+    close_old_connections()
+    try:
+        job = MigrationJob.objects.select_related("source", "target").get(pk=job_id)
+
+        def progress(percent, stage):
+            MigrationJob.objects.filter(pk=job_id).update(
+                progress_percent=percent, progress_stage=stage,
+            )
+
+        report = migration_service.run_migration(
+            job.source, job.target, copy_data=job.copy_data,
+            reset_target=job.reset_target, progress_callback=progress,
+        )
+        job.report = report
+        job.warnings = report.get("warnings", [])
+        job.status = MigrationJob.Status.COMPLETED if report.get("success") else MigrationJob.Status.PARTIAL
+        job.progress_percent = 100
+        job.progress_stage = "Migration completed" if report.get("success") else "Completed with errors"
+        migration_service.record_migration_errors(job, report)
+    except Exception as exc:
+        job = MigrationJob.objects.get(pk=job_id)
+        job.status = MigrationJob.Status.FAILED
+        job.error_message = str(exc)
+        job.progress_stage = "Migration failed"
+    finally:
+        job.finished_at = timezone.now()
+        job.save()
+        close_old_connections()
 
 
 def errors_view(request):

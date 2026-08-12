@@ -91,13 +91,20 @@ def _is_fk_or_check(stmt: str) -> bool:
 
 
 class MigrationOrchestrator:
-    def __init__(self, source, target, copy_data: bool = True, reset_target: bool = False):
+    def __init__(self, source, target, copy_data: bool = True, reset_target: bool = False,
+                 progress_callback=None):
         self.source = source
         self.target = target
         self.copy_data = copy_data
         self.reset_target = reset_target
+        self.progress_callback = progress_callback
+
+    def _progress(self, percent: int, stage: str) -> None:
+        if self.progress_callback:
+            self.progress_callback(percent, stage)
 
     def run(self) -> MigrationReport:
+        self._progress(5, "Connecting and extracting source schema")
         report = MigrationReport(
             source_db=self.source.database, target_db=self.target.database,
             started_at=_now(),
@@ -116,10 +123,12 @@ class MigrationOrchestrator:
         report.warnings.extend(schema.warnings)
 
         # ---- 2. convert -----------------------------------------------------
+        self._progress(20, "Converting schema and database objects")
         ddl, conv_warnings = build_database_ddl(schema, self.target.dialect)
         report.warnings.extend(conv_warnings)
 
         # ---- 3. apply structural DDL -----------------------------------------
+        self._progress(35, "Creating schemas, tables, and indexes")
         schemas = sorted({name.split(".")[0] for t in schema.tables for name in (t.name,)})
 
         # Optional destructive reset: drop the target objects we are about to
@@ -152,11 +161,13 @@ class MigrationOrchestrator:
                 self._apply(report, "index", stmt)
 
         # ---- 4. copy data -----------------------------------------------------
+        self._progress(55, "Copying table data")
         if self.copy_data:
             for table in schema.all_tables_in_dependency_order():
                 self._copy_table(report, table)
 
         # ---- 5. referential + object DDL ---------------------------------------
+        self._progress(75, "Creating constraints, views, routines, and triggers")
         # Views and routines may reference tables by bare name (T-SQL defaults
         # to the dbo schema); point PostgreSQL's search_path at the migrated
         # schemas so those references resolve.
@@ -170,6 +181,7 @@ class MigrationOrchestrator:
             self._apply(report, kind, stmt)
 
         # ---- 6. verify ----------------------------------------------------------
+        self._progress(90, "Verifying migrated row counts")
         report.verification = self._verify(schema)
 
         report.finished_at = _now()
@@ -187,6 +199,7 @@ class MigrationOrchestrator:
             "data_failed": sum(1 for r in report.data_results if r.status == "failed"),
             "warnings": len(report.warnings),
         }
+        self._progress(98, "Saving migration report")
         return report
 
     # ------------------------------------------------------------------

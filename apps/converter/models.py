@@ -91,6 +91,8 @@ class MigrationJob(models.Model):
     report = models.JSONField(default=dict, blank=True)
     warnings = models.JSONField(default=list, blank=True)
     error_message = models.TextField(blank=True)
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+    progress_stage = models.CharField(max_length=255, blank=True, default="Queued")
 
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)

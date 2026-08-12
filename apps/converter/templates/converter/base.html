@@ -247,6 +247,9 @@
         .meta-list { display: grid; gap: 6px; font-size: 14px; }
         .meta-list .label { color: var(--muted); display: inline-block; min-width: 110px; }
         .mono { font-family: var(--font-mono); font-size: 13px; }
+        .progress-track { width: 100%; height: 12px; overflow: hidden; border-radius: 999px; background: var(--border); }
+        .progress-bar { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--primary), #7c3aed); transition: width .35s ease; }
+        .progress-meta { display: flex; justify-content: space-between; gap: 12px; margin: 8px 0 0; color: var(--muted); font-size: 13px; }
     </style>
 </head>
 <body>

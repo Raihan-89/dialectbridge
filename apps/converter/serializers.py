@@ -85,9 +85,11 @@ class MigrationJobSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "source", "target", "source_name", "target_name",
             "copy_data", "reset_target", "status", "report", "warnings", "error_message",
+            "progress_percent", "progress_stage",
             "started_at", "finished_at", "created_at",
         ]
         read_only_fields = [
             "status", "report", "warnings", "error_message",
+            "progress_percent", "progress_stage",
             "started_at", "finished_at",
         ]

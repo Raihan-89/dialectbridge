@@ -93,13 +93,7 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
                 warnings.append(f"RETURNS {returns}: {ret_warn}")
             sig_returns = converted_returns or "TEXT"
     else:
-        # Infer concrete result columns so callers can use `SELECT *` directly
-        # instead of being forced into a column definition list (SETOF record).
-        result_cols = _infer_result_columns(transformed, tables)
-        if result_cols:
-            sig_returns = "TABLE(" + ", ".join(f'"{alias}" {coltype}' for alias, coltype in result_cols) + ")"
-        else:
-            sig_returns = "SETOF record" if has_result_select else "void"
+        sig_returns = ""
 
     param_list = []
     for pname, ptype, output in params:
@@ -115,8 +109,15 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
         # parse the @table variable form later; keep a placeholder
         sig_returns = "TABLE(...)"
 
+    if kind in ("PROCEDURE", "PROC"):
+        transformed, cursor_params = _procedure_result_cursors(transformed)
+        param_list.extend(cursor_params)
+
     signature = ", ".join(param_list)
-    header = f"CREATE OR REPLACE FUNCTION {name}({signature}) RETURNS {sig_returns} AS $$"
+    if kind == "FUNCTION":
+        header = f"CREATE OR REPLACE FUNCTION {name}({signature}) RETURNS {sig_returns} AS $$"
+    else:
+        header = f"CREATE OR REPLACE PROCEDURE {name}({signature}) AS $$"
     footer = "$$ LANGUAGE plpgsql;"
 
     # table-returning functions need a return statement
@@ -126,6 +127,22 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
     return converted, warnings
+
+
+def _procedure_result_cursors(transformed: list[str]) -> tuple[list[str], list[str]]:
+    """Expose SQL Server procedure result sets as PostgreSQL refcursors."""
+    out, cursor_params = [], []
+    cursor_number = 0
+    for line in transformed:
+        if line.startswith("RETURN QUERY "):
+            cursor_number += 1
+            cursor = "result_cursor" if cursor_number == 1 else f"result_cursor_{cursor_number}"
+            query = line[len("RETURN QUERY "):]
+            out.append(f"OPEN {cursor} FOR {query}")
+            cursor_params.append(f"INOUT {cursor} refcursor DEFAULT '{cursor}'")
+        else:
+            out.append(line)
+    return out, cursor_params
 
 
 def _assemble_plpgsql(header: str, declared: dict[str, str], transformed: list[str], footer: str) -> str:
@@ -1110,6 +1127,9 @@ def _expr(text: str) -> str:
 
 def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
+    is_pg_procedure = bool(re.search(
+        r"CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\b", sql, re.IGNORECASE
+    ))
 
     # pg_get_functiondef output: LANGUAGE plpgsql comes between RETURNS and the
     # (possibly named) dollar-quoted body; PG procedures have no RETURNS clause.
@@ -1208,7 +1228,7 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
     declares = "".join(declare_lines)
 
     lower_returns = returns.lower()
-    is_scalar_fn = not (
+    is_scalar_fn = not is_pg_procedure and not (
         lower_returns.startswith(("void", "setof "))
         or "table(" in lower_returns
     )
@@ -1250,9 +1270,21 @@ def _parse_params_reverse(param_text: str) -> tuple[list[tuple[str, str, bool]],
         if not part:
             continue
         output = False
-        if part.upper().startswith("OUT "):
+        if part.upper().startswith("INOUT "):
+            # Result cursors are an implementation detail used to preserve
+            # SQL Server procedure result sets; they disappear on round-trip.
+            if re.search(r"\brefcursor\b", part, re.IGNORECASE):
+                continue
+            output = True
+            part = part[6:].strip()
+        elif part.upper().startswith("OUT "):
             output = True
             part = part[4:].strip()
+        elif part.upper().startswith("IN "):
+            part = part[3:].strip()
+        # Defaults are PostgreSQL call-site behavior, not part of a T-SQL
+        # type. Strip them before type conversion.
+        part = re.split(r"\s+DEFAULT\s+", part, maxsplit=1, flags=re.IGNORECASE)[0].strip()
         # name type
         m = re.match(r"\"?([\w\d_]+)\"?\s+(.+)$", part)
         if m:
@@ -1363,6 +1395,10 @@ def _transform_plpgsql_body(body: str) -> tuple[list[str], list[str], dict[str, 
         if upper.startswith("RETURN QUERY"):
             out.append(_expr_rev(line[len("RETURN QUERY"):].strip()) + ";")
             continue
+        m = re.match(r"^OPEN\s+[A-Za-z_]\w*\s+FOR\s+(.+)$", line, re.IGNORECASE | re.DOTALL)
+        if m:
+            out.append(_expr_rev(m.group(1)) + ";")
+            continue
         if upper.startswith("RETURN NEXT"):
             out.append(_expr_rev(line[len("RETURN NEXT"):].strip()) + ";")
             continue
@@ -1437,6 +1473,12 @@ def _repair_tsql_parameter_contexts(text: str, params: list[tuple[str, str, bool
         text = re.sub(rf"\[{re.escape(canon)}\]\s+IS\s+NULL", f"@{canon} IS NULL", text, flags=re.IGNORECASE)
         text = re.sub(rf"=\s*\[{re.escape(canon)}\]", f"= @{canon}", text, flags=re.IGNORECASE)
         text = re.sub(rf"(?<!\.)\[{re.escape(canon)}\]", f"@{canon}", text, flags=re.IGNORECASE)
+        # Quoted source parameters may only become @variables in the step
+        # above. Repair the resulting predicate after that normalization too.
+        text = re.sub(
+            rf"\b(WHERE|AND|OR)\s+@{re.escape(canon)}\s*=\s*@{re.escape(canon)}\b",
+            rf"\1 [{canon}] = @{canon}", text, flags=re.IGNORECASE,
+        )
         text = text.replace(column_marker, f"[{canon}]")
     for i, value in enumerate(protected):
         text = text.replace(f"\x03{i}\x03", value)

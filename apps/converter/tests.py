@@ -1,5 +1,6 @@
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 
 from engine.schema import CheckConstraint, Column, Constraint, Database, Index, Table, Trigger, View
@@ -84,6 +85,61 @@ class EngineDDLTests(TestCase):
 
 
 class EngineServiceTests(TestCase):
+    def test_tsql_procedure_stays_procedure_with_refcursor_result(self):
+        tsql = """CREATE PROCEDURE dbo.list_products @active BIT
+AS BEGIN SELECT ProductID FROM dbo.Products WHERE IsActive = @active; END"""
+        converted, warnings = translate_routine(tsql, source="procedure", target="postgres")
+        self.assertTrue(converted, warnings)
+        self.assertIn("CREATE OR REPLACE PROCEDURE list_products(", converted)
+        self.assertIn("INOUT result_cursor refcursor DEFAULT 'result_cursor'", converted)
+        self.assertIn("OPEN result_cursor FOR SELECT", converted)
+        self.assertNotIn("CREATE OR REPLACE FUNCTION", converted)
+
+    def test_postgres_procedure_refcursor_round_trips_to_tsql_procedure(self):
+        pg = """CREATE OR REPLACE PROCEDURE dbo.list_products(active boolean,
+INOUT result_cursor refcursor DEFAULT 'result_cursor') AS $$
+BEGIN
+OPEN result_cursor FOR SELECT "ProductID" FROM "dbo"."Products" WHERE "IsActive" = active;
+END;
+$$ LANGUAGE plpgsql;"""
+        converted, warnings = translate_routine(pg, source="procedure", target="tsql")
+        self.assertTrue(converted, warnings)
+        self.assertIn("CREATE PROCEDURE [dbo].[list_products] (@active BIT)", converted)
+        self.assertIn("SELECT [ProductID] FROM [dbo].[Products]", converted)
+        self.assertNotIn("result_cursor", converted)
+        self.assertNotIn("CREATE FUNCTION", converted)
+
+    def test_postgres_explicit_in_parameters_convert_to_unique_tsql_variables(self):
+        pg = """CREATE PROCEDURE dbo.search(IN searchterm character varying,
+IN "CategoryID" integer, IN thresholdpercent numeric,
+INOUT result_cursor refcursor DEFAULT 'result_cursor'::refcursor)
+LANGUAGE plpgsql AS $$ BEGIN
+OPEN result_cursor FOR SELECT * FROM "dbo"."Products" p
+WHERE (searchterm IS NULL OR p."Name" LIKE searchterm)
+AND ("CategoryID" IS NULL OR p."CategoryID" = "CategoryID")
+AND p."Stock" <= thresholdpercent;
+END; $$"""
+        converted, warnings = translate_routine(pg, source="procedure", target="tsql")
+        self.assertEqual(warnings, [])
+        self.assertIn("@searchterm NVARCHAR(MAX)", converted)
+        self.assertIn("@CategoryID INT", converted)
+        self.assertIn("@thresholdpercent NUMERIC", converted)
+        self.assertNotIn("@IN", converted)
+        self.assertIn("@searchterm IS NULL", converted)
+        self.assertIn("p.[CategoryID] = @CategoryID", converted)
+        self.assertIn("p.[Stock] <= @thresholdpercent", converted)
+
+    def test_quoted_parameter_column_collision_keeps_column_on_left(self):
+        pg = """CREATE PROCEDURE dbo.details(IN "ProductID" integer,
+INOUT result_cursor refcursor DEFAULT 'result_cursor') AS $$ BEGIN
+OPEN result_cursor FOR SELECT "ImageID" FROM "dbo"."Images"
+WHERE "ProductID" = "ProductID";
+END; $$ LANGUAGE plpgsql;"""
+        converted, warnings = translate_routine(pg, source="procedure", target="tsql")
+        self.assertEqual(warnings, [])
+        self.assertIn("WHERE [ProductID] = @ProductID", converted)
+        self.assertNotIn("WHERE @ProductID = @ProductID", converted)
+
     def test_tsql_parenthesized_params_do_not_consume_procedure_body(self):
         tsql = """CREATE PROCEDURE [dbo].[sp_search]
 (@searchterm NVARCHAR(MAX), @CategoryID INT, @minprice NUMERIC(18,2))
@@ -845,3 +901,39 @@ class ConvertAPITests(TestCase):
         })
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("BIT DEFAULT 1", response.json()["converted_sql"])
+
+
+class MigrationProgressViewTests(TestCase):
+    def setUp(self):
+        self.source = DatabaseConnection.objects.create(
+            name="Source", engine="postgres", role="source", host="localhost",
+            port=5432, database="source", username="user",
+        )
+        self.target = DatabaseConnection.objects.create(
+            name="Target", engine="mssql", role="target", host="localhost",
+            port=1433, database="target", username="user",
+        )
+        self.job = MigrationJob.objects.create(
+            name="Saved migration", source=self.source, target=self.target,
+            status=MigrationJob.Status.RUNNING, progress_percent=55,
+            progress_stage="Copying table data", started_at=timezone.now(),
+        )
+
+    def test_status_endpoint_returns_persisted_progress(self):
+        response = self.client.get(reverse("migrate-status", args=[self.job.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["progress_percent"], 55)
+        self.assertEqual(response.json()["progress_stage"], "Copying table data")
+        self.assertFalse(response.json()["finished"])
+
+    def test_history_serial_links_to_full_saved_report(self):
+        self.job.status = MigrationJob.Status.COMPLETED
+        self.job.progress_percent = 100
+        self.job.report = {"summary": {"tables": 3}, "schema_results": [], "data_results": []}
+        self.job.save()
+        listing = self.client.get(reverse("migrate"))
+        self.assertContains(listing, f"#{self.job.pk}")
+        self.assertContains(listing, reverse("migrate-detail", args=[self.job.pk]))
+        detail = self.client.get(reverse("migrate-detail", args=[self.job.pk]))
+        self.assertContains(detail, "Saved migration")
+        self.assertContains(detail, "Tables")
