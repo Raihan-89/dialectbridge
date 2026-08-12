@@ -16,12 +16,18 @@ from __future__ import annotations
 import re
 
 from engine.translators.functions import translate_functions
-from engine.translators.sql_builder import convert_type
+from engine.translators.sql_builder import convert_type, fix_boolean_predicates, _translate_top
 
 PARAM_RE = re.compile(
-    r"@([A-Za-z_][A-Za-z0-9_]*)\s+([^\s,]+(?:\([^)]*\))?)\s*(OUTPUT|OUT)?",
+    r"@([A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"(\[?[A-Za-z_][A-Za-z0-9_]*\]?\s*(?:\([^)]*\))?)"
+    r"\s*(OUTPUT|OUT)?"
+    r"(?:\s*=\s*[^,]+)?",
     re.IGNORECASE,
 )
+
+# A T-SQL type token: int, [int], decimal(18,2), [decimal](18,2), varchar(50)
+_TSQL_TYPE_RE = r"\[?[A-Za-z_][A-Za-z0-9_]*\]?\s*(?:\([^)]*\))?"
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +41,7 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
     header_match = re.search(
         r"CREATE\s+(?:OR\s+ALTER\s+)?(PROCEDURE|PROC|FUNCTION)\s+"
         r"(?:\[?[\w\d_]+\]?\.)?\[?([\w\d_]+)\]?"
-        r"(?:\s*\((.*?)\)|\s+(@.*?))?"
+        r"(?:\s*\((.*)\)|\s+(@.*?))?"
         r"(?=\s*(?:WITH|AS|RETURNS)\b|\s*$)",
         sql, re.IGNORECASE | re.DOTALL,
     )
@@ -49,7 +55,7 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
     # ---- RETURNS clause for functions --------------------------------------
     returns = "void"
     if kind == "FUNCTION":
-        ret_match = re.search(r"RETURNS\s+(.+?)\s*(?:AS\b|BEGIN|RETURN\b)", sql, re.IGNORECASE | re.DOTALL)
+        ret_match = re.search(r"RETURNS\s+(.+?)\s*(?:WITH\b|AS\b|BEGIN\b|RETURN\b)", sql, re.IGNORECASE | re.DOTALL)
         if ret_match:
             returns = ret_match.group(1).strip()
 
@@ -68,10 +74,21 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
     transformed, t_warns, declared = _transform_tsql_body(body, kind, has_result_select)
     warnings.extend(t_warns)
 
+    # Comparisons against BIT/BOOLEAN columns (col = 1) are invalid in
+    # PostgreSQL (boolean = integer) — rewrite to true/false.
+    if tables:
+        transformed = [fix_boolean_predicates(ln, tables, "tsql") for ln in transformed]
+
     if kind == "FUNCTION":
         if returns.lower().strip() == "table" or "table" in returns.lower():
-            returns = "TABLE(...)"
-        sig_returns = returns
+            sig_returns = "TABLE(...)"
+        else:
+            # Scalar return types are still T-SQL types — map to PostgreSQL
+            # (nvarchar -> TEXT, decimal(p,s) -> NUMERIC(p,s), ...).
+            converted_returns, ret_warn = convert_type(returns, "tsql", "postgres")
+            if ret_warn:
+                warnings.append(f"RETURNS {returns}: {ret_warn}")
+            sig_returns = converted_returns or "TEXT"
     else:
         # Infer concrete result columns so callers can use `SELECT *` directly
         # instead of being forced into a column definition list (SETOF record).
@@ -150,7 +167,7 @@ def _parse_params(param_text: str, source: str) -> tuple[list[tuple[str, str, bo
 
 def _has_result_select(body: str) -> bool:
     # bare SELECT returning rows: not "SELECT @x =", not "SELECT INTO #"
-    stripped = re.sub(r"SELECT\s+@[\w]+\s*=", "", body, flags=re.IGNORECASE)
+    stripped = re.sub(r"SELECT\s+(?:TOP\s*(?:\(\d+\)|\d+)\s+)?@[\w]+\s*=", "", body, flags=re.IGNORECASE)
     stripped = re.sub(r"SELECT\s+[^#]*?\s+INTO\s+", "", stripped, flags=re.IGNORECASE)
     return bool(re.search(r"\bSELECT\b", stripped, flags=re.IGNORECASE))
 
@@ -275,36 +292,497 @@ def _join_declares(declared: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _transform_tsql_body(body: str, kind: str, returns_set: bool) -> tuple[list[str], list[str], dict[str, str]]:
+def _split_cond_body(rest: str) -> tuple[str, str]:
+    """Split ``IF (cond) stmt`` into ``((cond), "stmt")``.
+
+    When the rest starts with a balanced parenthesised condition and more
+    follows on the same line, the tail is the single-statement branch body.
+    Unparenthesised or unbalanced conditions take the whole rest as the
+    condition with no tail."""
+    if not rest.startswith("("):
+        return rest, ""
+    depth = 0
+    for i, ch in enumerate(rest):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return rest[: i + 1], rest[i + 1 :].strip()
+    return rest, ""
+
+
+def _paren_delta(text: str) -> int:
+    """Net change in open-paren depth across ``text``, ignoring parens inside
+    string literals and ``--`` line comments (brackets are identifiers in
+    T-SQL and must NOT count as grouping)."""
+    delta, in_str = 0, False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == "'":
+            in_str = True
+        elif ch == "-" and i + 1 < len(text) and text[i + 1] == "-":
+            break
+        elif ch == "(":
+            delta += 1
+        elif ch == ")":
+            delta -= 1
+        i += 1
+    return delta
+
+
+# Keywords that never continue a statement already in the buffer: a line
+# starting with one begins a brand-new statement.
+_STMT_START_RE = re.compile(
+    r"^(?:RETURN|RAISERROR|THROW|PRINT|DECLARE|EXEC(?:UTE)?|WAITFOR|GOTO|BREAK|CONTINUE|"
+    r"IF|WHILE|BEGIN|END|ELSE|UPDATE|INSERT|DELETE|MERGE|COMMIT|ROLLBACK|TRUNCATE|DROP|"
+    r"CREATE|ALTER|WITH)\b",
+    re.IGNORECASE,
+)
+_SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
+_SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT)\b", re.IGNORECASE)
+
+
+def _split_top_level_else(text: str) -> tuple[str, str | None]:
+    """Split ``... ELSE ...`` on the first top-level IF-ELSE keyword.
+
+    Returns ``(before, after)`` where ``after`` is None when the ELSE belongs
+    to a CASE expression (an ELSE that is preceded at depth 0 by an unclosed
+    CASE is a CASE-ELSE, not an IF-ELSE)."""
+    depth, in_str, case_depth = 0, False, 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and text[i : i + 4].upper() == "CASE":
+            if (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) and (
+                i + 4 >= len(text) or not (text[i + 4].isalnum() or text[i + 4] == "_")
+            ):
+                case_depth += 1
+        elif depth == 0 and text[i : i + 3].upper() == "END":
+            if (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) and (
+                i + 3 >= len(text) or not (text[i + 3].isalnum() or text[i + 3] == "_")
+            ):
+                case_depth = max(0, case_depth - 1)
+        elif depth == 0 and case_depth == 0 and text[i : i + 4].upper() == "ELSE":
+            if (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")) and (
+                i + 4 >= len(text) or not (text[i + 4].isalnum() or text[i + 4] == "_")
+            ):
+                return text[:i].strip(), text[i + 4:].strip()
+        i += 1
+    return text.strip(), None
+
+
+_CONTINUATION_ENDINGS = {
+    "(",
+    ",",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "=",
+    ".",
+    "AND",
+    "OR",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "WHERE",
+    "FROM",
+    "ON",
+    "AS",
+    "SET",
+    "VALUES",
+}
+
+
+def _is_complete_tail(piece: str) -> bool:
+    """A same-line branch body is complete when its parens balance and it does
+    not dangle on a continuation token (``+``, ``,``, ``(``, ``=``, ...)."""
+    if _paren_delta(piece) != 0:
+        return False
+    tokens = piece.rstrip().strip().split()
+    if not tokens:
+        return False
+    return tokens[-1].rstrip(";").upper() not in _CONTINUATION_ENDINGS
+
+
+def _case_open(text: str) -> bool:
+    """True when ``text`` contains an unclosed CASE expression (CASE keyword
+    count exceeds END count at paren depth 0, outside strings). Used to keep a
+    multi-line CASE from being mistaken for statement boundaries: while a CASE
+    is open, lines starting with ELSE/END/THEN belong to the CASE, not to a new
+    statement or a block terminator."""
+    depth, in_str, cases, ends = 0, False, 0, 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0:
+            if text[i : i + 4].upper() == "CASE" and (
+                i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            ) and (i + 4 >= n or not (text[i + 4].isalnum() or text[i + 4] == "_")):
+                cases += 1
+                i += 3
+            elif text[i : i + 3].upper() == "END" and (
+                i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            ) and (i + 3 >= n or not (text[i + 3].isalnum() or text[i + 3] == "_")):
+                ends += 1
+                i += 2
+        i += 1
+    return cases > ends
+
+
+
+def _normalize_statement_ends(body: str) -> str:
+    """Insert ``;`` after statements whose T-SQL sources omit it but whose
+    boundary is unambiguous: RAISERROR(...) once its balanced parens close, and
+    single-line THROW / PRINT statements. This keeps a missing ``;`` from
+    merging two statements into one buffer."""
+    out = []
+    i = 0
+    n = len(body)
+    in_str = False
+    while i < n:
+        ch = body[i]
+        if in_str:
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < n and body[i + 1] == "'":
+                    out.append(body[i + 1])
+                    i += 1
+                else:
+                    in_str = False
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "-" and i + 1 < n and body[i + 1] == "-":
+            while i < n and body[i] != "\n":
+                out.append(body[i])
+                i += 1
+            continue
+        m = re.match(r"\bRAISERROR\b\s*\(", body[i:], re.IGNORECASE)
+        if m:
+            out.append(body[i : i + m.end()])
+            i += m.end()
+            depth = 1
+            while i < n and depth:
+                c = body[i]
+                if c == "'":
+                    out.append(c)
+                    i += 1
+                    while i < n:
+                        if body[i] == "'":
+                            if i + 1 < n and body[i + 1] == "'":
+                                out.append("''")
+                                i += 2
+                                continue
+                            out.append("'")
+                            i += 1
+                            break
+                        out.append(body[i])
+                        i += 1
+                    continue
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                out.append(c)
+                i += 1
+            j = i
+            while j < n and body[j] in " \t":
+                j += 1
+            if j < n and body[j] not in ";":
+                out.append(";")
+            continue
+        m = re.match(r"\b(THROW|PRINT)\b\s", body[i:], re.IGNORECASE)
+        if m and _paren_delta(body[i : body.find("\n", i) if body.find("\n", i) != -1 else n]) == 0:
+            end = body.find("\n", i)
+            line_end = end if end != -1 else n
+            line = body[i:line_end]
+            stripped = line.strip()
+            if not stripped.endswith(";") and not stripped.endswith("+") and not stripped.endswith(",") and not stripped.endswith("("):
+                out.append(line)
+                out.append(";")
+            else:
+                out.append(line)
+            i = line_end
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _unbalanced_parens(text: str) -> int:
+    """Net open-paren count of ``text`` (ignoring string literals)."""
+    depth = 0
+    in_str = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+        elif ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def _join_balanced_lines(body: str) -> list[str]:
+    """Split ``body`` into logical lines, joining any line that ends with an
+    unbalanced ``(`` together with its following lines until the parens close.
+
+    A multi-line T-SQL condition such as ``IF EXISTS (`` ... ``)`` must be
+    treated as one line so the IF/WHILE control handling can consume it."""
+    joined: list[str] = []
+    acc: list[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("--"):
+            joined.append(line)
+            continue
+        if acc:
+            acc.append(line)
+            if _unbalanced_parens(" ".join(acc)) == 0:
+                joined.append(" ".join(acc))
+                acc = []
+            continue
+        if _unbalanced_parens(line) != 0:
+            acc.append(line)
+        else:
+            joined.append(line)
+    if acc:
+        joined.append(" ".join(acc))
+    return joined
+
+
+def _transform_tsql_statement(line: str, statement_fn, declared, t_warns, returns_set) -> str | None:
+    """Rewrite a single completed statement, honoring an optional override."""
+    if statement_fn is not None:
+        return statement_fn(line, declared, t_warns, returns_set)
+    return _transform_statement(line, declared, t_warns, returns_set)
+
+
+def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=None) -> tuple[list[str], list[str], dict[str, str]]:
     """Body transformation with statement accumulation.
 
     Statements may span several lines and end with ``;``, so lines are
     accumulated into a buffer until the terminating semicolon (or a
     control keyword / blank line) and transformed as a whole — a multi-line
     ``SELECT ... FROM ... JOIN ... GROUP BY ...`` must stay one statement.
-    Returns (output lines, warnings, declared vars).
+    Returns (output lines, warnings, declared vars). ``statement_fn``, when
+    given, overrides ``_transform_statement`` for completed statements (used
+    by the trigger translator).
+
+    Block handling models T-SQL's grammar where an IF/WHILE takes exactly one
+    statement (a BEGIN...END block or a single statement) and there is no
+    explicit terminator for the whole IF. Stack entries:
+      ("if", "branch")  then-branch active
+      ("if", "else")    else-branch active
+      ("while", "branch")
+      "begin" / "try"
+    ``waiting`` means the top if's then-branch just completed and the next
+    token decides whether an ELSE follows or the IF closes (END IF;).
     """
+    body = _normalize_statement_ends(body)
     out: list[str] = []
     t_warns: list[str] = []
     declared: dict[str, str] = {}
-    stack: list[str] = []
+    stack: list = []
     buf: list[str] = []
+    waiting = False
+    depth = 0
+
+    def _branch_completed() -> None:
+        """The top if/while entry's branch (single statement or BEGIN block)
+        has finished. A branch-mode if waits for a possible ELSE; everything
+        else closes immediately."""
+        nonlocal waiting
+        entry = stack[-1]
+        if entry[0] == "if" and entry[1] == "branch":
+            waiting = True
+        else:
+            _close_now()
+
+    def _close_now() -> None:
+        """Emit the terminator for the top if/while and pop it. If the closed
+        entry was the single-statement branch of the entry below, resolve that
+        too."""
+        nonlocal waiting
+        entry = stack.pop()
+        out.append("END IF;" if entry[0] == "if" else "END LOOP;")
+        waiting = False
+        if stack and stack[-1][0] in ("if", "while"):
+            _branch_completed()
 
     def flush() -> None:
         nonlocal buf
         if not buf:
             return
-        stmt = _transform_statement(" ".join(buf).rstrip(";").strip(), declared, t_warns, returns_set)
+        stmt = _transform_tsql_statement(" ".join(buf).rstrip(";").strip(), statement_fn, declared, t_warns, returns_set)
         buf = []
         if stmt is not None:
             out.append(stmt)
+        if stack and stack[-1][0] in ("if", "while"):
+            _branch_completed()
 
-    for raw_line in body.splitlines():
+    def _inline_block(block: str) -> None:
+        """Single-line ``BEGIN a; b; END`` block: emit BEGIN, each statement,
+        then END;. Falls back to buffering when the inner body is not plain
+        semicolon-separated statements."""
+        inner = block[len("BEGIN"):].rsplit("END", 1)[0]
+        out.append("BEGIN")
+        for piece in inner.split(";"):
+            piece = piece.strip()
+            if not piece:
+                continue
+            stmt = _transform_tsql_statement(piece, statement_fn, declared, t_warns, returns_set)
+            if stmt:
+                out.append(stmt)
+        out.append("END;")
+
+    def _activate_else() -> None:
+        """Switch the top if from its then-branch to its else-branch and emit
+        the ``ELSE`` keyword."""
+        nonlocal waiting
+        waiting = False
+        if stack and stack[-1][0] == "if" and stack[-1][1] == "branch":
+            stack[-1] = ("if", "else")
+        out.append("ELSE")
+
+    def _process_end() -> None:
+        """Close the top block on an ``END`` keyword."""
+        if not stack:
+            out.append("END;")
+            return
+        block = stack.pop()
+        if block == "begin":
+            out.append("END;")
+            if stack and stack[-1][0] in ("if", "while"):
+                _branch_completed()
+        elif block[0] in ("if", "while"):
+            out.append("END IF;" if block[0] == "if" else "END LOOP;")
+        elif block == "try":
+            out.append("END;")
+
+    def _handle_branch_body(piece: str, then_branch: bool) -> None:
+        """Emit the body of a single-statement branch on the same line as its
+        IF/WHILE/ELSE. ``piece`` may be a ``BEGIN ... END`` inline block, an
+        ``IF ...`` (else-if), a bare ``BEGIN``, or a single statement that is
+        flushed when it looks complete."""
+        piece = piece.strip()
+        if not piece:
+            if then_branch:
+                _branch_completed()
+            return
+        if re.match(r"^BEGIN\b.*\bEND$", piece, re.IGNORECASE):
+            _inline_block(piece)
+            _branch_completed()
+        elif re.match(r"^IF\b", piece, re.IGNORECASE):
+            icond, itail = _split_cond_body(piece[2:].strip())
+            stack.append(("if", "branch"))
+            out.append(f"IF {_expr(icond)} THEN")
+            if itail:
+                ithen, ielse = _split_top_level_else(itail)
+                _handle_branch_body(ithen, then_branch=True)
+                if ielse is not None:
+                    _activate_else()
+                    _handle_branch_body(ielse, then_branch=False)
+        elif piece.upper() == "BEGIN":
+            stack.append("begin")
+            out.append("BEGIN")
+        else:
+            buf.append(piece)
+            if piece.endswith(";") or piece.upper().startswith("DECLARE ") or _is_complete_tail(piece):
+                flush()
+
+    for raw_line in _join_balanced_lines(body):
         line = raw_line.strip()
         if not line:
-            flush()
+            if not _case_open(" ".join(buf)):
+                flush()
+            continue
+        # Standalone T-SQL comments must not merge with (and swallow) the next
+        # statement; they are documentation only and are dropped.
+        if line.startswith("--"):
             continue
         upper = line.upper()
+
+        # A completed single-statement then-branch is resolved by the next
+        # token: ELSE continues it, anything else closes the IF first.
+        if waiting:
+            is_else = bool(re.match(r"^ELSE\b", upper))
+            while waiting and not is_else:
+                _close_now()
+
+        # Statements whose T-SQL sources omit the trailing ';' must still be
+        # split. When the buffer is complete at paren depth 0 and the next
+        # line starts a keyword that can never continue the buffered statement
+        # (RETURN, a second SET, a fresh RAISERROR, ...), the buffer is a full
+        # statement — flush it. Clause keywords that DO continue a statement
+        # (SET after UPDATE, SELECT after WITH/INSERT, ...) never trigger.
+        # While an unclosed CASE sits in the buffer, ELSE/END/THEN lines belong
+        # to the CASE expression, so they are buffered as statement
+        # continuation and keyword flushes are suspended entirely.
+        buf_case = _case_open(" ".join(buf))
+        if buf_case:
+            buf.append(line)
+            depth += _paren_delta(line)
+            if line.endswith(";"):
+                flush()
+            continue
+        if depth == 0 and buf:
+            first_word = upper.split(maxsplit=1)[0] if upper.split() else ""
+            if _STMT_START_RE.match(first_word):
+                flush()
+            elif first_word == "SET" and not _SET_START_EXCEPT.match(buf[0].lstrip()):
+                flush()
+            elif first_word == "SELECT" and not _SELECT_START_EXCEPT.match(buf[0].lstrip()):
+                flush()
 
         is_control = (
             upper in ("BEGIN", "END", "ELSE")
@@ -312,35 +790,66 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool) -> tuple[list[
             or upper.startswith("BEGIN CATCH")
             or upper.startswith("END TRY")
             or upper.startswith("END CATCH")
+            or upper.startswith("END ELSE")
             or re.match(r"^ELSE\s+IF\b", line, re.IGNORECASE)
-            or re.match(r"^IF\s", line, re.IGNORECASE)
-            or re.match(r"^WHILE\s", line, re.IGNORECASE)
+            or re.match(r"^IF\b", line, re.IGNORECASE)
+            or re.match(r"^WHILE\b", line, re.IGNORECASE)
+            or re.match(r"^BEGIN\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE)
+            or re.match(r"^(COMMIT|ROLLBACK)\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE)
         )
         if is_control:
             flush()
+        depth += _paren_delta(line)
+
+        # ---- transaction statements -----------------------------------------
+        # PL/pgSQL functions cannot contain transaction control and already run
+        # inside a single implicit transaction, so BEGIN/COMMIT/ROLLBACK
+        # TRANSACTION are dropped (the statements they guarded still run).
+        if re.match(r"^BEGIN\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
+            t_warns.append("transaction control 'BEGIN TRANSACTION' is not supported inside PL/pgSQL functions and was removed")
+            if stack and stack[-1][0] in ("if", "while"):
+                _branch_completed()
+            continue
+        if re.match(r"^(COMMIT|ROLLBACK)\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
+            t_warns.append(f"transaction control '{upper.split()[0]} TRANSACTION' is not supported inside PL/pgSQL functions and was removed")
+            if stack and stack[-1][0] in ("if", "while"):
+                _branch_completed()
+            continue
 
         # ---- block openers --------------------------------------------------
-        if re.match(r"^IF\s+.*\bBEGIN\s*$", line, re.IGNORECASE):
+        if re.match(r"^IF\b.*\bBEGIN\s*$", line, re.IGNORECASE):
             cond = re.sub(r"\bBEGIN\s*$", "", line, flags=re.IGNORECASE)
             cond = cond[2:].strip()
-            stack.append("if")
+            stack.append(("if", "branch"))
+            stack.append("begin")
             out.append(f"IF {_expr(cond)} THEN")
+            out.append("BEGIN")
             continue
-        if re.match(r"^IF\s", line, re.IGNORECASE):
-            cond = line[2:].strip()
-            stack.append("if")
+        if re.match(r"^IF\b", line, re.IGNORECASE):
+            cond, tail = _split_cond_body(line[2:].strip())
+            stack.append(("if", "branch"))
             out.append(f"IF {_expr(cond)} THEN")
+            if tail:
+                then_part, else_part = _split_top_level_else(tail)
+                _handle_branch_body(then_part, then_branch=True)
+                if else_part is not None:
+                    _activate_else()
+                    _handle_branch_body(else_part, then_branch=False)
             continue
-        if re.match(r"^WHILE\s+.*\bBEGIN\s*$", line, re.IGNORECASE):
+        if re.match(r"^WHILE\b.*\bBEGIN\s*$", line, re.IGNORECASE):
             cond = re.sub(r"\bBEGIN\s*$", "", line, flags=re.IGNORECASE)
             cond = cond[5:].strip()
-            stack.append("while")
+            stack.append(("while", "branch"))
+            stack.append("begin")
             out.append(f"WHILE {_expr(cond)} LOOP")
+            out.append("BEGIN")
             continue
-        if re.match(r"^WHILE\s", line, re.IGNORECASE):
-            cond = line[5:].strip()
-            stack.append("while")
+        if re.match(r"^WHILE\b", line, re.IGNORECASE):
+            cond, tail = _split_cond_body(line[5:].strip())
+            stack.append(("while", "branch"))
             out.append(f"WHILE {_expr(cond)} LOOP")
+            if tail:
+                _handle_branch_body(tail, then_branch=True)
             continue
         if upper.startswith("BEGIN TRY"):
             stack.append("try")
@@ -356,30 +865,26 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool) -> tuple[list[
             if stack and stack[-1] == "try":
                 stack.pop()
             continue
-        if upper == "ELSE":
-            if stack and stack[-1] == "if":
-                out.append("ELSE")
-            else:
-                out.append("ELSE")
-            continue
-        if upper.startswith("ELSE IF"):
-            out.append("ELSE")
-            cond = line[7:].strip()
-            stack.append("if")
-            out.append(f"IF {_expr(cond)} THEN")
+        if re.match(r"^ELSE\b", line, re.IGNORECASE):
+            _activate_else()
+            rest = line[4:].strip()
+            if rest:
+                _handle_branch_body(rest, then_branch=False)
             continue
         if upper == "BEGIN":
             stack.append("begin")
             out.append("BEGIN")
             continue
+        m_end_else = re.match(r"^END\s+ELSE\b(.*)$", line, re.IGNORECASE)
+        if m_end_else:
+            _process_end()
+            _activate_else()
+            rest = m_end_else.group(1).strip()
+            if rest:
+                _handle_branch_body(rest, then_branch=False)
+            continue
         if upper == "END":
-            block = stack.pop() if stack else "begin"
-            if block == "if":
-                out.append("END IF;")
-            elif block == "while":
-                out.append("END LOOP;")
-            else:
-                out.append("END;")
+            _process_end()
             continue
 
         # ---- statements ------------------------------------------------------
@@ -389,6 +894,8 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool) -> tuple[list[
 
     if buf:
         flush()
+    while waiting:
+        _close_now()
     if stack:
         t_warns.append(f"Unbalanced BEGIN/END blocks: {stack}")
 
@@ -396,13 +903,22 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool) -> tuple[list[
 
 
 def _transform_statement(line: str, declared: dict[str, str], warnings: list[str], returns_set: bool) -> str | None:
+    # Normalize a leading SELECT TOP n to a trailing LIMIT n first so the
+    # assignment-SELECT regexes below still match "SELECT TOP 1 @x = ...".
+    line = _translate_top(line)
     upper = line.upper()
 
     if upper in ("SET NOCOUNT ON", "SET NOCOUNT OFF"):
         return None
 
+    # BEGIN/COMMIT/ROLLBACK TRANSACTION -> plain PL/pgSQL transaction control
+    if re.match(r"^BEGIN\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
+        return "BEGIN;"
+    if re.match(r"^(COMMIT|ROLLBACK)\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
+        return f"{upper.split()[0]};"
+
     # DECLARE @x INT / DECLARE @x INT = expr
-    m = re.match(r"^DECLARE\s+@([\w]+)\s+([^\s=,]+(?:\s*\([^)]*\))?)\s*(?:=\s*(.*))?$", line, re.IGNORECASE)
+    m = re.match(rf"^DECLARE\s+@([\w]+)\s+({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$", line, re.IGNORECASE)
     if m:
         name, dtype, init = m.group(1), m.group(2), m.group(3)
         target_type, warn = convert_type(dtype, "tsql", "postgres")
@@ -441,12 +957,21 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
         return f"RAISE NOTICE {arg};"
 
     # RAISERROR / THROW
-    m = re.match(r"^RAISERROR\s*\(\s*([^,]+)\s*,\s*(\d+)\s*,\s*\d+", line, re.IGNORECASE)
+    m = re.match(r"^RAISERROR\s*\((.*)\)\s*$", line, re.IGNORECASE | re.DOTALL)
     if m:
-        msg = m.group(1).strip()
-        if msg.startswith("@"):
-            return f"RAISE EXCEPTION '%', {msg[1:]};"
-        return f"RAISE EXCEPTION {msg};"
+        args = _split_args_balanced(m.group(1))
+        if args:
+            msg = args[0].strip()
+            if msg.startswith("@"):
+                return f"RAISE EXCEPTION '%', {_expr(msg[1:])};"
+            # T-SQL %-format specifiers (%d, %s, ...) -> PL/pgSQL bare '%'
+            msg_literal = re.sub(r"%\s*[sdiduoxXcgeEfG]", "%", msg)
+            msg_expr = _replace_concat(_expr(msg_literal))
+            if len(args) > 3:
+                warnings.append("RAISERROR positional arguments appended as RAISE EXCEPTION format values")
+                extra = ", ".join(_expr(a.strip()) for a in args[3:])
+                msg_expr = f"{msg_expr}, {extra}"
+            return f"RAISE EXCEPTION {msg_expr};"
     m = re.match(r"^THROW\s+(\d+)\s*,\s*([^,]+)\s*,", line, re.IGNORECASE)
     if m:
         return f"RAISE EXCEPTION {m.group(2).strip()};"
@@ -456,10 +981,7 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
     # RETURN [expr]
     m = re.match(r"^RETURN\s+(.+)$", line, re.IGNORECASE)
     if m:
-        val = m.group(1).strip()
-        if val.startswith("@"):
-            return f"RETURN {val[1:]};"
-        return f"RETURN {_expr(val)};"
+        return f"RETURN {_expr(m.group(1).strip())};"
     if upper == "RETURN":
         return "RETURN;"
 
@@ -493,9 +1015,74 @@ def _delay_to_seconds(delay: str) -> float:
     return float(delay)
 
 
+def _split_args_balanced(arg_string: str) -> list[str]:
+    """Split a comma-separated argument list respecting quotes and nesting."""
+    parts, buf, depth, in_str = [], [], 0, False
+    i = 0
+    while i < len(arg_string):
+        ch = arg_string[i]
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                if i + 1 < len(arg_string) and arg_string[i + 1] == "'":
+                    buf.append("'")
+                    i += 1
+                else:
+                    in_str = False
+        elif ch == "'":
+            in_str = True
+            buf.append(ch)
+        elif ch in "([":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if buf:
+        parts.append("".join(buf).strip())
+    return parts
+
+
+def _replace_concat(text: str) -> str:
+    """Convert T-SQL '+' string concatenation to PL/pgSQL '||', leaving '+'
+    characters inside string literals untouched."""
+    out = []
+    in_str = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    out.append("'")
+                    i += 1
+                else:
+                    in_str = False
+        elif ch == "'":
+            in_str = True
+            out.append(ch)
+        elif ch == "+":
+            out.append(" || ")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _expr(text: str) -> str:
     """Translate expressions inside a statement."""
     text = translate_functions(text, "tsql", "postgres")
+    # MSSQL bracket identifiers -> PG quoted identifiers
+    text = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', text)
+    # MSSQL N-prefixed string literals have no PG equivalent
+    text = re.sub(r"\bN'", "'", text, flags=re.IGNORECASE)
     # variable references @x -> x (not inside string literals)
     text = re.sub(r"@([A-Za-z_][A-Za-z0-9_]*)", r"\1", text)
     # @@system vars
@@ -504,6 +1091,13 @@ def _expr(text: str) -> str:
     text = re.sub(r"SCOPE_IDENTITY\s*\(\)", "LASTVAL()", text, flags=re.IGNORECASE)
     # #temp references
     text = re.sub(r"\[?#([\w\d_]+)\]?", r"\1", text)
+    # SELECT TOP n -> trailing LIMIT n
+    text = _translate_top(text)
+    # T-SQL '+' is overloaded: numeric addition vs string concatenation. Only
+    # treat it as concatenation when a string literal is present, so arithmetic
+    # like `@i + 1` keeps its plus sign.
+    if "'" in text:
+        text = _replace_concat(text)
     return text
 
 

@@ -1,82 +1,168 @@
 {% extends "converter/base.html" %}
-{% block title %}Migration Report{% endblock %}
-
+{% block title %}Migration Report — SQL Conversion Engine{% endblock %}
+{% block nav_migrate %}active{% endblock %}
 {% block content %}
-<h2>{{ job.name }}</h2>
-<p>
-    <strong>{{ job.source.name }}</strong> → <strong>{{ job.target.name }}</strong>
-    · Status: <strong>{{ job.get_status_display }}</strong>
-    · {{ job.started_at|date:"Y-m-d H:i:s" }} – {{ job.finished_at|date:"Y-m-d H:i:s" }}
+<h1 class="page-title">{{ job.name }}</h1>
+<p class="subtitle">
+    {{ job.source.name }} ({{ job.source.get_engine_display }}) → {{ job.target.name }} ({{ job.target.get_engine_display }})
 </p>
 
-{% if job.error_message %}
-    <div class="error">Error: {{ job.error_message }}</div>
-{% endif %}
+<div class="card">
+    <div class="btn-row" style="margin-bottom: 16px;">
+        <span class="badge
+            {% if job.status == 'completed' %}badge-ok{% elif job.status == 'partial' %}badge-warn{% elif job.status == 'failed' %}badge-fail{% else %}badge-neutral{% endif %}">
+            {{ job.get_status_display }}
+        </span>
+        <span class="badge badge-neutral">{{ job.started_at|date:"Y-m-d H:i:s" }} – {{ job.finished_at|date:"Y-m-d H:i:s" }}</span>
+    </div>
 
-{% if job.report %}
-    <h3>Summary</h3>
-    <table>
-        <tr><th>Tables</th><td>{{ job.report.summary.tables }}</td></tr>
-        <tr><th>Views</th><td>{{ job.report.summary.views }}</td></tr>
-        <tr><th>Functions</th><td>{{ job.report.summary.functions }}</td></tr>
-        <tr><th>Procedures</th><td>{{ job.report.summary.procedures }}</td></tr>
-        <tr><th>Triggers</th><td>{{ job.report.summary.triggers }}</td></tr>
-        <tr><th>Rows copied</th><td>{{ job.report.summary.rows_copied }}</td></tr>
-        <tr><th>Rows failed</th><td>{{ job.report.summary.rows_failed }}</td></tr>
-        <tr><th>Schema failures</th><td>{{ job.report.summary.schema_failed }}</td></tr>
-    </table>
-
-    <h3>Verification (row counts)</h3>
-    {% if job.report.verification %}
-    <table>
-        <tr><th>Table</th><th>Source</th><th>Target</th><th>Match</th></tr>
-        {% for v in job.report.verification %}
-        <tr>
-            <td>{{ v.table }}</td>
-            <td>{{ v.source_rows }}</td>
-            <td>{{ v.target_rows }}</td>
-            <td>{% if v.match %}✓{% else %}✗{% endif %}</td>
-        </tr>
-        {% endfor %}
-    </table>
+    {% if job.error_message %}
+        <div class="alert alert-error">Error: {{ job.error_message }}</div>
     {% endif %}
 
-    <h3>Schema Objects</h3>
-    {% if job.report.schema_results %}
-    <table>
-        <tr><th>Status</th><th>Kind</th><th>Name</th><th>Detail</th></tr>
-        {% for r in job.report.schema_results %}
-        <tr>
-            <td>{{ r.status }}</td>
-            <td>{{ r.kind }}</td>
-            <td>{{ r.name }}</td>
-            <td>{{ r.detail }}</td>
-        </tr>
-        {% endfor %}
-    </table>
+    {% if job.report %}
+        <h3>Summary</h3>
+        <div class="meta-list">
+            <div><span class="label">Tables</span> {{ job.report.summary.tables }}</div>
+            <div><span class="label">Views</span> {{ job.report.summary.views }}</div>
+            <div><span class="label">Functions</span> {{ job.report.summary.functions }}</div>
+            <div><span class="label">Procedures</span> {{ job.report.summary.procedures }}</div>
+            <div><span class="label">Triggers</span> {{ job.report.summary.triggers }}</div>
+            <div><span class="label">Rows copied</span> {{ job.report.summary.rows_copied }}</div>
+            <div><span class="label">Rows failed</span> {{ job.report.summary.rows_failed }}</div>
+            <div><span class="label">Schema failures</span> {{ job.report.summary.schema_failed }}</div>
+        </div>
+
+        <h3>Verification (row counts)</h3>
+        {% if job.report.verification %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Table</th>
+                        <th>Source</th>
+                        <th>Target</th>
+                        <th>Match</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for v in job.report.verification %}
+                    <tr>
+                        <td class="mono">{{ v.table }}</td>
+                        <td>{{ v.source_rows }}</td>
+                        <td>{{ v.target_rows }}</td>
+                        <td>{% if v.match %}<span class="badge badge-ok">✓ Match</span>{% else %}<span class="badge badge-fail">✕ Mismatch</span>{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        <h3>Schema Objects</h3>
+        {% if job.report.schema_results %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Status</th>
+                        <th>Kind</th>
+                        <th>Name</th>
+                        <th>Detail</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in job.report.schema_results %}
+                    <tr>
+                        <td>
+                            {% if r.status == 'success' %}<span class="badge badge-ok">✓</span>
+                            {% elif r.status == 'failed' %}<span class="badge badge-fail">✕</span>
+                            {% else %}<span class="badge badge-neutral">{{ r.status }}</span>{% endif %}
+                        </td>
+                        <td><span class="badge badge-neutral">{{ r.kind }}</span></td>
+                        <td class="mono">{{ r.name }}</td>
+                        <td>{% if r.detail %}<span class="badge badge-fail" style="white-space:normal;">{{ r.detail }}</span>{% else %}—{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="subtitle">No schema objects recorded.</p>
+        {% endif %}
+
+        <h3>Data Copy</h3>
+        {% if job.report.data_results %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Status</th>
+                        <th>Table</th>
+                        <th>Copied</th>
+                        <th>Failed</th>
+                        <th>Detail</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in job.report.data_results %}
+                    <tr>
+                        <td>
+                            {% if r.status == 'success' %}<span class="badge badge-ok">✓</span>
+                            {% else %}<span class="badge badge-fail">✕</span>{% endif %}
+                        </td>
+                        <td class="mono">{{ r.name }}</td>
+                        <td>{{ r.rows_copied }}</td>
+                        <td>{% if r.rows_failed %}<span class="badge badge-fail">{{ r.rows_failed }}</span>{% else %}{{ r.rows_failed }}{% endif %}</td>
+                        <td>{% if r.detail %}<span class="badge badge-fail" style="white-space:normal;">{{ r.detail }}</span>{% else %}—{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    {% else %}
+    <div class="empty-state">
+        <div class="big">📄</div>
+        <p>No report data available for this migration.</p>
+    </div>
     {% endif %}
 
-    <h3>Data Copy</h3>
-    {% if job.report.data_results %}
-    <table>
-        <tr><th>Status</th><th>Table</th><th>Copied</th><th>Failed</th><th>Detail</th></tr>
-        {% for r in job.report.data_results %}
-        <tr>
-            <td>{{ r.status }}</td>
-            <td>{{ r.name }}</td>
-            <td>{{ r.rows_copied }}</td>
-            <td>{{ r.rows_failed }}</td>
-            <td>{{ r.detail }}</td>
-        </tr>
+    {% if job.warnings %}
+        <h3>Warnings</h3>
+        {% for w in job.warnings %}
+            <div class="alert alert-warning">{{ w }}</div>
         {% endfor %}
-    </table>
     {% endif %}
-{% endif %}
 
-{% if job.warnings %}
-    <h3>Warnings</h3>
-    {% for w in job.warnings %}<div class="warning">{{ w }}</div>{% endfor %}
-{% endif %}
+    <h3>Captured Errors</h3>
+    {% if job.errors.exists %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Kind</th>
+                    <th>Object</th>
+                    <th>Type</th>
+                    <th>Message</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for e in job.errors.all %}
+                <tr>
+                    <td><span class="badge badge-neutral">{{ e.get_object_kind_display }}</span></td>
+                    <td class="mono">{{ e.object_name }}</td>
+                    <td><span class="badge badge-fail">{{ e.error_type }}</span></td>
+                    <td class="mono" style="white-space: normal;">{{ e.message|truncatechars:160 }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="subtitle">No per-object errors recorded for this migration.</p>
+    {% endif %}
 
-<p><a href="{% url 'migrate' %}">← Back to migrations</a></p>
+    <p><a href="{% url 'migrate' %}">← Back to migrations</a></p>
+</div>
 {% endblock %}

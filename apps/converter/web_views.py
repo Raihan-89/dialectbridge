@@ -1,11 +1,12 @@
 from django.contrib import messages
+from django.db.models import Q
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 
 from engine.connectors.base import ConnectorError
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from . import migration_service
-from .models import ConversionJob, DatabaseConnection, MigrationJob
+from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 
 # Statement types the current engine can actually handle — others are shown
 # disabled in the form until their translators land.
@@ -134,6 +135,7 @@ def migrate_view(request):
             job.report = report
             job.warnings = report.get("warnings", [])
             job.status = MigrationJob.Status.COMPLETED if report.get("success") else MigrationJob.Status.PARTIAL
+            migration_service.record_migration_errors(job, report)
         except Exception as exc:
             job.status = MigrationJob.Status.FAILED
             job.error_message = str(exc)
@@ -153,3 +155,35 @@ def migrate_view(request):
 def migrate_detail_view(request, pk):
     job = get_object_or_404(MigrationJob, pk=pk)
     return render(request, "converter/migrate_detail.html", {"job": job})
+
+
+def errors_view(request):
+    """Table of captured migration errors, filterable by kind / job / query."""
+    kind = request.GET.get("kind", "")
+    job_id = request.GET.get("job", "")
+    q = request.GET.get("q", "").strip()
+
+    errors = MigrationError.objects.select_related("job")
+    if kind:
+        errors = errors.filter(object_kind=kind)
+    if job_id:
+        errors = errors.filter(job_id=job_id)
+    if q:
+        errors = errors.filter(
+            Q(object_name__icontains=q) | Q(message__icontains=q)
+        )
+
+    errors = errors[:500]
+    context = {
+        "errors": errors,
+        "kind_choices": MigrationError.ObjectKind.choices,
+        "kind": kind,
+        "job_id": job_id,
+        "q": q,
+        "jobs": MigrationJob.objects.all()[:50],
+        "kind_counts": {
+            k: MigrationError.objects.filter(object_kind=k).count()
+            for k, _ in MigrationError.ObjectKind.choices
+        },
+    }
+    return render(request, "converter/errors.html", context)

@@ -1,0 +1,87 @@
+{% extends "converter/base.html" %}
+{% block title %}Migration Errors — SQL Conversion Engine{% endblock %}
+{% block nav_migrate %}active{% endblock %}
+{% block content %}
+<h1 class="page-title">Migration Errors</h1>
+<p class="subtitle">Failures captured from migration runs, stored per object for analysis.</p>
+
+<div class="card">
+    <form method="get" class="form-grid" style="grid-template-columns: 200px 200px 1fr auto; align-items: end;">
+        <div class="field">
+            <label for="kind">Kind</label>
+            <select name="kind" id="kind">
+                <option value="">All kinds</option>
+                {% for value, label in kind_choices %}
+                    <option value="{{ value }}" {% if kind == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field">
+            <label for="job">Migration</label>
+            <select name="job" id="job">
+                <option value="">All migrations</option>
+                {% for j in jobs %}
+                    <option value="{{ j.pk }}" {% if job_id == j.pk|stringformat:"s" %}selected{% endif %}>
+                        {{ j.name|truncatechars:30 }}
+                    </option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field">
+            <label for="q">Search object / message</label>
+            <input type="text" name="q" id="q" value="{{ q }}" placeholder="e.g. Inventory, RAISERROR...">
+        </div>
+        <button type="submit" class="btn">Filter</button>
+    </form>
+</div>
+
+<div class="card">
+    <div class="section-head">
+        <h2>Errors</h2>
+        <span class="badge badge-fail">{{ errors|length }} shown</span>
+    </div>
+
+    {% if errors %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Kind</th>
+                    <th>Object</th>
+                    <th>Type</th>
+                    <th>Message</th>
+                    <th>Migration</th>
+                    <th>When</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for e in errors %}
+                <tr>
+                    <td><span class="badge badge-neutral">{{ e.get_object_kind_display }}</span></td>
+                    <td class="mono">{{ e.object_name }}</td>
+                    <td><span class="badge {% if e.error_type == 'data_copy' %}badge-warn{% else %}badge-fail{% endif %}">{{ e.error_type }}</span></td>
+                    <td style="max-width: 420px;">
+                        <span class="mono" style="white-space: normal;">{{ e.message|truncatechars:180 }}</span>
+                        {% if e.detail and e.detail != e.message %}
+                        <details style="margin-top: 6px;">
+                            <summary class="mono" style="color: var(--muted); cursor: pointer;">detail</summary>
+                            <pre class="code-block">{{ e.detail }}</pre>
+                        </details>
+                        {% endif %}
+                    </td>
+                    <td><a href="{% url 'migrate-detail' e.job_id %}">{{ e.job.name|truncatechars:26 }}</a></td>
+                    <td class="mono">{{ e.created_at|date:"Y-m-d H:i" }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="big">✓</div>
+        <p>No captured migration errors{% if kind or job_id or q %} for the current filters{% endif %}.</p>
+    </div>
+    {% endif %}
+</div>
+
+{% endblock %}

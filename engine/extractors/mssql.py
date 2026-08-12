@@ -9,7 +9,7 @@ definitions, FK actions, and index definitions.
 from __future__ import annotations
 
 from engine.schema import (
-    Column, Constraint, Database, ForeignKey, Index, Routine, Table, Trigger, View,
+    CheckConstraint, Column, Constraint, Database, ForeignKey, Index, Routine, Table, Trigger, View,
 )
 
 _BASE_TABLES_SQL = """
@@ -236,7 +236,10 @@ def _extract_table(conn, schema: str, name: str) -> Table:
             indexes.append(current_idx)
         current_idx.columns.append(col_name)
 
-    checks = [row[1] for row in conn.fetch(_CHECK_SQL, (schema, name))]
+    checks = [
+        CheckConstraint(name=row[0], definition=row[1])
+        for row in conn.fetch(_CHECK_SQL, (schema, name))
+    ]
 
     return Table(
         name=qualified,

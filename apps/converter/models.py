@@ -110,6 +110,41 @@ class MigrationJob(models.Model):
         return f"{self.name or 'Migration'} {self.source} → {self.target} [{self.status}]"
 
 
+class MigrationError(models.Model):
+    """
+    A single failure captured from a migration run, stored separately from
+    the report JSON so errors can be listed, filtered and analyzed as a table
+    (object kind, error message, failing SQL, source line, ...).
+    """
+
+    class ObjectKind(models.TextChoices):
+        TABLE = "table", "Table"
+        INDEX = "index", "Index"
+        CONSTRAINT = "constraint", "Constraint"
+        VIEW = "view", "View"
+        FUNCTION = "function", "Function"
+        PROCEDURE = "procedure", "Procedure"
+        TRIGGER = "trigger", "Trigger"
+        DATA = "data", "Data copy"
+        OTHER = "object", "Object"
+
+    job = models.ForeignKey(
+        MigrationJob, on_delete=models.CASCADE, related_name="errors"
+    )
+    object_kind = models.CharField(max_length=16, choices=ObjectKind.choices, default=ObjectKind.OTHER)
+    object_name = models.CharField(max_length=255, blank=True)
+    error_type = models.CharField(max_length=64, blank=True, default="sql_error")
+    message = models.TextField(blank=True)
+    detail = models.TextField(blank=True, help_text="Failing statement / extra context.")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.get_object_kind_display()} {self.object_name}: {self.message[:60]}"
+
+
 class ConversionJob(models.Model):
     """
     Records a single SQL conversion request: the source SQL, the direction

@@ -1,58 +1,76 @@
 {% extends "converter/base.html" %}
-{% block title %}Convert SQL{% endblock %}
+{% block title %}Convert SQL — SQL Conversion Engine{% endblock %}
+{% block nav_convert %}active{% endblock %}
 {% block content %}
-<h1>SQL Conversion Engine</h1>
+<h1 class="page-title">SQL Conversion</h1>
+<p class="subtitle">Paste SQL in, pick a direction, and get dialect-converted SQL back — along with any manual-review warnings.</p>
 
-<form method="post">
-    {% csrf_token %}
-    <label for="direction">Direction</label><br>
-    <select name="direction" id="direction">
-        {% for value, label in direction_choices %}
-            <option value="{{ value }}" {% if direction == value %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-    </select>
-    <br><br>
+<div class="grid-2">
+    <div class="card">
+        <h2>Input</h2>
+        <form method="post">
+            {% csrf_token %}
+            <div class="form-grid">
+                <div class="field">
+                    <label for="direction">Direction</label>
+                    <select name="direction" id="direction">
+                        {% for value, label in direction_choices %}
+                            <option value="{{ value }}" {% if direction == value %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="statement_type">Statement type</label>
+                    <select name="statement_type" id="statement_type">
+                        {% for value, label in statement_type_choices %}
+                            {% if value in supported_statement_types %}
+                                <option value="{{ value }}" {% if statement_type == value %}selected{% endif %}>{{ label }}</option>
+                            {% else %}
+                                <option value="{{ value }}" disabled title="Translator coming soon">{{ label }} (coming soon)</option>
+                            {% endif %}
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="source_sql">Source SQL</label>
+                    <textarea name="source_sql" id="source_sql" rows="12" placeholder="CREATE TABLE ...">{{ source_sql|default:"" }}</textarea>
+                </div>
+                <div class="btn-row">
+                    <button type="submit" class="btn">Convert</button>
+                    <button type="button" class="btn btn-ghost" data-sample="ddl">Load sample DDL</button>
+                    <button type="button" class="btn btn-ghost" data-sample="dml">Load sample DML</button>
+                </div>
+            </div>
+        </form>
+    </div>
 
-    <label for="statement_type">Statement type</label><br>
-    <select name="statement_type" id="statement_type">
-        {% for value, label in statement_type_choices %}
-            {% if value in supported_statement_types %}
-                <option value="{{ value }}" {% if statement_type == value %}selected{% endif %}>{{ label }}</option>
+    <div class="card">
+        <h2>Result</h2>
+        {% if job %}
+            {% if job.succeeded %}
+                <div class="btn-row" style="margin-bottom: 12px;">
+                    <button type="button" class="btn btn-sm btn-outline" id="copy-result">Copy to clipboard</button>
+                    <span class="badge badge-ok">Converted successfully</span>
+                </div>
+                <pre class="code-block" id="result">{{ job.converted_sql }}</pre>
+                {% if job.warnings %}
+                    <h3 style="margin-top: 20px;">Warnings</h3>
+                    {% for w in job.warnings %}
+                        <div class="alert alert-warning">{{ w }}</div>
+                    {% endfor %}
+                {% endif %}
             {% else %}
-                <option value="{{ value }}" disabled title="Translator coming soon">{{ label }} (coming soon)</option>
+                <div class="alert alert-error">Conversion failed: {{ job.error_message }}</div>
             {% endif %}
-        {% endfor %}
-    </select>
-    <br><br>
-
-    <label for="source_sql">Source SQL</label><br>
-    <textarea name="source_sql" id="source_sql" rows="10">{{ source_sql|default:"" }}</textarea>
-    <br><br>
-
-    <button type="submit">Convert</button>
-</form>
-
-<details style="margin-top: 8px;">
-    <summary>Load a sample</summary>
-    <button type="button" data-sample="ddl">Sample DDL (T-SQL)</button>
-    <button type="button" data-sample="dml">Sample DML (T-SQL)</button>
-</details>
-
-{% if job %}
-    <h2>Result</h2>
-    {% if job.succeeded %}
-        <button type="button" id="copy-result">Copy</button>
-        <pre id="result">{{ job.converted_sql }}</pre>
-        {% if job.warnings %}
-            <h3>Warnings</h3>
-            {% for w in job.warnings %}
-                <div class="warning">{{ w }}</div>
-            {% endfor %}
+        {% else %}
+            <div class="empty-state">
+                <div class="big">⌨️</div>
+                <p>No conversion yet. Paste SQL on the left and hit <strong>Convert</strong>.<br>
+                The converted SQL and any warnings will appear here.</p>
+            </div>
         {% endif %}
-    {% else %}
-        <div class="error">Conversion failed: {{ job.error_message }}</div>
-    {% endif %}
-{% endif %}
+    </div>
+</div>
 
 <script>
 const samples = {
@@ -82,13 +100,17 @@ document.querySelectorAll("[data-sample]").forEach(btn => {
     btn.addEventListener("click", () => {
         document.getElementById("source_sql").value = samples[btn.dataset.sample];
         document.getElementById("statement_type").value = btn.dataset.sample;
+        btn.classList.add("active");
     });
 });
 
 const copyBtn = document.getElementById("copy-result");
 if (copyBtn) {
-    copyBtn.addEventListener("click", () => {
-        navigator.clipboard.writeText(document.getElementById("result").textContent);
+    copyBtn.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(document.getElementById("result").textContent);
+        const original = copyBtn.textContent;
+        copyBtn.textContent = "Copied ✓";
+        setTimeout(() => (copyBtn.textContent = original), 1500);
     });
 }
 </script>

@@ -90,6 +90,7 @@ def convert_type(data_type: str, source_dialect: str, target_dialect: str) -> tu
     if source_dialect == "tsql" and target_dialect == "postgres":
         base, params = _split_type(data_type)
         base_upper = base.upper()
+        is_max = params is not None and params.strip().upper() == "MAX"
         mapped = _MSSQL_TYPES.get(base_upper)
         if mapped is None:
             if base_upper in MSSQL_TO_POSTGRES_TYPE_OVERRIDES:
@@ -97,11 +98,10 @@ def convert_type(data_type: str, source_dialect: str, target_dialect: str) -> tu
         if mapped is None:
             if base_upper in ("DECIMAL", "NUMERIC"):
                 mapped = f"NUMERIC({params})" if params else "NUMERIC"
-            elif base_upper in ("VARCHAR", "CHAR"):
-                mapped = f"{base_upper}({params})" if params else "TEXT"
-            elif base_upper in ("NVARCHAR", "NCHAR"):
+            elif base_upper in ("VARCHAR", "CHAR", "NVARCHAR", "NCHAR"):
                 # PostgreSQL has no N-prefixed types — VARCHAR/CHAR hold unicode.
-                mapped = f"{base_upper[1:]}({params})" if params else "TEXT"
+                # VARCHAR(MAX)/NVARCHAR(MAX) become TEXT (no length limit in PG).
+                mapped = "TEXT" if is_max else f"{base_upper[1:]}({params})" if params else "TEXT"
             else:
                 return None, f"Type '{base_upper}' has no PostgreSQL equivalent — manual review required"
         if base_upper in ("GEOGRAPHY", "GEOMETRY", "HIERARCHYID", "SQL_VARIANT", "ROWVERSION"):
@@ -123,9 +123,10 @@ def convert_type(data_type: str, source_dialect: str, target_dialect: str) -> tu
 
 
 def _split_type(data_type: str) -> tuple[str, str | None]:
-    match = re.match(r"^(\w+)(?:\(([^)]*)\))?$", data_type.strip())
+    cleaned = re.sub(r"[\[\]]", "", data_type.strip())
+    match = re.match(r"^(\w+)(?:\(([^)]*)\))?$", cleaned)
     if not match:
-        return data_type.strip(), None
+        return cleaned, None
     return match.group(1), match.group(2)
 
 
@@ -156,9 +157,8 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
             warnings.extend(tw)
         for check in table.check_constraints:
             statements.append(build_check_ddl(table, check, target_dialect))
-
     for view in database.views:
-        stmts, tw = build_view_ddl(view, target_dialect, source)
+        stmts, tw = build_view_ddl(view, target_dialect, source, database.tables)
         statements.extend(stmts)
         warnings.extend(tw)
 
@@ -268,7 +268,9 @@ def build_index_ddl(table: Table, index: Index, target: str, source: str) -> tup
         stmt += f" WHERE {index.where}"
     elif index.where:
         # PostgreSQL keeps filtered indexes as partial indexes.
-        stmt += f" WHERE {_translate_expr(index.where, source, target)}"
+        where = _translate_expr(index.where, source, target)
+        where = fix_boolean_predicates(where, [table], source)
+        stmt += f" WHERE {where}"
     return [stmt], []
 
 
@@ -285,24 +287,27 @@ def build_foreign_key_ddl(table: Table, fk: ForeignKey, target: str) -> tuple[li
     return [stmt], []
 
 
-def build_check_ddl(table: Table, check_def: str, target: str) -> str:
+def build_check_ddl(table: Table, check, target: str) -> str:
+    name = check.name or _anon_name(table, check.definition)
     if target == "postgres":
         # MSSQL sys.check_constraints.definition looks like "([Status]=N'Pending')"
-        expr = _translate_expr(check_def.strip(), "tsql", "postgres")
+        expr = _translate_expr(check.definition.strip(), "tsql", "postgres")
         if not expr.upper().startswith("CHECK"):
             expr = f"CHECK {expr}"
     else:
         # pg_get_constraintdef returns "CHECK ((Price >= 0))" — normalize identifiers back
-        expr = _translate_expr(check_def.strip(), "postgres", "tsql")
-    return f"ALTER TABLE {_qident(table.name, target)} ADD CONSTRAINT {_qident(_anon_name(table, check_def), target)} {expr}"
+        expr = _translate_expr(check.definition.strip(), "postgres", "tsql")
+    return f"ALTER TABLE {_qident(table.name, target)} ADD CONSTRAINT {_qident(pg_ident(name), target)} {expr}"
 
 
-def build_view_ddl(view: View, target: str, source: str) -> tuple[list[str], list[str]]:
+def build_view_ddl(view: View, target: str, source: str, tables: list | None = None) -> tuple[list[str], list[str]]:
     definition = (view.definition or "").strip()
     m = re.search(r"\bAS\s+(SELECT\b.*)$", definition, re.IGNORECASE | re.DOTALL)
     if m:
         definition = m.group(1)
     definition = _translate_expr(definition, source, target)
+    if source == "tsql" and target == "postgres":
+        definition = fix_boolean_predicates(definition, tables or [], "tsql")
     prefix = "CREATE OR REPLACE VIEW" if target == "postgres" else "CREATE OR ALTER VIEW"
     stmt = f"{prefix} {_qident(view.name, target)} AS {definition}"
     return [stmt], []
@@ -367,12 +372,101 @@ def _translate_expr(expr: str, source: str, target: str) -> str:
         out = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', out)
         # MSSQL N-prefixed string literals have no PG equivalent
         out = re.sub(r"\bN'", "'", out, flags=re.IGNORECASE)
+        out = _translate_top(out)
     else:
         # PG quoted identifiers -> MSSQL brackets
         out = re.sub(r'"([\w\s\d_]+)"', r"[\1]", out)
         # PG type casts (::numeric, ::character varying) have no T-SQL form
         out = re.sub(r"::[\w\s.]+", "", out)
     return out
+
+
+def _select_end(after: str) -> int:
+    """Index of the end of the statement/subquery beginning at ``after``.
+
+    The end is the enclosing ``)`` for a scalar subquery, a ``;`` for a
+    top-level statement, or the end of the string. Quotes and nested parens
+    are respected."""
+    depth = 0
+    in_str = False
+    i = 0
+    while i < len(after):
+        ch = after[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < len(after) and after[i + 1] == "'":
+                    i += 1
+                else:
+                    in_str = False
+        elif ch == "'":
+            in_str = True
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return i
+        i += 1
+    return len(after)
+
+
+def _translate_top(text: str) -> str:
+    """Rewrite every ``SELECT TOP n`` (leading or inside scalar subqueries)
+    into a trailing ``LIMIT n`` at the end of that statement/subquery."""
+    out = []
+    pos = 0
+    for m in re.finditer(r"\bSELECT\s+(?:(DISTINCT)\s+)?TOP\s*(\(\d+\)|\d+)\b", text, re.IGNORECASE):
+        out.append(text[pos:m.start()])
+        count = m.group(2).strip().strip("()")
+        distinct = m.group(1)
+        after = text[m.end():]
+        end = _select_end(after)
+        body = after[:end]
+        prefix = "SELECT DISTINCT" if distinct else "SELECT"
+        out.append(f"{prefix} {body} LIMIT {count}")
+        pos = m.end() + end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _boolean_column_names(tables: list, source: str) -> set[str]:
+    """Lowercased names of columns whose source type is BIT/BOOLEAN."""
+    bool_cols: set[str] = set()
+    for table in tables or []:
+        for col in table.columns:
+            base = col.data_type.split("(")[0].strip().upper()
+            if base in ("BIT", "BOOLEAN"):
+                bool_cols.add(col.name.lower())
+    return bool_cols
+
+
+def fix_boolean_predicates(expr: str, tables: list, source: str) -> str:
+    """Rewrite ``col = 1`` / ``col = (0)`` on BIT/BOOLEAN columns to
+    ``col = true`` / ``col = false`` so PostgreSQL doesn't error with
+    ``boolean = integer``."""
+    bool_cols = _boolean_column_names(tables, source)
+    if not bool_cols:
+        return expr
+    for col in sorted(bool_cols, key=len, reverse=True):
+        # parenthesized values, e.g. WHERE ("IsActive"=(1))
+        pattern = re.compile(
+            rf'("?{re.escape(col)}"?)\s*=\s*\(\s*([01])\s*\)', re.IGNORECASE
+        )
+        expr = pattern.sub(
+            lambda m: f'{m.group(1)} = {"true" if m.group(2) == "1" else "false"}',
+            expr,
+        )
+        # bare values, e.g. WHERE "IsActive" = 1
+        pattern = re.compile(
+            rf'("?{re.escape(col)}"?)\s*=\s*([01])(?![\d])', re.IGNORECASE
+        )
+        expr = pattern.sub(
+            lambda m: f'{m.group(1)} = {"true" if m.group(2) == "1" else "false"}',
+            expr,
+        )
+    return expr
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +499,12 @@ def pg_ident(name: str) -> str:
 
 
 def _anon_name(table: Table, definition: str) -> str:
-    return f"{table.name.replace('.', '_')}_chk"
+    # Fallback name for check constraints whose real name is unavailable:
+    # stable per table+definition so several checks on one table never collide
+    # and a re-run of the migration doesn't hit a duplicate constraint name.
+    base = table.name.replace(".", "_")
+    digest = hashlib.md5(definition.encode("utf-8")).hexdigest()[:6]
+    return f"{base}_chk_{digest}"
 
 
 def _qualify_table_refs(text: str, table_names: list[str], target: str) -> str:
@@ -521,6 +620,10 @@ def _mask(text: str) -> tuple[str, list[str]]:
 
     text = re.sub(r"'([^']*)'", _s1, text)
     text = re.sub(r'"([^"]*)"', _s2, text)
+    # Column/table aliases introduced by `AS` are local to the statement and
+    # must never be rewritten as qualified identifiers (they aren't schema
+    # objects). Masked before the table-ref rewrite below.
+    text = re.sub(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", _s2, text, flags=re.IGNORECASE)
     return text, stash
 
 

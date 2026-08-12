@@ -2,13 +2,13 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework import status
 
-from engine.schema import Column, Database, Table, Trigger
+from engine.schema import CheckConstraint, Column, Constraint, Database, Index, Table, Trigger, View
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from engine.translators.ddl_translator import convert_ddl
 from engine.translators.procedure_translator import translate_routine
-from engine.translators.sql_builder import build_database_ddl
+from engine.translators.sql_builder import build_database_ddl, convert_type
 from engine.translators.trigger_translator import translate_trigger
-from .models import ConversionJob
+from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 
 
 class EngineDDLTests(TestCase):
@@ -163,9 +163,90 @@ class TriggerTranslationTests(TestCase):
         self.assertEqual(warnings, [])
         self.assertIn('ON "dbo"."Orders" FOR EACH ROW', trigger_sql)
         self.assertIn('INSERT INTO "dbo"."OrderAudit"', trigger_sql)
-        self.assertIn("VALUES(NEW.\"OrderID\"", trigger_sql)
-        self.assertIn("CURRENT_TIMESTAMP", trigger_sql)
+        self.assertIn('SELECT "OrderID", CURRENT_TIMESTAMP FROM (SELECT (NEW).*)', trigger_sql)
         self.assertIn("CREATE OR REPLACE FUNCTION trg_OrderAudit_fn()", trigger_sql)
+
+    def test_trigger_if_exists_raiserror_and_rollback(self):
+        trig = Trigger(
+            name="trg_Inventory_Validate",
+            table="dbo.Inventory",
+            timing="AFTER",
+            events=["UPDATE"],
+            definition=(
+                "CREATE TRIGGER trg_Inventory_Validate\nON dbo.Inventory\nAFTER UPDATE\nAS\nBEGIN\n"
+                "    SET NOCOUNT ON;\n"
+                "    -- Check for negative quantities\n"
+                "    IF EXISTS (SELECT 1 FROM inserted WHERE QuantityInStock < 0)\n"
+                "        BEGIN\n"
+                "            RAISERROR('Quantity in stock cannot be negative', 16, 1);\n"
+                "            ROLLBACK TRANSACTION;\n"
+                "            RETURN;\n"
+                "        END\n"
+                "END"
+            ),
+        )
+        converted, warnings = translate_trigger(trig, "postgres")
+        self.assertIn("IF EXISTS (SELECT 1 FROM (SELECT (NEW).*) WHERE QuantityInStock < 0) THEN", converted)
+        self.assertIn("RAISE EXCEPTION 'Quantity in stock cannot be negative';", converted)
+        self.assertIn("RETURN NEW;", converted)
+        self.assertNotIn("ROLLBACK", converted)
+        self.assertIn("transaction control 'ROLLBACK TRANSACTION'", " ".join(warnings))
+
+    def test_trigger_comment_concat_system_user_and_top(self):
+        trig = Trigger(
+            name="trg_ProductMaster_Audit",
+            table="dbo.ProductMaster",
+            timing="AFTER",
+            events=["INSERT", "UPDATE"],
+            definition=(
+                "CREATE TRIGGER trg_ProductMaster_Audit\nON dbo.ProductMaster\nAFTER INSERT, UPDATE\nAS\nBEGIN\n"
+                "    SET NOCOUNT ON;\n"
+                "    -- For INSERT\n"
+                "    IF EXISTS (SELECT * FROM inserted)\n"
+                "        BEGIN\n"
+                "            INSERT INTO AuditLog (TableName, RecordID, NewData, UserName)\n"
+                "            SELECT 'ProductMaster', ProductID, CONCAT('SKU: ', SKU),\n"
+                "                   (SELECT TOP 1 SellingPrice FROM ProductPriceHistory WHERE ProductID = i.ProductID), SYSTEM_USER\n"
+                "            FROM inserted i;\n"
+                "        END\n"
+                "END"
+            ),
+        )
+        converted, warnings = translate_trigger(trig, "postgres")
+        self.assertNotIn("-- For INSERT", converted)
+        self.assertIn("CURRENT_USER", converted)
+        self.assertIn("LIMIT 1", converted)
+        self.assertIn("TG_OP IN ('INSERT','UPDATE') THEN", converted)
+        self.assertIn("FROM (SELECT (NEW).*) i", converted)
+
+    def test_instead_of_delete_becomes_before_delete(self):
+        trig = Trigger(
+            name="trg_ProductMaster_PreventDelete",
+            table="dbo.ProductMaster",
+            timing="INSTEAD OF",
+            events=["DELETE"],
+            definition=(
+                "CREATE TRIGGER trg_ProductMaster_PreventDelete\nON dbo.ProductMaster\nINSTEAD OF DELETE\nAS\nBEGIN\n"
+                "    SET NOCOUNT ON;\n"
+                "    IF EXISTS (\n"
+                "        SELECT 1 FROM deleted d INNER JOIN Inventory i ON d.ProductID = i.ProductID\n"
+                "        WHERE i.QuantityInStock > 0\n"
+                "    )\n"
+                "        BEGIN\n"
+                "            RAISERROR('Cannot delete product with existing stock.', 16, 1);\n"
+                "            RETURN;\n"
+                "        END\n"
+                "    DELETE FROM ProductMaster\n"
+                "    WHERE ProductID IN (SELECT ProductID FROM deleted);\n"
+                "END"
+            ),
+        )
+        converted, warnings = translate_trigger(trig, "postgres")
+        self.assertIn("BEFORE DELETE ON dbo.ProductMaster", converted)
+        self.assertIn("IF EXISTS ( SELECT 1 FROM (SELECT (OLD).*) d INNER JOIN Inventory i ON d.ProductID = i.ProductID WHERE i.QuantityInStock > 0 ) THEN", converted)
+        self.assertNotIn("DELETE FROM ProductMaster", converted)
+        self.assertIn("RETURN OLD;", converted)
+        self.assertIn("DELETE inside an INSTEAD OF DELETE trigger", " ".join(warnings))
 
     def test_plpgsql_trigger_to_tsql_with_function_dollar_quote(self):
         pg_trigger = Trigger(
@@ -197,6 +278,454 @@ class TriggerTranslationTests(TestCase):
         self.assertIn("FROM inserted", converted)
         self.assertIn("GETDATE()", converted)
         self.assertNotIn("NEW.", converted)
+
+
+class MigrationErrorCaptureTests(TestCase):
+    def setUp(self):
+        source = DatabaseConnection.objects.create(
+            name="src", engine="mssql", role="source", host="h", database="db",
+        )
+        target = DatabaseConnection.objects.create(
+            name="tgt", engine="postgres", role="target", host="h", database="db",
+        )
+        self.job = MigrationJob.objects.create(
+            name="job1", source=source, target=target, status=MigrationJob.Status.PARTIAL,
+        )
+
+    def test_failed_objects_recorded_and_idempotent(self):
+        from . import migration_service
+
+        report = {
+            "success": False,
+            "schema_results": [
+                {"kind": "table", "name": "dbo.Orders", "status": "success"},
+                {"kind": "index", "name": "IX_Orders_active", "status": "failed",
+                 "detail": 'column "active" does not exist'},
+                {"kind": "function", "name": "fn_x", "status": "failed",
+                 "detail": 'type "nvarchar" does not exist'},
+            ],
+            "data_results": [
+                {"kind": "data", "name": "dbo.Orders", "status": "failed",
+                 "rows_failed": 3, "detail": "identity insert failed"},
+            ],
+        }
+        count = migration_service.record_migration_errors(self.job, report)
+        self.assertEqual(count, 3)
+        self.assertEqual(MigrationError.objects.filter(job=self.job).count(), 3)
+
+        index_err = MigrationError.objects.get(object_kind="index")
+        self.assertEqual(index_err.object_name, "IX_Orders_active")
+        self.assertEqual(index_err.error_type, "sql_error")
+
+        data_err = MigrationError.objects.get(object_kind="data")
+        self.assertEqual(data_err.error_type, "data_copy")
+
+        # Re-running replaces, never duplicates.
+        migration_service.record_migration_errors(self.job, report)
+        self.assertEqual(MigrationError.objects.filter(job=self.job).count(), 3)
+
+    def test_errors_page_renders(self):
+        MigrationError.objects.create(
+            job=self.job, object_kind="function", object_name="dbo.fn_x",
+            error_type="sql_error", message='type "nvarchar" does not exist',
+        )
+        response = self.client.get(reverse("errors"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "dbo.fn_x")
+
+
+class MigrationFixRegressionTests(TestCase):
+    def _db(self) -> Database:
+        db = Database(name="x", dialect="tsql")
+        db.tables = [
+            Table(
+                name="dbo.AuditLog",
+                columns=[Column("LogID", "INT", nullable=False), Column("Details", "NVARCHAR(MAX)"),
+                         Column("IsActive", "BIT"), Column("Price", "DECIMAL(18,2)")],
+                primary_key=Constraint("PK_AuditLog", ["LogID"]),
+                indexes=[Index("IX_AuditLog_active", ["LogID"], where="([IsActive]=(1))")],
+                check_constraints=[
+                    CheckConstraint("CK_AuditLog_price_ge", "([Price]>=0)"),
+                    CheckConstraint("CK_AuditLog_price_le", "([Price]<=1000)"),
+                ],
+            ),
+        ]
+        return db
+
+    def test_varchar_max_maps_to_text(self):
+        self.assertEqual(convert_type("NVARCHAR(MAX)", "tsql", "postgres")[0], "TEXT")
+        self.assertEqual(convert_type("VARCHAR(MAX)", "tsql", "postgres")[0], "TEXT")
+        self.assertEqual(convert_type("NVARCHAR(50)", "tsql", "postgres")[0], "VARCHAR(50)")
+        stmts, _ = build_database_ddl(self._db(), "postgres")
+        self.assertIn("TEXT", stmts[0])
+
+    def test_filtered_index_boolean_predicate(self):
+        stmts, _ = build_database_ddl(self._db(), "postgres")
+        index_stmt = next(s for s in stmts if "IX_AuditLog_active" in s)
+        self.assertIn('WHERE ("IsActive" = true)', index_stmt)
+        self.assertNotIn("= 1", index_stmt)
+
+    def test_check_constraints_keep_real_names(self):
+        stmts, _ = build_database_ddl(self._db(), "postgres")
+        names = [s for s in stmts if "ADD CONSTRAINT" in s]
+        self.assertEqual(len(names), 2)
+        self.assertIn("CK_AuditLog_price_ge", names[0])
+        self.assertIn("CK_AuditLog_price_le", names[1])
+
+    def test_view_alias_and_boolean_predicate(self):
+        db = self._db()
+        db.tables.append(Table(name="dbo.Category", columns=[Column("CategoryID", "INT"),
+                                                             Column("CategoryName", "NVARCHAR(100)")]))
+        db.views = [
+            View(name="dbo.vCategory", definition="CREATE VIEW dbo.vCategory AS SELECT c.CategoryName AS Category FROM dbo.Category c"),
+            View(name="dbo.vActive", definition="CREATE VIEW dbo.vActive AS SELECT a.LogID FROM dbo.AuditLog a WHERE a.IsActive = 1"),
+        ]
+        stmts, _ = build_database_ddl(db, "postgres")
+        view_sql = [s for s in stmts if "CREATE OR REPLACE VIEW" in s]
+        self.assertIn('FROM "dbo"."Category"', view_sql[0])  # table ref qualified
+        self.assertIn('AS Category', view_sql[0])          # alias NOT rewritten
+        self.assertIn('WHERE a."IsActive" = true', view_sql[1])
+
+    def test_procedure_decimal_param_not_truncated(self):
+        proc = """
+CREATE PROCEDURE dbo.UpdatePrice @ProductId INT, @NewPrice DECIMAL(18,2)
+AS
+BEGIN
+    DECLARE @oldPrice DECIMAL(18,2);
+    IF (@oldPrice IS NULL) SET @oldPrice = 0;
+END
+"""
+        conv, warnings = translate_routine(proc, source="procedure", target="postgres")
+        self.assertEqual(warnings, [])
+        self.assertIn("NewPrice NUMERIC(18,2)", conv)
+        self.assertIn("oldPrice NUMERIC(18,2)", conv)
+
+    def test_function_returns_nvarchar_maps_to_text(self):
+        fn = """
+CREATE FUNCTION dbo.GetName(@ProductId INT)
+RETURNS nvarchar
+AS
+BEGIN
+    DECLARE @name nvarchar(max);
+    SELECT @name = 'x';
+    RETURN @name;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertEqual(warnings, [])
+        self.assertIn("RETURNS TEXT", conv)
+        self.assertIn("name TEXT", conv)
+
+    def test_begin_transaction_and_raiserror(self):
+        proc = """
+CREATE PROCEDURE dbo.P
+AS
+BEGIN
+    BEGIN TRANSACTION;
+    RAISERROR('Price cannot be, negative: %d', 16, 1, 5);
+    IF (1 = 0) ROLLBACK TRANSACTION;
+    COMMIT TRANSACTION;
+END
+"""
+        conv, warnings = translate_routine(proc, source="procedure", target="postgres")
+        self.assertNotIn("BEGIN;", conv)
+        self.assertNotIn("COMMIT;", conv)
+        self.assertIn("RAISE EXCEPTION 'Price cannot be, negative: %', 5;", conv)
+        self.assertIn("IF (1 = 0) THEN", conv)
+        self.assertIn("END IF;", conv)
+        self.assertTrue(any("TRANSACTION" in w for w in warnings), warnings)
+
+    def test_single_statement_if_and_else_balanced(self):
+        proc = """
+CREATE PROCEDURE dbo.P
+AS
+BEGIN
+    IF (1 = 1)
+        SET NOCOUNT ON;
+    IF (2 = 2) SELECT 1;
+    ELSE SELECT 2;
+END
+"""
+        conv, warnings = translate_routine(proc, source="procedure", target="postgres")
+        self.assertFalse(any("Unbalanced" in w for w in warnings), warnings)
+        self.assertEqual(conv.count("END IF;"), 2)
+        self.assertIn("ELSE", conv)
+
+    def test_select_top_inside_function_becomes_limit(self):
+        fn = """
+CREATE FUNCTION dbo.Latest(@Id INT)
+RETURNS int
+AS
+BEGIN
+    DECLARE @val INT;
+    SELECT TOP 1 @val = LogID FROM dbo.AuditLog WHERE LogID = @Id;
+    RETURN @val;
+END
+"""
+        conv, warnings = translate_routine(
+            fn, source="function", target="postgres", tables=self._db().tables
+        )
+        self.assertEqual(warnings, [])
+        self.assertIn("SELECT LogID INTO val FROM dbo.AuditLog", conv)
+        self.assertIn("LIMIT 1", conv)
+        self.assertIn("RETURNS INTEGER", conv)
+
+    def test_if_begin_else_block_balanced(self):
+        proc = """
+CREATE PROCEDURE dbo.P
+AS
+BEGIN
+    IF (1 = 1) BEGIN
+        SELECT 1;
+    END
+    ELSE BEGIN
+        SELECT 2;
+    END
+END
+"""
+        conv, warnings = translate_routine(proc, source="procedure", target="postgres")
+        self.assertFalse(any("Unbalanced" in w for w in warnings), warnings)
+        self.assertEqual(conv.count("END IF;"), 1)
+
+    def test_bracketed_params_and_returns(self):
+        # OBJECT_DEFINITION emits [schema].[fn] and [int] type wrappers.
+        fn = """
+CREATE FUNCTION [dbo].[ufn_CheckStock](@ProductId [int], @Qty [int])
+RETURNS [decimal](18,2)
+AS
+BEGIN
+    DECLARE @stock [decimal](18,2);
+    SELECT @stock = StockQty FROM dbo.Products WHERE ProductId = @ProductId;
+    IF (@stock < @Qty)
+        RETURN @stock;
+    RETURN 0;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertEqual(warnings, [])
+        self.assertIn("ufn_CheckStock(ProductId INTEGER, Qty INTEGER)", conv)
+        self.assertIn("RETURNS NUMERIC(18,2)", conv)
+        self.assertIn("stock NUMERIC(18,2);", conv)
+
+    def test_returns_with_with_clause(self):
+        fn = """
+CREATE FUNCTION [dbo].[fn_GetStatus](@Code [int])
+RETURNS [int]
+WITH SCHEMABINDING
+AS
+BEGIN
+    IF (@Code = 1)
+        RETURN 10;
+    ELSE
+        RETURN 20;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertEqual(warnings, [])
+        self.assertIn("RETURNS INTEGER", conv)
+        self.assertIn("IF (Code = 1) THEN", conv)
+
+    def test_no_semicolon_inline_block_raiserror(self):
+        fn = """
+CREATE FUNCTION dbo.fn_NoSemi(@p int)
+RETURNS int
+AS
+BEGIN
+    IF (@p < 0) BEGIN
+        RAISERROR('Quantity in stock cannot be negative', 16, 1)
+        RETURN 0
+    END
+    RETURN 1
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("RAISE EXCEPTION 'Quantity in stock cannot be negative';", conv)
+        self.assertIn("RETURN 0;", conv)
+        self.assertNotIn("RAISERROR(", conv)
+
+    def test_return_with_two_vars(self):
+        fn = """
+CREATE FUNCTION dbo.fn_Div(@a int, @b int)
+RETURNS int
+AS
+BEGIN
+    RETURN @a / @b;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("RETURN a / b;", conv)
+        self.assertNotIn("@b", conv)
+
+    def test_top_in_scalar_subquery_and_concat(self):
+        db = self._db()
+        db.tables.append(Table(name="dbo.Prices", columns=[
+            Column("Id", "INT", nullable=False), Column("ProductId", "INT"),
+            Column("SellingPrice", "DECIMAL(18,2)"), Column("Date", "DATETIME"),
+        ], primary_key=Constraint("PK_Prices", ["Id"])))
+        fn = """
+CREATE FUNCTION dbo.ufn_ProductReport(@ProductId INT)
+RETURNS nvarchar(max)
+AS
+BEGIN
+    DECLARE @report nvarchar(max);
+    SET @report = N'Product name: ' + d.ProductName + N', Price: ' + (SELECT TOP 1 SellingPrice FROM dbo.Prices WHERE ProductId = @ProductId ORDER BY Date DESC);
+    RETURN @report;
+END
+"""
+        conv, warnings = translate_routine(
+            fn, source="function", target="postgres", tables=db.tables
+        )
+        self.assertIn("'Product name: '  ||  d.ProductName", conv)
+        self.assertIn("FROM dbo.Prices WHERE ProductId = ProductId ORDER BY Date DESC LIMIT 1", conv)
+        self.assertNotIn("SELECT TOP", conv)
+
+    def test_numeric_addition_keeps_plus(self):
+        fn = """
+CREATE FUNCTION dbo.fn_CountUp(@n int)
+RETURNS int
+AS
+BEGIN
+    DECLARE @i int = 0;
+    WHILE (@i < @n) BEGIN
+        SET @i = @i + 1;
+    END
+    RETURN @i;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("i := i + 1;", conv)
+        self.assertNotIn("||", conv)
+
+    def test_set_assignment_then_return_split_without_semicolons(self):
+        fn = """
+CREATE FUNCTION dbo.fn_GetProductPriceHistory(@ProductId INT)
+RETURNS decimal(18,2)
+WITH SCHEMABINDING
+AS
+BEGIN
+    IF (1 = 1)
+    BEGIN
+        RAISERROR('Cannot delete product', 16, 1)
+        RETURN 0
+    END
+    SET @SellingPrice = (SELECT TOP 1 SellingPrice
+                         FROM dbo.ProductPriceHistory
+                         WHERE ProductId = @ProductId
+                         ORDER BY ChangedDate DESC)
+    RETURN @SellingPrice
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("RAISE EXCEPTION 'Cannot delete product';", conv)
+        self.assertIn("RETURN 0;", conv)
+        self.assertIn("SellingPrice := (SELECT  SellingPrice FROM dbo.ProductPriceHistory", conv)
+        self.assertIn("ORDER BY ChangedDate DESC LIMIT 1);", conv)
+        self.assertIn("RETURN SellingPrice;", conv)
+        self.assertNotIn("RAISERROR(", conv)
+        self.assertNotIn("SELECT TOP", conv)
+
+    def test_single_line_if_else_statements(self):
+        fn = """
+CREATE FUNCTION dbo.fn_Pick(@x int)
+RETURNS int
+AS
+BEGIN
+    IF (1 = 1) RETURN 10; ELSE RETURN 20;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("IF (1 = 1) THEN\nRETURN 10;\nELSE\nRETURN 20;\nEND IF;", conv)
+        self.assertNotIn("RETURN 10; ELSE", conv)
+
+    def test_single_line_if_begin_else_begin_split(self):
+        fn = """
+CREATE FUNCTION dbo.fn_Pick(@x int)
+RETURNS int
+AS
+BEGIN
+    IF (@x = 1) BEGIN SET @y = 1; END ELSE BEGIN SET @y = 2; END
+    RETURN @y
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("IF (x = 1) THEN\nBEGIN\ny := 1;\nEND;\nELSE\nBEGIN\ny := 2;\nEND;\nEND IF;", conv)
+
+    def test_end_else_on_one_line(self):
+        fn = """
+CREATE FUNCTION dbo.fn_Pick(@x int)
+RETURNS int
+AS
+BEGIN
+    IF (@x = 1)
+    BEGIN
+        SET @y = 1;
+    END ELSE BEGIN
+        SET @y = 2;
+    END
+    RETURN @y
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("IF (x = 1) THEN\nBEGIN\ny := 1;\nEND;\nELSE\nBEGIN\ny := 2;\nEND;\nEND IF;", conv)
+
+    def test_multiline_update_set_not_split(self):
+        fn = """
+CREATE FUNCTION dbo.fn_UpdatePrice(@ProductId INT, @SellingPrice decimal(18,2))
+RETURNS int
+AS
+BEGIN
+    UPDATE dbo.ProductPriceHistory
+    SET SellingPrice = @SellingPrice
+    WHERE ProductId = @ProductId
+    RETURN 1
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn('UPDATE dbo.ProductPriceHistory SET SellingPrice = SellingPrice WHERE ProductId = ProductId;', conv)
+        self.assertIn("RETURN 1;", conv)
+        self.assertEqual(conv.count("UPDATE dbo.ProductPriceHistory SET"), 1)
+
+    def test_multiline_with_cte_not_split(self):
+        fn = """
+CREATE FUNCTION dbo.fn_Search(@term nvarchar(50))
+RETURNS int
+AS
+BEGIN
+    WITH ProductSearch AS
+    (
+        SELECT ProductId FROM dbo.Products WHERE ProductName = @term
+    )
+    SELECT TOP 1 ProductId FROM ProductSearch
+    RETURN 1
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertIn("WITH ProductSearch AS ( SELECT ProductId FROM dbo.Products WHERE ProductName = term ) SELECT  ProductId FROM ProductSearch LIMIT 1;", conv)
+        self.assertIn("RETURN 1;", conv)
+        self.assertNotIn("WITH ProductSearch AS (;", conv)
+
+    def test_multiline_if_condition_with_comment(self):
+        fn = """
+CREATE PROCEDURE dbo.sp_Check(@id int)
+AS
+BEGIN
+    -- guard clause
+    IF EXISTS (
+        SELECT 1 FROM dbo.Orders WHERE OrderId = @id
+    )
+        BEGIN
+            RAISERROR('Not found', 16, 1)
+            RETURN
+        END
+    SELECT 1
+END
+"""
+        conv, warnings = translate_routine(fn, source="procedure", target="postgres")
+        self.assertNotIn("-- guard clause IF EXISTS", conv)
+        self.assertIn("IF EXISTS ( SELECT 1 FROM dbo.Orders WHERE OrderId = id ) THEN", conv)
+        self.assertIn("RAISE EXCEPTION 'Not found';", conv)
+        self.assertIn("END IF;", conv)
+        self.assertNotIn("END LOOP;", conv)
 
 
 class ConvertAPITests(TestCase):

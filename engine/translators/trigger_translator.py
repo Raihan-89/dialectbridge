@@ -18,6 +18,7 @@ import re
 
 from engine.schema import Trigger
 from engine.translators.functions import translate_functions
+from engine.translators.procedure_translator import _transform_tsql_body, _translate_top, _split_args_balanced
 
 _HEADER_RE = re.compile(
     r"CREATE\s+(?:OR\s+ALTER\s+)?(?:TRIGGER\s+)?\[?([\w\d_]+)\]?\s+"
@@ -141,19 +142,30 @@ def _tsql_trigger_to_plpgsql(trigger: Trigger) -> tuple[str | None, list[str]]:
     timing = m.group(3).upper()
     events = [e for e in re.split(r"[\s,]+", m.group(4)) if e.upper() in ("INSERT", "UPDATE", "DELETE")]
 
+    pg_timing = "INSTEAD OF" if "INSTEAD" in timing else "AFTER"
+    pg_return = "NEW"
+    if "INSTEAD" in timing:
+        if events == ["DELETE"]:
+            # INSTEAD OF DELETE on a base table -> BEFORE DELETE row trigger:
+            # PostgreSQL deletes the row after the trigger returns, so the
+            # explicit self-DELETE is stripped and the trigger returns OLD.
+            pg_timing = "BEFORE"
+            pg_return = "OLD"
+        else:
+            return None, ["INSTEAD OF triggers on base tables have no PostgreSQL equivalent (only views support INSTEAD OF); the trigger was skipped — reimplement its logic as a BEFORE trigger or application-level check"]
+
     body = _extract_tsql_body(definition)
     if body is None:
         return None, ["Could not extract trigger body (expected AS BEGIN ... END)"]
 
-    lines = _transform_tsql_trigger_body(body, warnings)
+    lines = _transform_tsql_trigger_body(body, warnings, table=table, return_target=pg_return)
 
-    pg_timing = "INSTEAD OF" if "INSTEAD" in timing else "AFTER"
     pg_events = " OR ".join(e.upper() for e in events) or "INSERT"
     fn_name = f"{name}_fn"
     function = (
         f"CREATE OR REPLACE FUNCTION {fn_name}() RETURNS TRIGGER AS $$\n"
         f"BEGIN\n" + "\n".join("    " + ln for ln in lines) + "\n"
-        f"    RETURN NEW;\n"
+        f"    RETURN {pg_return};\n"
         f"END;\n$$ LANGUAGE plpgsql;"
     )
     create = (
@@ -174,45 +186,139 @@ def _extract_tsql_body(definition: str) -> str | None:
     return tail[: ends[-1].start()]
 
 
-def _transform_tsql_trigger_body(body: str, warnings: list[str]) -> list[str]:
-    parts = _split_structural(body)
-    out: list[str] = []
-    for part in parts:
-        upper = part.upper()
-        if upper in ("BEGIN", "BEGIN TRY"):
-            out.append("BEGIN")
-            continue
-        if upper == "END":
-            out.append("END;")
-            continue
-        if upper == "END TRY":
-            out.append("EXCEPTION WHEN OTHERS THEN")
-            continue
-        if upper == "BEGIN CATCH":
-            continue
-        if upper == "END CATCH":
-            out.append("END;")
-            continue
-        if upper == "ELSE":
-            out.append("ELSE")
-            continue
-        if any(part.upper().startswith(p) for p in _IGNORE_PREFIXES):
-            continue
+def _guard_repl(m: re.Match) -> str:
+    """``EXISTS (SELECT * FROM inserted|deleted)`` presence guards, which are
+    per-statement in T-SQL, map to per-row ``TG_OP`` tests in PostgreSQL.
+    (``NEW IS NOT NULL`` would be wrong: for a composite record it is only
+    true when every field is non-null.)"""
+    if m.group(2).lower() == "inserted":
+        return "TG_OP = 'DELETE'" if m.group(1) else "TG_OP IN ('INSERT','UPDATE')"
+    return "TG_OP = 'INSERT'" if m.group(1) else "TG_OP IN ('DELETE','UPDATE')"
 
-        stmt = _rewrite_insert_select(part)
-        if re.search(r"\bFROM\s+(?:inserted|deleted)\b", stmt, re.IGNORECASE):
-            warnings.append("Statement still references FROM inserted/deleted — multi-row semantics need manual review")
-        stmt = re.sub(r"\binserted\b", "NEW", stmt, flags=re.IGNORECASE)
-        stmt = re.sub(r"\bdeleted\b", "OLD", stmt, flags=re.IGNORECASE)
-        stmt = _expr_tsql_to_pg(stmt)
-        out.append(stmt + ";")
+
+def _wrap_insdel(text: str) -> str:
+    """Rewrite the T-SQL `inserted`/`deleted` pseudo-tables into single-row
+    PostgreSQL forms (string literals are preserved).
+
+    - ``EXISTS (SELECT * FROM inserted)`` guards become ``TG_OP``
+    - ``FROM|JOIN inserted [alias]`` becomes ``FROM (SELECT (NEW).*) [alias]``
+      so column references resolve against the trigger's row (same for OLD)."""
+    parts = re.split(r"('(?:[^']|'')*')", text)
+    for i, p in enumerate(parts):
+        if p.startswith("'"):
+            continue
+        p = re.sub(
+            r"(NOT\s+)?EXISTS\s*\(\s*SELECT\s+\*\s+FROM\s+(inserted|deleted)\s*\)",
+            _guard_repl,
+            p, flags=re.IGNORECASE,
+        )
+        p = re.sub(
+            r"\b(FROM|JOIN)\s+(inserted|deleted)\b",
+            lambda m: f"{m.group(1)} (SELECT ({'NEW' if m.group(2).lower() == 'inserted' else 'OLD'}).*)",
+            p, flags=re.IGNORECASE,
+        )
+        parts[i] = p
+    return "".join(parts)
+
+
+def _sub_insdel(text: str) -> str:
+    """Substitute ``inserted`` -> ``NEW`` and ``deleted`` -> ``OLD`` outside
+    string literals (so IF predicates and expressions pick them up without
+    corrupting RAISERROR messages)."""
+    parts = re.split(r"('(?:[^']|'')*')", text)
+    return "".join(
+        re.sub(r"\binserted\b", "NEW", re.sub(r"\bdeleted\b", "OLD", p, flags=re.IGNORECASE), flags=re.IGNORECASE)
+        if not p.startswith("'") else p
+        for p in parts
+    )
+
+
+def _transform_tsql_trigger_body(body: str, warnings: list[str], table: str | None = None,
+                                 return_target: str = "NEW") -> list[str]:
+    """Transform a trigger body by delegating to the procedure translator's
+    block engine (IF/WHILE/BEGIN/END/TRY/CATCH, multi-line statements), with a
+    trigger-specific statement rewriter (`_trigger_statement`)."""
+    def statement_fn(line, declared, warns, returns_set):
+        return _trigger_statement(line, declared, warns, returns_set, table=table, return_target=return_target)
+
+    out, warns, _ = _transform_tsql_body(_wrap_insdel(body), "trigger", False, statement_fn=statement_fn)
+    warnings.extend(warns)
     return out
+
+
+def _translate_raiseerror(line: str) -> str:
+    """RAISERROR / THROW -> RAISE EXCEPTION (only the message and optional
+    positional values are kept; severity/state are dropped)."""
+    m = re.match(r"^RAISERROR\s*\((.*)\)\s*$", line, re.IGNORECASE | re.DOTALL)
+    if m:
+        args = _split_args_balanced(m.group(1))
+        if args:
+            msg = args[0].strip()
+            if msg.startswith("@"):
+                return f"RAISE EXCEPTION '%', {msg[1:]}"
+            msg_literal = re.sub(r"%\s*[sdiduoxXcgeEfG]", "%", msg)
+            if len(args) > 3:
+                extra = ", ".join(a.strip() for a in args[3:])
+                return f"RAISE EXCEPTION {msg_literal}, {extra}"
+            return f"RAISE EXCEPTION {msg_literal}"
+        return "RAISE EXCEPTION 'error'"
+    m = re.match(r"^THROW\s+(\d+)\s*,\s*([^,]+)\s*,", line, re.IGNORECASE)
+    if m:
+        return f"RAISE EXCEPTION {m.group(2).strip()}"
+    if line.upper().startswith("THROW"):
+        return "RAISE EXCEPTION 'error'"
+    return line
+
+
+def _trigger_statement(line: str, declared: dict[str, str], warnings: list[str], returns_set: bool,
+                       table: str | None = None, return_target: str = "NEW") -> str | None:
+    """Rewrite a completed trigger-body statement (called via the
+    procedure translator's statement_fn hook)."""
+    upper = line.upper()
+    if upper in ("SET NOCOUNT ON", "SET NOCOUNT OFF"):
+        return None
+    # transaction control is not supported inside PL/pgSQL trigger functions
+    if re.match(r"^BEGIN\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
+        warnings.append("transaction control 'BEGIN TRANSACTION' is not supported inside PL/pgSQL trigger functions and was removed")
+        return None
+    if re.match(r"^(COMMIT|ROLLBACK)\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
+        warnings.append(f"transaction control '{upper.split()[0]} TRANSACTION' is not supported inside PL/pgSQL trigger functions and was removed")
+        return None
+    # An INSTEAD OF DELETE converted to a BEFORE DELETE trigger: the explicit
+    # DELETE of the trigger's own table is implicit in PostgreSQL and removed.
+    guard_self_write = False
+    if table:
+        bare = re.escape(table.split(".")[-1])
+        if re.match(rf"^DELETE\s+FROM\s+{bare}\b", line, re.IGNORECASE) and re.search(
+                r"\(SELECT \((NEW|OLD)\)\.\*\)", line, re.IGNORECASE):
+            warnings.append("DELETE inside an INSTEAD OF DELETE trigger is implicit in PostgreSQL (BEFORE DELETE) and was removed")
+            return None
+        # A trigger that writes to its own table would fire itself forever
+        # (MSSQL disables recursive triggers by default). Guard the self-write
+        # so it only runs for the outermost statement.
+        guard_self_write = re.match(rf"^(?:UPDATE\s+{bare}\b|INSERT\s+INTO\s+{bare}\b)", line, re.IGNORECASE) and bool(
+            re.search(r"\(SELECT \((NEW|OLD)\)\.\*\)", line, re.IGNORECASE))
+
+    line = _translate_raiseerror(line)
+    line = _translate_top(line)
+    stmt = _rewrite_insert_select(line)
+    if re.search(r"\bFROM\s+(?:inserted|deleted)\b", stmt, re.IGNORECASE):
+        warnings.append("Statement still references FROM inserted/deleted — multi-row semantics need manual review")
+    stmt = _sub_insdel(stmt)
+    stmt = _expr_tsql_to_pg(stmt)
+    if guard_self_write:
+        return f"IF pg_trigger_depth() = 1 THEN\n{stmt};\nEND IF;"
+    # A row-level trigger function must RETURN NEW/OLD; a bare RETURN exits.
+    if re.match(r"^RETURN\b", stmt, re.IGNORECASE) and not re.match(rf"^RETURN\s+(NEW|OLD)\b", stmt, re.IGNORECASE):
+        stmt = re.sub(r"^RETURN\b", f"RETURN {return_target}", stmt, flags=re.IGNORECASE)
+    return stmt + ";"
 
 
 _RESERVED = {"SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IN", "VALUES",
              "INSERT", "UPDATE", "DELETE", "JOIN", "ON", "AS", "SET", "TOP", "DISTINCT",
              "INSERTED", "DELETED", "GETDATE", "NEWID", "NEWSEQUENTIALID", "SCOPE_IDENTITY",
-             "ISNULL", "COUNT", "SUM", "MIN", "MAX", "AVG", "COALESCE", "CASE", "WHEN", "THEN", "ELSE", "END"}
+             "ISNULL", "COUNT", "SUM", "MIN", "MAX", "AVG", "COALESCE", "CASE", "WHEN", "THEN", "ELSE", "END",
+             "SYSTEM_USER", "CONCAT", "RETURN", "RAISERROR"}
 
 
 def _rewrite_insert_select(stmt: str) -> str:

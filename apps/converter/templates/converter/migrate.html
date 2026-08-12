@@ -1,55 +1,91 @@
 {% extends "converter/base.html" %}
-{% block title %}Migrate Database{% endblock %}
-
+{% block title %}Database Migration — SQL Conversion Engine{% endblock %}
+{% block nav_migrate %}active{% endblock %}
 {% block content %}
-<h2>Database Migration</h2>
-<p>Pick a source and a target connection and run the full migration: schema, data, views, functions, procedures and triggers — with row-count verification at the end.</p>
+<h1 class="page-title">Database Migration</h1>
+<p class="subtitle">Pick a source and a target connection and run the full migration: schema, data, views, functions, procedures and triggers — with row-count verification at the end.</p>
 
 {% if messages %}
     {% for message in messages %}
-        <div class="{{ message.tags }}">{{ message }}</div>
+        <div class="alert {% if message.tags == 'success' %}alert-success{% elif message.tags == 'error' %}alert-error{% else %}alert-warning{% endif %}">{{ message }}</div>
     {% endfor %}
 {% endif %}
 
-{% if connections %}
-<form method="post" style="display: grid; gap: 8px; max-width: 520px;">
-    {% csrf_token %}
-    <label>Name (optional) <input type="text" name="name" placeholder="My migration"></label>
-    <label>Source
-        <select name="source" required>
-            <option value="">— select source —</option>
-            {% for conn in connections %}<option value="{{ conn.pk }}">{{ conn.name }} ({{ conn.get_engine_display }})</option>{% endfor %}
-        </select>
-    </label>
-    <label>Target
-        <select name="target" required>
-            <option value="">— select target —</option>
-            {% for conn in connections %}<option value="{{ conn.pk }}">{{ conn.name }} ({{ conn.get_engine_display }})</option>{% endfor %}
-        </select>
-    </label>
-    <label><input type="checkbox" name="copy_data" checked> Copy table data</label>
-    <label><input type="checkbox" name="reset_target"> Drop target schemas before migrating (destructive)</label>
-    <button type="submit">Run Migration</button>
-</form>
-{% else %}
-<p>No connections saved yet. <a href="{% url 'connections' %}">Add one first</a>.</p>
-{% endif %}
+<div class="grid-2">
+    <div class="card">
+        <h2>Run Migration</h2>
+        {% if connections %}
+        <form method="post" class="form-grid">
+            {% csrf_token %}
+            <div class="field">
+                <label for="name">Name <span class="hint">(optional)</span></label>
+                <input type="text" name="name" id="name" placeholder="My migration">
+            </div>
+            <div class="field">
+                <label for="source">Source</label>
+                <select name="source" id="source" required>
+                    <option value="">— select source —</option>
+                    {% for conn in connections %}<option value="{{ conn.pk }}">{{ conn.name }} ({{ conn.get_engine_display }})</option>{% endfor %}
+                </select>
+            </div>
+            <div class="field">
+                <label for="target">Target</label>
+                <select name="target" id="target" required>
+                    <option value="">— select target —</option>
+                    {% for conn in connections %}<option value="{{ conn.pk }}">{{ conn.name }} ({{ conn.get_engine_display }})</option>{% endfor %}
+                </select>
+            </div>
+            <label class="checkbox-line"><input type="checkbox" name="copy_data" checked> Copy table data</label>
+            <label class="checkbox-line"><input type="checkbox" name="reset_target"> <span>Drop target schemas before migrating <span class="badge badge-warn">destructive</span></span></label>
+            <button type="submit" class="btn">Run Migration</button>
+        </form>
+        {% else %}
+        <div class="empty-state">
+            <div class="big">🔌</div>
+            <p>No connections saved yet. <a href="{% url 'connections' %}">Add one first</a>.</p>
+        </div>
+        {% endif %}
+    </div>
 
-<h3>Recent Migrations</h3>
-{% if recent_jobs %}
-<table>
-    <tr><th>Name</th><th>Source → Target</th><th>Status</th><th>Run</th><th></th></tr>
-    {% for job in recent_jobs %}
-    <tr>
-        <td>{{ job.name }}</td>
-        <td>{{ job.source.name }} → {{ job.target.name }}</td>
-        <td>{{ job.get_status_display }}</td>
-        <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
-        <td><a href="{% url 'migrate-detail' job.pk %}">View</a></td>
-    </tr>
-    {% endfor %}
-</table>
-{% else %}
-<p>No migrations yet.</p>
-{% endif %}
+    <div class="card">
+        <h2>Recent Migrations</h2>
+        {% if recent_jobs %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Source → Target</th>
+                        <th>Status</th>
+                        <th>Run</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for job in recent_jobs %}
+                    <tr>
+                        <td><strong>{{ job.name }}</strong></td>
+                        <td>{{ job.source.name }} → {{ job.target.name }}</td>
+                        <td>
+                            {% if job.status == 'completed' %}<span class="badge badge-ok">Completed</span>
+                            {% elif job.status == 'partial' %}<span class="badge badge-warn">Completed with errors</span>
+                            {% elif job.status == 'failed' %}<span class="badge badge-fail">Failed</span>
+                            {% elif job.status == 'running' %}<span class="badge badge-neutral">Running</span>
+                            {% else %}<span class="badge badge-neutral">Pending</span>{% endif %}
+                        </td>
+                        <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
+                        <td><a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline">View</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <div class="big">🚀</div>
+            <p>No migrations yet — run one on the left.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
 {% endblock %}

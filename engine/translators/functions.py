@@ -244,8 +244,15 @@ def _pg_type(t: str) -> str:
         "DATETIMEOFFSET": "TIMESTAMPTZ", "UNIQUEIDENTIFIER": "UUID",
         "BINARY": "BYTEA", "VARBINARY": "BYTEA", "IMAGE": "BYTEA",
         "NTEXT": "TEXT", "TEXT": "TEXT", "MONEY": "NUMERIC(19,4)",
+        "DECIMAL": "NUMERIC", "NUMERIC": "NUMERIC",
     }
-    return simple.get(base, f"{base}{params}")
+    if base in simple:
+        return simple[base]
+    if base in ("VARCHAR", "CHAR", "NVARCHAR", "NCHAR"):
+        if params is None or params.strip("()").upper() == "MAX":
+            return "TEXT"
+        return f"{base[1:] if base.startswith('N') else base}{params}"
+    return f"{base}{params}"
 
 
 def _pg_date_part_reverse(args: str) -> str | None:
@@ -310,6 +317,7 @@ def translate_functions(text: str, source: str, target: str) -> str:
         text = re.sub(r"\bLEN\s*\(", "LENGTH(", text, flags=re.I)
         text = re.sub(r"\bCURRENT_TIMESTAMP\b", "CURRENT_TIMESTAMP", text, flags=re.I)
         text = re.sub(r"\bGETUTCDATE\s*\(\s*\)", "CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", text, flags=re.I)
+        text = re.sub(r"\bSYSTEM_USER\b", "CURRENT_USER", text, flags=re.I)
         return text
     elif source == "postgres" and target == "tsql":
         text = _rewrite_calls(text, {

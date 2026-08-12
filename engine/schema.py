@@ -33,6 +33,12 @@ class Constraint:
 
 
 @dataclass
+class CheckConstraint:
+    name: str
+    definition: str
+
+
+@dataclass
 class ForeignKey:
     name: str
     columns: list[str]
@@ -58,7 +64,7 @@ class Table:
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     unique_constraints: list[Constraint] = field(default_factory=list)
     indexes: list[Index] = field(default_factory=list)
-    check_constraints: list[str] = field(default_factory=list)
+    check_constraints: list[CheckConstraint] = field(default_factory=list)
 
 
 @dataclass
@@ -188,7 +194,9 @@ def _table_to_dict(t: Table) -> dict:
             {"name": i.name, "columns": i.columns, "unique": i.unique, "where": i.where}
             for i in t.indexes
         ],
-        "check_constraints": t.check_constraints,
+        "check_constraints": [
+            {"name": c.name, "definition": c.definition} for c in t.check_constraints
+        ],
     }
 
 

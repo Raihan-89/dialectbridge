@@ -8,7 +8,7 @@ table by OID, so identifiers with spaces/uppercase never break parsing.
 from __future__ import annotations
 
 from engine.schema import (
-    Column, Constraint, Database, ForeignKey, Index, Routine, Sequence, Table,
+    CheckConstraint, Column, Constraint, Database, ForeignKey, Index, Routine, Sequence, Table,
     Trigger, View,
 )
 
@@ -266,7 +266,10 @@ def _extract_table(conn, oid: int, qualified: str) -> Table:
             indexes.append(current_idx)
         current_idx.columns.append(col_name)
 
-    checks = [row[1] for row in conn.fetch(_CHECK_SQL, (oid,))]
+    checks = [
+        CheckConstraint(name=row[0], definition=row[1])
+        for row in conn.fetch(_CHECK_SQL, (oid,))
+    ]
 
     return Table(
         name=qualified,

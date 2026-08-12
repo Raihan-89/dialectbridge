@@ -1,25 +1,41 @@
 {% extends "converter/base.html" %}
-{% block title %}Conversion History{% endblock %}
+{% block title %}Conversion History — SQL Conversion Engine{% endblock %}
+{% block nav_history %}active{% endblock %}
 {% block content %}
-<h1>Conversion History</h1>
-<table>
-    <tr>
-        <th>When</th>
-        <th>Direction</th>
-        <th>Type</th>
-        <th>Status</th>
-        <th>Warnings</th>
-    </tr>
-    {% for job in jobs %}
-    <tr>
-        <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
-        <td>{{ job.get_direction_display }}</td>
-        <td>{{ job.get_statement_type_display }}</td>
-        <td>{% if job.succeeded %}✅ OK{% else %}❌ Failed{% endif %}</td>
-        <td>{{ job.warnings|length }}</td>
-    </tr>
-    {% empty %}
-    <tr><td colspan="5">No conversions yet.</td></tr>
-    {% endfor %}
-</table>
+<h1 class="page-title">Conversion History</h1>
+<p class="subtitle">Audit trail of every SQL conversion run through the converter.</p>
+
+<div class="card">
+    {% if jobs %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>When</th>
+                    <th>Direction</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Warnings</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for job in jobs %}
+                <tr>
+                    <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
+                    <td>{{ job.get_direction_display }}</td>
+                    <td><span class="badge badge-neutral">{{ job.get_statement_type_display }}</span></td>
+                    <td>{% if job.succeeded %}<span class="badge badge-ok">✓ Success</span>{% else %}<span class="badge badge-fail">✕ Failed</span>{% endif %}</td>
+                    <td>{% if job.warnings %}<span class="badge badge-warn">{{ job.warnings|length }} warning{{ job.warnings|pluralize }}</span>{% else %}<span class="badge badge-neutral">none</span>{% endif %}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="big">🕓</div>
+        <p>No conversions yet. <a href="{% url 'convert-form' %}">Run your first conversion</a>.</p>
+    </div>
+    {% endif %}
+</div>
 {% endblock %}
