@@ -11,7 +11,7 @@
     {% endfor %}
 {% endif %}
 
-<div class="grid-2">
+<div class="grid-2 connection-layout">
     <div class="card">
         <h2>Add Connection</h2>
         <form method="post" class="form-grid">
@@ -60,8 +60,8 @@
     <div class="card">
         <h2>Saved Connections</h2>
         {% if connections %}
-        <div class="table-wrap">
-            <table>
+        <div class="table-wrap connection-list-wrap">
+            <table class="connection-list">
                 <thead>
                     <tr>
                         <th>Name</th>
@@ -69,18 +69,18 @@
                         <th>Role</th>
                         <th>Host</th>
                         <th>Database</th>
-                        <th>Actions</th>
+                        <th class="table-actions">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for conn in connections %}
                     <tr>
-                        <td><strong>{{ conn.name }}</strong></td>
-                        <td><span class="badge badge-neutral">{{ conn.get_engine_display }}</span></td>
-                        <td>{{ conn.get_role_display }}</td>
-                        <td class="mono">{{ conn.host }}:{{ conn.effective_port }}</td>
-                        <td class="mono">{{ conn.database }}</td>
-                        <td>
+                        <td data-label="Name"><strong>{{ conn.name }}</strong></td>
+                        <td data-label="Engine"><span class="badge badge-neutral">{{ conn.get_engine_display }}</span></td>
+                        <td data-label="Role">{{ conn.get_role_display }}</td>
+                        <td data-label="Host" class="mono">{{ conn.host }}:{{ conn.effective_port }}</td>
+                        <td data-label="Database" class="mono">{{ conn.database }}</td>
+                        <td data-label="Actions" class="table-actions">
                             <div class="btn-row" style="gap: 4px;">
                                 <form method="post">{% csrf_token %}
                                     <input type="hidden" name="action" value="test">

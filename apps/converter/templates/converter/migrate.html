@@ -11,7 +11,7 @@
     {% endfor %}
 {% endif %}
 
-<div class="grid-2">
+<div class="grid-2 migration-layout">
     <div class="card">
         <h2>Run Migration</h2>
         {% if running_job %}
@@ -57,8 +57,8 @@
     <div class="card">
         <h2>Migration History</h2>
         {% if recent_jobs %}
-        <div class="table-wrap">
-            <table>
+        <div class="table-wrap migration-history-wrap">
+            <table class="migration-history">
                 <thead>
                     <tr>
                         <th>Serial</th>
@@ -66,24 +66,24 @@
                         <th>Source → Target</th>
                         <th>Status</th>
                         <th>Run</th>
-                        <th></th>
+                        <th class="table-actions">Action</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for job in recent_jobs %}
                     <tr>
-                        <td><a class="mono" href="{% url 'migrate-detail' job.pk %}"><strong>#{{ job.pk }}</strong></a></td>
-                        <td><strong>{{ job.name }}</strong></td>
-                        <td>{{ job.source.name }} → {{ job.target.name }}</td>
-                        <td>
+                        <td data-label="Serial"><a class="mono" href="{% url 'migrate-detail' job.pk %}"><strong>#{{ job.pk }}</strong></a></td>
+                        <td data-label="Name"><strong>{{ job.name }}</strong></td>
+                        <td data-label="Route">{{ job.source.name }} → {{ job.target.name }}</td>
+                        <td data-label="Status">
                             {% if job.status == 'completed' %}<span class="badge badge-ok">Completed</span>
                             {% elif job.status == 'partial' %}<span class="badge badge-warn">Completed with errors</span>
                             {% elif job.status == 'failed' %}<span class="badge badge-fail">Failed</span>
                             {% elif job.status == 'running' %}<span class="badge badge-neutral">Running</span>
                             {% else %}<span class="badge badge-neutral">Pending</span>{% endif %}
                         </td>
-                        <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
-                        <td><a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline">View</a></td>
+                        <td data-label="Run">{{ job.created_at|date:"Y-m-d H:i" }}</td>
+                        <td data-label="Report" class="table-actions"><a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline">View</a></td>
                     </tr>
                     {% endfor %}
                 </tbody>
