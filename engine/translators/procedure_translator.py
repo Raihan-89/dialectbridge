@@ -1135,6 +1135,16 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
 
     transformed, t_warns, declared = _transform_plpgsql_body(body)
     warnings.extend(t_warns)
+    if any(line == "END TRY" for line in transformed) and not any(line == "BEGIN TRY" for line in transformed):
+        end_try = transformed.index("END TRY")
+        begin_indexes = [i for i, line in enumerate(transformed[:end_try]) if line == "BEGIN"]
+        if begin_indexes:
+            transformed[begin_indexes[-1]] = "BEGIN TRY"
+    if "BEGIN CATCH" in transformed:
+        catch_start = transformed.index("BEGIN CATCH")
+        catch_end = next((i for i in range(catch_start + 1, len(transformed)) if transformed[i] == "END"), None)
+        if catch_end is not None:
+            transformed[catch_end] = "END CATCH"
 
     param_list = []
     for pname, ptype, output in params:
@@ -1164,7 +1174,35 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
             )
         transformed = [_qualify(ln) for ln in transformed]
 
-    declares = "".join(f"    DECLARE @{k} {v};\n" for k, v in declared.items())
+        # Initializers are stored separately from body statements.
+        declared = {name: _qualify(value) for name, value in declared.items()}
+
+        # Older round-tripped bodies can quote a local variable. In an
+        # assignment "v" = "v", the left token is the local and the right
+        # token is the source column; later bracketed uses are procedural.
+        for local_name in declared:
+            marker = f"\x02{local_name}\x02"
+            transformed = [re.sub(
+                rf"\[{re.escape(local_name)}\]\s*=\s*\[{re.escape(local_name)}\]",
+                f"@{local_name} = {marker}", ln, flags=re.IGNORECASE,
+            ) for ln in transformed]
+            transformed = [
+                re.sub(rf"\[{re.escape(local_name)}\]", f"@{local_name}", ln, flags=re.IGNORECASE)
+                .replace(marker, f"[{local_name}]")
+                for ln in transformed
+            ]
+
+    transformed = [_repair_tsql_parameter_contexts(ln, params) for ln in transformed]
+
+    declare_lines = []
+    for var_name, type_and_init in declared.items():
+        pieces = re.split(r"\s*:=\s*", type_and_init, maxsplit=1)
+        mapped_type, type_warn = convert_type(pieces[0], "postgres", "tsql")
+        if type_warn:
+            warnings.append(f"Variable {var_name}: {type_warn}")
+        initializer = f" = {pieces[1]}" if len(pieces) == 2 else ""
+        declare_lines.append(f"    DECLARE @{var_name} {mapped_type or 'NVARCHAR(MAX)'}{initializer};\n")
+    declares = "".join(declare_lines)
 
     lower_returns = returns.lower()
     is_scalar_fn = not (
@@ -1184,7 +1222,8 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
         # void / SETOF / TABLE(...) — all return a result set; the closest
         # working T-SQL equivalent is a stored procedure.
         head = (
-            f"CREATE PROCEDURE [{schema}].[{name}] ({', '.join(param_list)})\n"
+            f"CREATE PROCEDURE [{schema}].[{name}]"
+            f"{' (' + ', '.join(param_list) + ')' if param_list else ''}\n"
             f"AS\nBEGIN\n    SET NOCOUNT ON;\n"
         )
         tail = "END;"
@@ -1203,7 +1242,7 @@ def _extract_plpgsql_body(sql: str) -> str | None:
 
 def _parse_params_reverse(param_text: str) -> tuple[list[tuple[str, str, bool]], list[str]]:
     params = []
-    for part in param_text.split(","):
+    for part in _split_args_balanced(param_text):
         part = part.strip()
         if not part:
             continue
@@ -1236,7 +1275,10 @@ def _transform_plpgsql_body(body: str) -> tuple[list[str], list[str], dict[str, 
             in_declare = True
             continue
         if in_declare and upper != "BEGIN":
-            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)|\S+)\s*(?::=\s*(.+))?$", line)
+            m = re.match(
+                r'^"?([A-Za-z_][A-Za-z0-9_]*)"?\s+(.+?)(?:\s*:=\s*(.+))?$',
+                line,
+            )
             if m:
                 name, dtype, init = m.group(1), m.group(2), m.group(3)
                 declare_types[name] = dtype
@@ -1267,12 +1309,12 @@ def _transform_plpgsql_body(body: str) -> tuple[list[str], list[str], dict[str, 
             out.append("ELSE")
             out.append("BEGIN")
             continue
-        if upper == "END IF;":
+        if upper == "END IF":
             out.append("END")
             if stack and stack[-1] == "if":
                 stack.pop()
             continue
-        if upper == "END LOOP;":
+        if upper == "END LOOP":
             out.append("END")
             if stack and stack[-1] == "while":
                 stack.pop()
@@ -1354,10 +1396,47 @@ def _transform_plpgsql_body(body: str) -> tuple[list[str], list[str], dict[str, 
 def _expr_rev(text: str) -> str:
     text = translate_functions(text, "postgres", "tsql")
     text = re.sub(r'"([\w\s\d_]+)"', r"[\1]", text)
-    text = re.sub(r"::[\w\s.]+", "", text)
+    from engine.translators.sql_builder import _strip_pg_casts, _translate_pg_boolean_literals
+    text = _strip_pg_casts(text)
+    text = _translate_pg_boolean_literals(text)
+    text = text.replace("||", "+")
     text = re.sub(r"ROW_COUNT\s*\(\s*\)", "@@ROWCOUNT", text, flags=re.IGNORECASE)
     text = re.sub(r"LASTVAL\s*\(\s*\)", "SCOPE_IDENTITY()", text, flags=re.IGNORECASE)
     text = re.sub(r"pg_sleep\s*\(([^)]+)\)", "WAITFOR DELAY '00:00:00.001'", text, flags=re.IGNORECASE)
+    return text
+
+
+def _repair_tsql_parameter_contexts(text: str, params: list[tuple[str, str, bool]]) -> str:
+    """Repair contexts where a PG parameter and column share a name."""
+    names = {name.lower(): name for name, _, _ in params}
+    if not names:
+        return text
+
+    # Protect INSERT column lists: they contain identifiers, never variables.
+    protected: list[str] = []
+    def _protect_insert(m):
+        protected.append(re.sub(r"@([A-Za-z_]\w*)", r"[\1]", m.group(2)))
+        return m.group(1) + f"\x03{len(protected) - 1}\x03" + m.group(3)
+    text = re.sub(
+        r"(INSERT\s+INTO\s+[^()\s]+\s*\()([^)]*)(\))",
+        _protect_insert,
+        text, flags=re.IGNORECASE,
+    )
+    # A common round-trip shape is WHERE param = param: the left occurrence
+    # originated as the table column, the right one is the routine parameter.
+    for lower, canon in names.items():
+        column_marker = f"\x04{canon}\x04"
+        text = re.sub(
+            rf"\b(WHERE|AND|OR)\s+@{re.escape(canon)}\s*=\s*@{re.escape(canon)}\b",
+            rf"\1 {column_marker} = @{canon}", text, flags=re.IGNORECASE,
+        )
+        # Older converted PG bodies may have accidentally quoted parameters.
+        text = re.sub(rf"\[{re.escape(canon)}\]\s+IS\s+NULL", f"@{canon} IS NULL", text, flags=re.IGNORECASE)
+        text = re.sub(rf"=\s*\[{re.escape(canon)}\]", f"= @{canon}", text, flags=re.IGNORECASE)
+        text = re.sub(rf"(?<!\.)\[{re.escape(canon)}\]", f"@{canon}", text, flags=re.IGNORECASE)
+        text = text.replace(column_marker, f"[{canon}]")
+    for i, value in enumerate(protected):
+        text = text.replace(f"\x03{i}\x03", value)
     return text
 
 

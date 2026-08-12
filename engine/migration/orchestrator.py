@@ -297,7 +297,12 @@ def _object_kind(stmt: str) -> str:
 
 def _name_from_stmt(stmt: str) -> str:
     # grab the first identifier after CREATE <kind>
-    m = __import__("re").match(r"^\s*CREATE(?:\s+\w+){1,2}\s+(?:\"?\[?\w+\]?\"?\.)?\"?\[?([\w\d_]+)", stmt)
+    m = __import__("re").match(
+        r"^\s*CREATE(?:\s+OR\s+(?:ALTER|REPLACE))?\s+"
+        r"(?:VIEW|FUNCTION|PROCEDURE|TRIGGER)\s+"
+        r"(?:\"?\[?\w+\]?\"?\.)?\"?\[?([\w\d_]+)", stmt,
+        flags=__import__("re").IGNORECASE,
+    )
     return m.group(1) if m else stmt[:40]
 
 

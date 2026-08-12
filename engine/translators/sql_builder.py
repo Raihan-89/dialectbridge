@@ -52,14 +52,18 @@ _PG_TYPES = [
     (r"^bigint$", "BIGINT"),
     (r"^smallint$", "SMALLINT"),
     (r"^boolean$", "BIT"),
+    (r"^numeric$", "NUMERIC"),
+    (r"^decimal$", "NUMERIC"),
     (r"^numeric\(([\d,]+)\)$", r"NUMERIC(\1)"),
     (r"^decimal\(([\d,]+)\)$", r"NUMERIC(\1)"),
     (r"^double precision$", "FLOAT"),
     (r"^real$", "REAL"),
     (r"^money$", "MONEY"),
     (r"^character varying\((\d+)\)$", r"NVARCHAR(\1)"),
+    (r"^character varying$", "NVARCHAR(MAX)"),
     (r"^character\((\d+)\)$", r"NCHAR(\1)"),
     (r"^varchar\((\d+)\)$", r"NVARCHAR(\1)"),
+    (r"^varchar$", "NVARCHAR(MAX)"),
     (r"^char\((\d+)\)$", r"NCHAR(\1)"),
     (r"^text$", "NVARCHAR(MAX)"),
     (r"^bytea$", "VARBINARY(MAX)"),
@@ -265,7 +269,8 @@ def build_index_ddl(table: Table, index: Index, target: str, source: str) -> tup
     unique = "UNIQUE " if index.unique else ""
     stmt = f"CREATE {unique}INDEX {_qident(index.name, target)} ON {_qident(table.name, target)} ({_qcols(index.columns, target)})"
     if index.where and target == "tsql":
-        stmt += f" WHERE {index.where}"
+        where = _translate_expr(index.where, source, target)
+        stmt += f" WHERE {where}"
     elif index.where:
         # PostgreSQL keeps filtered indexes as partial indexes.
         where = _translate_expr(index.where, source, target)
@@ -376,9 +381,33 @@ def _translate_expr(expr: str, source: str, target: str) -> str:
     else:
         # PG quoted identifiers -> MSSQL brackets
         out = re.sub(r'"([\w\s\d_]+)"', r"[\1]", out)
-        # PG type casts (::numeric, ::character varying) have no T-SQL form
-        out = re.sub(r"::[\w\s.]+", "", out)
+        out = _strip_pg_casts(out)
+        out = _translate_pg_boolean_literals(out)
     return out
+
+
+def _strip_pg_casts(text: str) -> str:
+    """Remove PostgreSQL ``::type`` suffixes without consuming SQL keywords.
+
+    Handles multi-word and parameterized types such as ``::character varying``
+    and ``::numeric(12,2)``.
+    """
+    pg_type = (
+        r"(?:double\s+precision|character\s+varying|timestamp(?:\(\d+\))?\s+"
+        r"(?:with|without)\s+time\s+zone|time(?:\(\d+\))?\s+"
+        r"(?:with|without)\s+time\s+zone|[A-Za-z_][\w.]*)"
+        r"(?:\s*\([^)]*\))?(?:\[\])?"
+    )
+    return re.sub(rf"\s*::\s*{pg_type}", "", text, flags=re.IGNORECASE)
+
+
+def _translate_pg_boolean_literals(text: str) -> str:
+    """Translate true/false outside quoted strings to SQL Server BIT values."""
+    parts = re.split(r"('(?:[^']|'')*')", text)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"\btrue\b", "1", parts[i], flags=re.IGNORECASE)
+        parts[i] = re.sub(r"\bfalse\b", "0", parts[i], flags=re.IGNORECASE)
+    return "".join(parts)
 
 
 def _select_end(after: str) -> int:
@@ -561,7 +590,10 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
     and already-quoted identifiers are masked so they are never rewritten.
     """
     if target != "postgres":
-        return _qualify_table_refs(text, [t.name for t in tables], target)
+        # PostgreSQL extraction already preserves identifiers with quotes and
+        # _translate_expr converts those to brackets. Broadly replacing bare
+        # names here corrupts SELECT aliases (Category -> dbo.Category).
+        return text
 
     masked, stash = _mask(text)
     masked = _qualify_table_refs(masked, [t.name for t in tables], target)

@@ -18,7 +18,12 @@ import re
 
 from engine.schema import Trigger
 from engine.translators.functions import translate_functions
-from engine.translators.procedure_translator import _transform_tsql_body, _translate_top, _split_args_balanced
+from engine.translators.procedure_translator import (
+    _transform_plpgsql_body,
+    _transform_tsql_body,
+    _translate_top,
+    _split_args_balanced,
+)
 
 _HEADER_RE = re.compile(
     r"CREATE\s+(?:OR\s+ALTER\s+)?(?:TRIGGER\s+)?\[?([\w\d_]+)\]?\s+"
@@ -123,7 +128,15 @@ def _expr_tsql_to_pg(text: str) -> str:
 
 def _expr_pg_to_tsql(text: str) -> str:
     text = translate_functions(text, "postgres", "tsql")
+    from engine.translators.sql_builder import _strip_pg_casts, _translate_pg_boolean_literals
+    text = re.sub(r'"([\w\s\d_]+)"', r"[\1]", text)
+    text = _strip_pg_casts(text)
+    text = _translate_pg_boolean_literals(text)
+    text = text.replace("||", "+")
     text = re.sub(r"ROW_COUNT\s*\(\s*\)", "@@ROWCOUNT", text, flags=re.IGNORECASE)
+    # SQL Server has no equivalent recursion-depth function. Nested triggers
+    # can be guarded with TRIGGER_NESTLEVEL().
+    text = re.sub(r"pg_trigger_depth\s*\(\s*\)", "TRIGGER_NESTLEVEL()", text, flags=re.IGNORECASE)
     return text
 
 
@@ -381,24 +394,32 @@ def _plpgsql_trigger_to_tsql(trigger: Trigger) -> tuple[str | None, list[str]]:
     if body is None:
         return None, ["Could not extract trigger function body"]
 
-    parts = _split_structural(body)
+    # Use the routine block parser for PL/pgSQL IF/ELSIF/ELSE/LOOP syntax;
+    # treating those tokens as plain statements leaves THEN in generated SQL.
+    parts, body_warnings, declared = _transform_plpgsql_body(body)
+    warnings.extend(body_warnings)
     lines: list[str] = []
+    for var_name, var_type in declared.items():
+        dtype = var_type.split(":=", 1)[0].strip()
+        from engine.translators.sql_builder import convert_type
+        mapped, warn = convert_type(dtype, "postgres", "tsql")
+        if warn:
+            warnings.append(f"Variable {var_name}: {warn}")
+        lines.append(f"    DECLARE @{var_name} {mapped or 'NVARCHAR(MAX)'};")
     for part in parts:
-        upper = part.upper()
-        if upper in ("BEGIN",):
-            lines.append("    BEGIN")
-            continue
-        if upper == "END":
-            lines.append("    END")
-            continue
-        if upper == "EXCEPTION WHEN OTHERS THEN":
-            lines.append("    END TRY")
-            lines.append("    BEGIN CATCH")
-            continue
-        stmt = _expr_pg_to_tsql(part)
-        stmt = re.sub(r"\bNEW\.", "inserted.", stmt)
-        stmt = re.sub(r"\bOLD\.", "deleted.", stmt)
+        stmt = _expr_pg_to_tsql(part.rstrip(";"))
+        # Bodies produced by our T-SQL -> PG converter use these single-row
+        # wrappers. On the return trip they are exactly the pseudo-tables.
+        stmt = re.sub(r"\(\s*SELECT\s+\(\s*NEW\s*\)\.\*\s*\)", "inserted", stmt, flags=re.IGNORECASE)
+        stmt = re.sub(r"\(\s*SELECT\s+\(\s*OLD\s*\)\.\*\s*\)", "deleted", stmt, flags=re.IGNORECASE)
+        stmt = re.sub(r"\bRETURN\s+(?:NEW|OLD)\b", "RETURN", stmt, flags=re.IGNORECASE)
+        stmt = _translate_trigger_operation_guards(stmt, trigger.events or [])
+        # PostgreSQL LIMIT in scalar subqueries becomes T-SQL TOP.
+        stmt = re.sub(r"\(SELECT\s+(.+?)\s+LIMIT\s+1\)", r"(SELECT TOP (1) \1)", stmt,
+                      flags=re.IGNORECASE | re.DOTALL)
         # INSERT ... VALUES (inserted.x, ...) -> INSERT ... SELECT x, ... FROM inserted
+        stmt = re.sub(r"\bNEW\.", "inserted.", stmt, flags=re.IGNORECASE)
+        stmt = re.sub(r"\bOLD\.", "deleted.", stmt, flags=re.IGNORECASE)
         m = re.match(
             r"^(INSERT\s+INTO\s+[^(\s]+\s*\([^)]*\))\s+VALUES\s*\((.*)\)\s*$",
             stmt, re.IGNORECASE | re.DOTALL,
@@ -407,7 +428,16 @@ def _plpgsql_trigger_to_tsql(trigger: Trigger) -> tuple[str | None, list[str]]:
             expr_list = ", ".join(re.sub(r"\b(inserted|deleted)\.", "", e, flags=re.IGNORECASE) for e in _split_top(m.group(2)))
             src = "inserted" if "inserted." in m.group(2) else "deleted"
             stmt = f"{m.group(1)} SELECT {expr_list} FROM {src}"
-        lines.append("    " + stmt + ";")
+        else:
+            # inserted/deleted are pseudo-tables, not row variables. Scalar
+            # NEW.x/OLD.x references therefore need a subquery in T-SQL.
+            stmt = re.sub(
+                r"\b(inserted|deleted)\.([A-Za-z_][A-Za-z0-9_]*)",
+                lambda sm: f"(SELECT [{sm.group(2)}] FROM {sm.group(1).lower()})",
+                stmt, flags=re.IGNORECASE,
+            )
+        suffix = "" if stmt.upper() in ("BEGIN", "END", "ELSE", "RETURN") or stmt.upper().startswith(("IF ", "ELSE IF ", "WHILE ")) else ";"
+        lines.append("    " + stmt + suffix)
 
     events_tsql = ", ".join(e for e in (trigger.events or ["INSERT"]) if e)
     timing = "INSTEAD OF" if trigger.timing == "INSTEAD OF" else "AFTER"
@@ -418,3 +448,23 @@ def _plpgsql_trigger_to_tsql(trigger: Trigger) -> tuple[str | None, list[str]]:
         f"AS\nBEGIN\n" + "\n".join(lines) + "\nEND"
     )
     return create, warnings
+
+
+def _translate_trigger_operation_guards(text: str, events: list[str]) -> str:
+    """Map PostgreSQL TG_OP predicates to inserted/deleted presence checks."""
+    replacements = {
+        "INSERT": "EXISTS (SELECT 1 FROM inserted) AND NOT EXISTS (SELECT 1 FROM deleted)",
+        "UPDATE": "EXISTS (SELECT 1 FROM inserted) AND EXISTS (SELECT 1 FROM deleted)",
+        "DELETE": "EXISTS (SELECT 1 FROM deleted) AND NOT EXISTS (SELECT 1 FROM inserted)",
+    }
+    for op, predicate in replacements.items():
+        text = re.sub(rf"TG_OP\s*=\s*'{op}'", predicate, text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"TG_OP\s+IN\s*\(\s*'INSERT'\s*,\s*'UPDATE'\s*\)",
+        "EXISTS (SELECT 1 FROM inserted)", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"TG_OP\s+IN\s*\(\s*'DELETE'\s*,\s*'UPDATE'\s*\)",
+        "EXISTS (SELECT 1 FROM deleted)", text, flags=re.IGNORECASE,
+    )
+    return text

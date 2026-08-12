@@ -84,6 +84,31 @@ class EngineDDLTests(TestCase):
 
 
 class EngineServiceTests(TestCase):
+    def test_postgres_unbounded_routine_types_map_without_warnings(self):
+        pg_fn = """CREATE FUNCTION dbo.f(searchterm character varying, amount numeric)
+RETURNS numeric LANGUAGE plpgsql AS $$ BEGIN RETURN amount; END; $$"""
+        converted, warnings = translate_routine(pg_fn, source="function", target="tsql")
+        self.assertEqual(warnings, [])
+        self.assertIn("@searchterm NVARCHAR(MAX)", converted)
+        self.assertIn("@amount NUMERIC", converted)
+        self.assertIn("RETURNS NUMERIC", converted)
+
+    def test_postgres_parameter_precision_and_local_types_are_preserved(self):
+        pg_fn = """CREATE FUNCTION dbo.f(amount numeric(12,2))
+RETURNS numeric LANGUAGE plpgsql AS $$
+DECLARE
+label character varying := 'ok';
+BEGIN
+IF amount > 0 THEN
+RETURN amount;
+END IF;
+END; $$"""
+        converted, warnings = translate_routine(pg_fn, source="function", target="tsql")
+        self.assertTrue(converted, warnings)
+        self.assertIn("@amount NUMERIC(12,2)", converted)
+        self.assertIn("DECLARE @label NVARCHAR(MAX) = 'ok';", converted)
+        self.assertNotIn("END IF", converted)
+
     def test_dml_routed_through_facade(self):
         result = convert_sql(
             "SELECT TOP 5 EmployeeID FROM Employees ORDER BY EmployeeID;",
@@ -138,6 +163,25 @@ $function$
 
 
 class TriggerTranslationTests(TestCase):
+    def test_plpgsql_trigger_converts_control_flow_booleans_and_row_refs(self):
+        trig = Trigger(
+            name="trg_product", table="dbo.Product", timing="AFTER", events=["UPDATE"],
+            definition="""CREATE TRIGGER trg_product AFTER UPDATE ON dbo.Product;
+CREATE FUNCTION dbo.trg_product_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+IF NEW.IsActive = true THEN
+UPDATE Audit SET ProductID = NEW.ProductID;
+END IF;
+RETURN NEW;
+END; $$""",
+        )
+        converted, warnings = translate_trigger(trig, "tsql")
+        self.assertTrue(converted, warnings)
+        self.assertIn("IF (SELECT [IsActive] FROM inserted) = 1", converted)
+        self.assertIn("SET ProductID = (SELECT [ProductID] FROM inserted)", converted)
+        self.assertNotIn("THEN", converted)
+        self.assertNotIn("NEW.", converted)
+
     def test_tsql_trigger_to_plpgsql_qualifies_tables(self):
         db = Database(name="sample", dialect="tsql")
         db.tables = [
