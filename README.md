@@ -1,0 +1,177 @@
+# SQL Conversion Engine
+
+Convert and migrate full databases between **SQL Server (MSSQL)** and **PostgreSQL** — in both directions.
+
+Two capabilities in one Django app:
+
+1. **SQL text conversion** — paste SQL, pick a direction, get converted SQL back instantly (DDL and DML).
+2. **Full database migration** — connect a source and a target database and migrate **everything**: tables, data, views, indexes, constraints, stored procedures, functions and triggers — with row-count verification at the end.
+
+---
+
+## Features
+
+- Bidirectional: MSSQL → PostgreSQL **and** PostgreSQL → MSSQL
+- Schema conversion: tables, primary/foreign keys, unique/check constraints, indexes (incl. filtered/partial), computed columns, identities, sequences, defaults, collations
+- Data migration: batched keyset-paginated row copy, identity preservation, sequence re-seeding
+- Object conversion: views, stored procedures, user-defined functions, triggers
+- Data type mapping with warning flags for types that have no clean equivalent (never silently converted)
+- Manual-review warnings for anything the engine can't translate safely
+- Per-object migration report with source vs target row-count verification
+- Captured migration errors on a dedicated **Errors** page (`/errors/`), filterable by object kind / job / keyword
+- Optional destructive `reset_target` mode for clean re-runs
+- Web UI + REST API
+- Conversion history / audit trail
+- Passwords stored obfuscated (Django `signing`), never in plain text
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Framework | Django 6.1 |
+| API | Django REST Framework |
+| App DB | SQLite |
+| MSSQL driver | pymssql |
+| PostgreSQL driver | psycopg2 |
+| SQL transpiler | sqlglot |
+| Python | 3.x (virtualenv at `venv/`) |
+
+---
+
+## Getting Started
+
+### 1. Create and activate a virtualenv
+
+```bash
+python3 -m venv venv
+source venv/bin/activate        # or: venv\Scripts\activate on Windows
+```
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt   # if present; otherwise pip install Django djangorestframework sqlglot pymssql psycopg2-binary
+```
+
+### 3. Apply migrations
+
+```bash
+python manage.py migrate
+```
+
+### 4. Run the server
+
+```bash
+python manage.py runserver
+```
+
+Open http://127.0.0.1:8000/
+
+### 5. Run the tests
+
+```bash
+python manage.py test
+```
+
+---
+
+## Usage
+
+### SQL text conversion
+
+Web: go to the home page `/`, paste SQL, pick a direction and statement type, click **Convert**.
+
+API:
+
+```
+POST /api/convert/
+{
+  "source_sql": "CREATE TABLE Employees (EmployeeID INT IDENTITY(1,1) PRIMARY KEY, IsActive BIT DEFAULT 1);",
+  "direction": "mssql_to_postgres",
+  "statement_type": "ddl"
+}
+```
+
+Supported directions: `mssql_to_postgres`, `postgres_to_mssql`.
+Supported statement types (text mode): `ddl`, `dml`.
+
+### Full database migration
+
+1. Save your connections under **Connections** (`/connections/`) — source and target.
+2. Go to **Migrate** (`/migrate/`), pick source + target, optionally copy data and reset the target.
+3. Run and inspect the report: schema results, data results, row-count verification, warnings.
+
+API:
+
+```
+POST /api/connections/            {name, engine: "mssql"|"postgres", host, port, database, username, password}
+POST /api/connections/{id}/test/  verify a connection
+POST /api/migrations/             {source: <id>, target: <id>, copy_data: true, reset_target: false, name: "..."}
+```
+
+---
+
+## Web UI Pages
+
+| Page | Route |
+|---|---|
+| Convert SQL | `/` |
+| Conversion history | `/history/` |
+| Manage connections | `/connections/` |
+| Run migration | `/migrate/` |
+| Migration report | `/migrate/{id}/` |
+| Migration errors | `/errors/` |
+
+## API Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/convert/` | POST | Convert SQL text (saves history) |
+| `/api/jobs/` | GET | List conversion history |
+| `/api/jobs/{id}/` | GET | Conversion detail |
+| `/api/connections/` | GET / POST | List / create connections |
+| `/api/connections/{id}/` | GET / PATCH / DELETE | Connection detail / update / delete |
+| `/api/connections/{id}/test/` | POST | Test a connection |
+| `/api/migrations/` | POST | Run a migration |
+| `/api/migrations/{id}/` | GET | Migration report |
+
+---
+
+## Project Structure
+
+```
+config/            Django project (settings, URLs)
+engine/            Conversion + migration engine (dialect-neutral)
+├── schema.py          Normalized database model
+├── service.py         Text-conversion facade
+├── connectors/        Live MSSQL / PostgreSQL connections
+├── extractors/        Introspect a DB into the normalized model
+├── translators/       Target-dialect DDL generation + SQL translation
+├── mappers/           Data type mapping tables
+└── migration/         End-to-end migration pipeline + data mover
+apps/converter/    Django app (models, API, web UI)
+```
+
+The conversion pipeline is:
+
+```
+extract schema -> convert to target DDL -> apply structural DDL -> copy data
+  -> apply FKs/checks/views/procs/triggers -> verify row counts -> report
+```
+
+---
+
+## Documentation
+
+- `PROJECT_CONTEXT.md` — detailed, module-by-module breakdown of the entire codebase (architecture, responsibilities, data flow).
+
+---
+
+## Known Limitations
+
+- Text conversion mode supports `ddl`/`dml` only; stored procedure and trigger statement types are available through the **migration engine**, not yet through the paste-SQL converter.
+- Types with no clean equivalent (e.g. `GEOGRAPHY`, `SQL_VARIANT`, `HIERARCHYID`, PG `ARRAY`/`HSTORE`/range types) are flagged for manual review rather than converted.
+- Trigger translation is best-effort — statement-level vs row-level semantics are surfaced as warnings.
+- Migrations run synchronously; very large databases will block the request until complete.
