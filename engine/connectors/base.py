@@ -17,6 +17,28 @@ class ConnectorError(Exception):
     """Raised when a database cannot be reached, queried, or modified."""
 
 
+def to_int(value) -> int | None:
+    """Coerce a DB-API value to int.
+
+    Tolerates bigint values that some TDS drivers return as raw little-endian
+    byte payloads (e.g. b'\\x01\\x00...' == 1) instead of Python ints, plus
+    strings and Decimals from other drivers.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        stripped = value.strip()
+        try:
+            return int(stripped.decode("ascii"))
+        except (UnicodeDecodeError, ValueError):
+            return int.from_bytes(stripped, "little", signed=True)
+    return int(value)
+
+
 class DatabaseConnector(ABC):
     """Uniform interface over a source or target database."""
 
@@ -99,12 +121,14 @@ class DatabaseConnector(ABC):
     # -- data migration -----------------------------------------------------
 
     @abstractmethod
-    def iter_table_rows(self, table_name: str, columns: list[str], order_columns: list[str], batch_size: int) -> Iterator[list[tuple]]:
+    def iter_table_rows(self, table_name: str, columns: list[str], order_columns: list[str], batch_size: int, int_columns: list[str] | None = None) -> Iterator[list[tuple]]:
         """Yield batches of rows from `table_name` for the given columns.
 
         Ordering by the PK is what makes batched SELECT ... WHERE pk > last
         pagination possible; callers fall back to OFFSET when no order columns
-        exist.
+        exist. `int_columns` names any integer columns whose values some TDS
+        drivers return as raw bytes instead of Python ints, so they can be
+        normalized before pagination and downstream inserts.
         """
 
     @abstractmethod

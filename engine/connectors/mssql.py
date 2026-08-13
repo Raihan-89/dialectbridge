@@ -7,7 +7,7 @@ from typing import Iterator
 
 import pymssql
 
-from engine.connectors.base import ConnectorError, DatabaseConnector
+from engine.connectors.base import ConnectorError, DatabaseConnector, to_int
 from engine.extractors.mssql import extract_schema
 
 
@@ -78,13 +78,21 @@ class MSSQLConnector(DatabaseConnector):
     def _extract_schema(self):
         return extract_schema(self)
 
-    def iter_table_rows(self, table_name, columns, order_columns, batch_size=5000):
+    def iter_table_rows(self, table_name, columns, order_columns, batch_size=5000, int_columns=None):
         qident = ", ".join(f"[{c}]" for c in columns)
         order_clause = ""
         if order_columns:
             order_clause = " ORDER BY " + ", ".join(f"[{c}]" for c in order_columns)
         tbl = self.quote_ident(table_name)
+        int_columns = {c.lower() for c in (int_columns or [])}
         last_key: tuple | None = None
+
+        def _norm(value, col_name):
+            # Some TDS drivers hand back bigint values as raw little-endian
+            # bytes; normalize only the columns we know are integers.
+            if isinstance(value, bytes) and col_name.lower() in int_columns:
+                return to_int(value)
+            return value
 
         while True:
             if order_columns and last_key is not None:
@@ -105,20 +113,22 @@ class MSSQLConnector(DatabaseConnector):
                 rows = self.fetch(sql)
                 if not rows:
                     break
-                yield rows
+                yield [[_norm(v, c) for v, c in zip(row, columns)] for row in rows]
                 # no ordering column — can't paginate; stop after first batch
                 break
 
             if not rows:
                 break
-            yield rows
+            yield [[_norm(v, c) for v, c in zip(row, columns)] for row in rows]
             if len(rows) < batch_size:
                 break
-            last_key = tuple(rows[-1][i] for i in range(len(order_columns)))
+            last_key = tuple(
+                _norm(rows[-1][i], order_columns[i]) for i in range(len(order_columns))
+            )
 
     def count_rows(self, table_name: str) -> int:
         row = self.fetchone(f"SELECT COUNT_BIG(*) FROM {self.quote_ident(table_name)}")
-        return int(row[0]) if row else 0
+        return to_int(row[0]) if row else 0
 
     def set_identity_insert(self, table_name: str, on: bool) -> None:
         # Only the column-list form avoids needing the table owner in scope.
@@ -126,7 +136,7 @@ class MSSQLConnector(DatabaseConnector):
 
     def max_value(self, table_name: str, column: str) -> int | None:
         row = self.fetchone(f"SELECT MAX([{column}]) FROM {self.quote_ident(table_name)}")
-        return int(row[0]) if row and row[0] is not None else None
+        return to_int(row[0]) if row and row[0] is not None else None
 
     def seed_identity(self, table_name: str, column: str) -> None:
         # Advance the identity counter past the highest loaded value.

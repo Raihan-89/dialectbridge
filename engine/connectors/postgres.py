@@ -8,7 +8,7 @@ from typing import Iterator
 import psycopg2
 import psycopg2.extras
 
-from engine.connectors.base import ConnectorError, DatabaseConnector
+from engine.connectors.base import ConnectorError, DatabaseConnector, to_int
 from engine.extractors.postgres import extract_schema
 
 
@@ -77,7 +77,7 @@ class PostgresConnector(DatabaseConnector):
     def _extract_schema(self):
         return extract_schema(self)
 
-    def iter_table_rows(self, table_name, columns, order_columns, batch_size=5000):
+    def iter_table_rows(self, table_name, columns, order_columns, batch_size=5000, int_columns=None):
         qident = ", ".join(f'"{c}"' for c in columns)
         order_clause = ""
         if order_columns:
@@ -114,7 +114,7 @@ class PostgresConnector(DatabaseConnector):
 
     def count_rows(self, table_name: str) -> int:
         row = self.fetchone(f"SELECT COUNT(*) FROM {self.quote_ident(table_name)}")
-        return int(row[0]) if row else 0
+        return to_int(row[0]) if row else 0
 
     def set_identity_insert(self, table_name: str, on: bool) -> None:
         # No explicit toggle needed: our converted identity columns are
@@ -123,7 +123,7 @@ class PostgresConnector(DatabaseConnector):
 
     def max_value(self, table_name: str, column: str) -> int | None:
         row = self.fetchone(f'SELECT MAX("{column}") FROM {self.quote_ident(table_name)}')
-        return int(row[0]) if row and row[0] is not None else None
+        return to_int(row[0]) if row and row[0] is not None else None
 
     def seed_identity(self, table_name: str, column: str) -> None:
         # pg_get_serial_sequence parses its text argument as a possibly

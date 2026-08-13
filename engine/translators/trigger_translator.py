@@ -26,10 +26,17 @@ from engine.translators.procedure_translator import (
     _split_args_balanced,
 )
 
+# Real CREATE TRIGGER definitions from OBJECT_DEFINITION vary in the clauses
+# between the table and the AS (WITH EXECUTE AS CALLER, WITH APPEND) and after
+# the event list (NOT FOR REPLICATION, WITH APPEND). The ``.*?`` (DOTALL) bridge
+# lets those clauses pass while still locating the timing keyword and events.
 _HEADER_RE = re.compile(
-    r"CREATE\s+(?:OR\s+ALTER\s+)?(?:TRIGGER\s+)?\[?([\w\d_]+)\]?\s+"
-    r"(?:ON\s+((?:\[?[\w\d_]+\]?\.)?\[?[\w\d_]+\]?))\s+"
-    r"(AFTER|INSTEAD\s+OF|FOR)\s+([A-Z,\s]+?)\s+(?:WITH\s+APPEND\s+)?AS\b",
+    r"CREATE\s+(?:OR\s+ALTER\s+)?(?:TRIGGER\s+)?"
+    r"(?:(?:\[?[\w\d_]+\]?\.)?\[?([\w\d_]+)\]?)\s+"
+    r"(?:ON\s+((?:\[?[\w\d_]+\]?\.)?\[?[\w\d_]+\]?)\s+)"
+    r"(?:.*?)"
+    r"(AFTER|INSTEAD\s+OF|FOR)\s+"
+    r"([A-Z,\s]+?)\s+AS\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -255,7 +262,16 @@ def _transform_tsql_trigger_body(body: str, warnings: list[str], table: str | No
     def statement_fn(line, declared, warns, returns_set):
         return _trigger_statement(line, declared, warns, returns_set, table=table, return_target=return_target)
 
-    out, warns, _ = _transform_tsql_body(_wrap_insdel(body), "trigger", False, statement_fn=statement_fn)
+    wrapped = _wrap_insdel(body)
+    # Compact catalog definitions can put a block opener and RAISERROR on one
+    # line (``BEGIN RAISERROR(...);``). Preserve that structural boundary.
+    wrapped = re.sub(r"\bBEGIN\s+(?=(?:RAISERROR|THROW)\b)", "BEGIN\n", wrapped,
+                     flags=re.IGNORECASE)
+    wrapped = re.sub(
+        r";\s+(?=(?:ROLLBACK|COMMIT|RETURN|END|RAISERROR|THROW)\b)", ";\n", wrapped,
+        flags=re.IGNORECASE,
+    )
+    out, warns, _ = _transform_tsql_body(wrapped, "trigger", False, statement_fn=statement_fn)
     warnings.extend(warns)
     return out
 

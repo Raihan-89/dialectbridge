@@ -19,6 +19,8 @@ from __future__ import annotations
 from engine.connectors.base import ConnectorError
 from engine.schema import Table
 
+_INT_TYPES = {"BIGINT", "INT", "SMALLINT", "TINYINT"}
+
 
 class DataMigration:
     def __init__(self, source, target, table: Table, batch_size: int = 5000):
@@ -45,7 +47,8 @@ class DataMigration:
 
         try:
             for batch in self.source.iter_table_rows(
-                self.table.name, cols, order_cols, batch_size=self.batch_size
+                self.table.name, cols, order_cols, batch_size=self.batch_size,
+                int_columns=self._int_columns(),
             ):
                 if not batch:
                     continue
@@ -62,6 +65,12 @@ class DataMigration:
     # ------------------------------------------------------------------
     def _column_names(self) -> list[str]:
         return [c.name for c in self.table.columns if not c.is_computed]
+
+    def _int_columns(self) -> list[str]:
+        return [
+            c.name for c in self.table.columns
+            if not c.is_computed and c.data_type.split("(")[0].strip().upper() in _INT_TYPES
+        ]
 
     def _order_columns(self) -> list[str]:
         if self.table.primary_key:

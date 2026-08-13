@@ -20,9 +20,14 @@ import re
 
 from engine.mappers.type_mappings import (
     MSSQL_TO_POSTGRES_TYPE_OVERRIDES,
+    MSSQL_TO_PG_COLLATIONS,
+    PG_TO_MSSQL_COLLATIONS,
     POSTGRES_TO_MSSQL_TYPE_OVERRIDES,
 )
-from engine.schema import Column, Constraint, Database, ForeignKey, Index, Routine, Table, Trigger
+from engine.schema import (
+    Column, Constraint, Database, ForeignKey, Index, Permission, Principal, Routine,
+    Sequence, Synonym, Table, Trigger, UserType, View,
+)
 
 _PG_MAX_IDENT = 63
 
@@ -105,7 +110,8 @@ def convert_type(data_type: str, source_dialect: str, target_dialect: str) -> tu
             elif base_upper in ("VARCHAR", "CHAR", "NVARCHAR", "NCHAR"):
                 # PostgreSQL has no N-prefixed types — VARCHAR/CHAR hold unicode.
                 # VARCHAR(MAX)/NVARCHAR(MAX) become TEXT (no length limit in PG).
-                mapped = "TEXT" if is_max else f"{base_upper[1:]}({params})" if params else "TEXT"
+                plain = base_upper[1:] if base_upper.startswith("N") else base_upper
+                mapped = "TEXT" if is_max else f"{plain}({params})" if params else "TEXT"
             else:
                 return None, f"Type '{base_upper}' has no PostgreSQL equivalent — manual review required"
         if base_upper in ("GEOGRAPHY", "GEOMETRY", "HIERARCHYID", "SQL_VARIANT", "ROWVERSION"):
@@ -140,8 +146,20 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
     warnings: list[str] = []
     source = database.dialect
 
+    # User-defined types and standalone sequences must exist before any table
+    # references them.
+    for ut in database.types:
+        stmts, tw = build_type_ddl(ut, target_dialect, source)
+        statements.extend(stmts)
+        warnings.extend(tw)
+
+    for seq in database.sequences:
+        stmts, tw = build_sequence_ddl(seq, target_dialect, source)
+        statements.extend(stmts)
+        warnings.extend(tw)
+
     for table in database.all_tables_in_dependency_order():
-        stmts, tw = build_table_ddl(table, target_dialect, source)
+        stmts, tw = build_table_ddl(table, target_dialect, source, database)
         statements.extend(stmts)
         warnings.extend(tw)
 
@@ -181,17 +199,28 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
         statements.extend(stmts)
         warnings.extend(tw)
 
+    # Synonyms wrap tables/views and must come after they exist.
+    for syn in database.synonyms:
+        stmts, tw = build_synonym_ddl(syn, target_dialect)
+        statements.extend(stmts)
+        warnings.extend(tw)
+
+    stmts, tw = build_security_ddl(database, target_dialect)
+    statements.extend(stmts)
+    warnings.extend(tw)
+
     table_names = [t.name for t in database.tables]
     statements = [_qualify_body_refs(s, database.tables, target_dialect) for s in statements]
 
     return statements, warnings
 
 
-def build_table_ddl(table: Table, target_dialect: str, source_dialect: str) -> tuple[list[str], list[str]]:
+def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
+                    database: Database | None = None) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
     col_lines = []
     for col in table.columns:
-        line, warn = _build_column(col, target_dialect, source_dialect)
+        line, warn = _build_column(col, target_dialect, source_dialect, database)
         if line is None:
             warnings.append(f"Table '{table.name}' column '{col.name}': {warn}")
             continue
@@ -205,16 +234,43 @@ def build_table_ddl(table: Table, target_dialect: str, source_dialect: str) -> t
     pk_line = ""
     if table.primary_key:
         pk_line = f",\n  CONSTRAINT {_qident(table.primary_key.name, target_dialect)} PRIMARY KEY ({_qcols(table.primary_key.columns, target_dialect)})"
+        if table.is_partitioned and target_dialect == "postgres" and table.partition_key:
+            key = _split_type(table.partition_key)[0].strip('"[]')
+            if key.lower() not in {c.lower() for c in table.primary_key.columns}:
+                warnings.append(
+                    f"Partitioned table '{table.name}': PostgreSQL requires the partition key "
+                    f"'{table.partition_key}' to be part of the primary key — the DDL below will "
+                    f"fail until the key is added"
+                )
 
     create = (
         f"CREATE TABLE {_qident(table.name, target_dialect)} (\n"
         f"  {',\n  '.join(col_lines)}{pk_line}\n)"
     )
-    return [create], warnings
+
+    statements = [create]
+
+    if table.is_partitioned:
+        if target_dialect == "postgres" and table.partition_key and table.partition_type in ("range", "list"):
+            create += f"\nPARTITION BY {table.partition_type.upper()} ({_translate_expr(table.partition_key, source_dialect, target_dialect)})"
+            statements[0] = create
+            for child in table.partition_children:
+                statements.append(
+                    f"CREATE TABLE {_qident(child.name, target_dialect)} PARTITION OF "
+                    f"{_qident(table.name, target_dialect)} FOR VALUES {child.bounds}"
+                )
+        else:
+            warnings.append(
+                f"Table '{table.name}' is partitioned but the target dialect cannot recreate its "
+                f"partitioning — the table was created as a regular table"
+            )
+
+    return statements, warnings
 
 
-def _build_column(col: Column, target: str, source: str) -> tuple[str | None, str | None]:
-    target_type, warn = convert_type(col.data_type, source, target)
+def _build_column(col: Column, target: str, source: str,
+                  database: Database | None = None) -> tuple[str | None, str | None]:
+    target_type, warn = _resolve_column_type(col.data_type, source, target, database)
     if target_type is None:
         return None, warn
 
@@ -254,7 +310,68 @@ def _build_column(col: Column, target: str, source: str) -> tuple[str | None, st
         if not col.nullable:
             parts[0] += " NOT NULL"
 
+    collation_warn = _append_collation(parts, col.collation, target_type, target, database)
+    if collation_warn:
+        warn = collation_warn if warn is None else f"{warn}; {collation_warn}"
+
     return parts[0], warn
+
+
+def _resolve_column_type(data_type: str, source: str, target: str,
+                         database: Database | None) -> tuple[str | None, str | None]:
+    """Map a column type, resolving user-defined types against the schema model."""
+    base, params = _split_type(data_type)
+    ut = database.type_by_name(base) if database else None
+
+    if ut is not None and source == "tsql" and target == "postgres" and ut.kind == "alias":
+        # The alias becomes a DOMAIN in PostgreSQL; the column references it.
+        return _qident(ut.name, "postgres"), None
+
+    if ut is not None and source == "postgres" and target == "tsql":
+        if ut.kind == "domain":
+            # The domain is recreated as a SQL Server alias type; the column
+            # references it by name so the domain is actually used.
+            return _qident(ut.name, "tsql"), None
+        if ut.kind == "enum":
+            return "NVARCHAR(MAX)", (
+                f"PostgreSQL enum type '{ut.name}' has no SQL Server equivalent — "
+                f"column mapped to NVARCHAR(MAX)"
+            )
+        if ut.kind == "composite":
+            return "NVARCHAR(MAX)", (
+                f"PostgreSQL composite type '{ut.name}' has no SQL Server equivalent — "
+                f"column mapped to NVARCHAR(MAX)"
+            )
+
+    return convert_type(data_type, source, target)
+
+
+def _append_collation(parts: list[str], collation: str | None, target_type: str,
+                      target: str, database: Database | None) -> str | None:
+    """Append a COLLATE clause for character columns where a mapping is known."""
+    if not collation or not _is_character_type(target_type):
+        return None
+    if database and database.collation and collation.lower() == database.collation.lower():
+        # Column uses the source database's default collation, which the target
+        # database will apply anyway — no need to pin it per column.
+        return None
+    key = collation.strip().lower()
+    if target == "postgres":
+        mapped = MSSQL_TO_PG_COLLATIONS.get(key)
+        if not mapped:
+            return f"Collation '{collation}' has no PostgreSQL equivalent — column created with the database collation"
+        parts[0] += f' COLLATE "{mapped}"'
+        return None
+    mapped = PG_TO_MSSQL_COLLATIONS.get(key)
+    if not mapped:
+        return f"Collation '{collation}' has no SQL Server equivalent — column created with the database collation"
+    parts[0] += f" COLLATE {mapped}"
+    return None
+
+
+def _is_character_type(target_type: str) -> bool:
+    upper = target_type.upper()
+    return any(token in upper for token in ("VARCHAR", "CHAR", "TEXT", "SYSNAME"))
 
 
 def build_unique_constraint_ddl(table: Table, uc: Constraint, target: str) -> tuple[list[str], list[str]]:
@@ -266,8 +383,26 @@ def build_unique_constraint_ddl(table: Table, uc: Constraint, target: str) -> tu
 
 
 def build_index_ddl(table: Table, index: Index, target: str, source: str) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    if index.index_type:
+        warnings.append(
+            f"Index '{index.name}' on '{table.name}' is a {index.index_type} index with no "
+            f"{'PostgreSQL' if target == 'postgres' else 'SQL Server'} equivalent and was not migrated"
+        )
+        return [], warnings
     unique = "UNIQUE " if index.unique else ""
-    stmt = f"CREATE {unique}INDEX {_qident(index.name, target)} ON {_qident(table.name, target)} ({_qcols(index.columns, target)})"
+    clustered = ""
+    if index.is_clustered:
+        if target == "tsql":
+            clustered = "CLUSTERED "
+        else:
+            warnings.append(
+                f"Clustered index '{index.name}' on '{table.name}': PostgreSQL does not enforce "
+                f"clustered storage — the index was created as a regular index"
+            )
+    stmt = f"CREATE {unique}{clustered}INDEX {_qident(index.name, target)} ON {_qident(table.name, target)} ({_qcols(index.columns, target)})"
+    if index.included_columns:
+        stmt += f" INCLUDE ({_qcols(index.included_columns, target)})"
     if index.where and target == "tsql":
         where = _translate_expr(index.where, source, target)
         stmt += f" WHERE {where}"
@@ -276,7 +411,7 @@ def build_index_ddl(table: Table, index: Index, target: str, source: str) -> tup
         where = _translate_expr(index.where, source, target)
         where = fix_boolean_predicates(where, [table], source)
         stmt += f" WHERE {where}"
-    return [stmt], []
+    return [stmt], warnings
 
 
 def build_foreign_key_ddl(table: Table, fk: ForeignKey, target: str) -> tuple[list[str], list[str]]:
@@ -306,6 +441,7 @@ def build_check_ddl(table: Table, check, target: str) -> str:
 
 
 def build_view_ddl(view: View, target: str, source: str, tables: list | None = None) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
     definition = (view.definition or "").strip()
     m = re.search(r"\bAS\s+(SELECT\b.*)$", definition, re.IGNORECASE | re.DOTALL)
     if m:
@@ -313,8 +449,59 @@ def build_view_ddl(view: View, target: str, source: str, tables: list | None = N
     definition = _translate_expr(definition, source, target)
     if source == "tsql" and target == "postgres":
         definition = fix_boolean_predicates(definition, tables or [], "tsql")
+
+    name = _qident(view.name, target)
+
+    if view.is_materialized:
+        if target == "postgres":
+            stmts = [f"CREATE MATERIALIZED VIEW {name} AS {definition}"]
+            for idx in view.indexes:
+                if idx.index_type:
+                    warnings.append(
+                        f"Index '{idx.name}' on materialized view '{view.name}' is a {idx.index_type} "
+                        f"index with no PostgreSQL equivalent and was not migrated"
+                    )
+                    continue
+                uniq = "UNIQUE " if idx.unique else ""
+                stmt = f"CREATE {uniq}INDEX {_qident(idx.name, target)} ON {name} ({_qcols(idx.columns, target)})"
+                if idx.included_columns:
+                    stmt += f" INCLUDE ({_qcols(idx.included_columns, target)})"
+                stmts.append(stmt)
+            # The indexes must be created right after the matview, before any
+            # data copy phase could re-order them — bundle into one statement.
+            return ["\n".join(stmts)], warnings
+
+        # SQL Server indexed views need SCHEMABINDING and a unique clustered
+        # index to materialize — the closest structural equivalent.
+        stmts = [f"CREATE VIEW {name} WITH SCHEMABINDING AS {definition}"]
+        if view.indexes:
+            clustered_seen = False
+            for idx in view.indexes:
+                uniq = "UNIQUE " if idx.unique else ""
+                clustered = "CLUSTERED " if idx.is_clustered else ""
+                stmt = (
+                    f"CREATE {uniq}{clustered}INDEX {_qident(idx.name, target)} ON {name} "
+                    f"({_qcols(idx.columns, target)})"
+                )
+                if idx.included_columns:
+                    stmt += f" INCLUDE ({_qcols(idx.included_columns, target)})"
+                stmts.append(stmt)
+                clustered_seen = clustered_seen or idx.is_clustered
+            if not clustered_seen:
+                warnings.append(
+                    f"Indexed view '{view.name}' has no clustered index — SQL Server requires a "
+                    f"unique clustered index for indexed views; the view is only created with "
+                    f"SCHEMABINDING"
+                )
+        else:
+            warnings.append(
+                f"Materialized view '{view.name}' has no indexes — SQL Server indexed views "
+                f"require a unique clustered index; the view is only created with SCHEMABINDING"
+            )
+        return ["\n".join(stmts)], warnings
+
     prefix = "CREATE OR REPLACE VIEW" if target == "postgres" else "CREATE OR ALTER VIEW"
-    stmt = f"{prefix} {_qident(view.name, target)} AS {definition}"
+    stmt = f"{prefix} {name} AS {definition}"
     return [stmt], []
 
 
@@ -335,11 +522,228 @@ def build_procedure_ddl(proc: Routine, target: str, tables: list | None = None) 
 
 
 def build_trigger_ddl(trigger: Trigger, target: str) -> tuple[list[str], list[str]]:
+    if trigger.is_ddl:
+        from engine.translators.ddl_trigger_translator import translate_ddl_trigger
+        converted, warnings = translate_ddl_trigger(trigger, target)
+        if converted:
+            return [converted], warnings
+        return [], [f"DDL trigger '{trigger.name}' could not be converted: {warnings}"]
     from engine.translators.trigger_translator import translate_trigger
     converted, warnings = translate_trigger(trigger, target)
     if converted:
         return [converted], warnings
     return [], [f"Trigger '{trigger.name}' could not be converted: {warnings}"]
+
+
+def build_type_ddl(ut: UserType, target: str, source: str) -> tuple[list[str], list[str]]:
+    """Convert a user-defined type into target-dialect DDL.
+
+    MSSQL alias types become PostgreSQL DOMAINs; PostgreSQL DOMAINs become
+    MSSQL alias types. Enums/composites/table-types/CLR types have no
+    equivalent in the other engine and are surfaced as warnings (the
+    extractors already flag them, so this is a defensive no-op for them).
+    """
+    if source == "tsql" and target == "postgres":
+        if ut.kind != "alias":
+            return [], []
+        base, warn = convert_type(ut.base_type or "", "tsql", "postgres")
+        if base is None:
+            return [], [f"User-defined type '{ut.name}' (alias for '{ut.base_type}') could not be mapped: {warn}"]
+        stmt = f"CREATE DOMAIN {_qident(ut.name, target)} AS {base}"
+        if ut.default:
+            stmt += f" DEFAULT {_translate_default(ut.default, target)}"
+        if not ut.nullable:
+            stmt += " NOT NULL"
+        warnings = []
+        if warn:
+            warnings.append(f"User-defined type '{ut.name}': {warn}")
+        return [stmt], warnings
+
+    if source == "postgres" and target == "tsql":
+        if ut.kind == "domain":
+            base, warn = convert_type(ut.base_type or "", "postgres", "tsql")
+            if base is None:
+                return [], [f"Domain '{ut.name}' base type '{ut.base_type}' could not be mapped: {warn}"]
+            stmt = f"CREATE TYPE {_qident(ut.name, target)} FROM {base}"
+            if not ut.nullable:
+                stmt += " NOT NULL"
+            if ut.default:
+                stmt += f" DEFAULT {_translate_default(ut.default, target)}"
+            warnings = []
+            if warn:
+                warnings.append(f"Domain '{ut.name}': {warn}")
+            if ut.constraints:
+                warnings.append(
+                    f"Domain '{ut.name}' has {len(ut.constraints)} CHECK constraint(s) that SQL "
+                    f"Server alias types cannot express — the constraints were not migrated"
+                )
+            return [stmt], warnings
+        if ut.kind == "enum":
+            return [], [f"PostgreSQL enum type '{ut.name}' has no SQL Server equivalent and was not migrated"]
+        if ut.kind == "composite":
+            return [], [f"PostgreSQL composite type '{ut.name}' has no SQL Server equivalent and was not migrated"]
+    return [], []
+
+
+def build_sequence_ddl(seq: Sequence, target: str, source: str) -> tuple[list[str], list[str]]:
+    warnings: list[str] = []
+    type_clause = ""
+    if seq.data_type:
+        mapped, warn = convert_type(seq.data_type, source, target)
+        if mapped and warn is None:
+            type_clause = f" AS {mapped}"
+        elif mapped:
+            # keep the mapped type but surface the review warning
+            type_clause = f" AS {mapped}"
+            warnings.append(f"Sequence '{seq.name}': {warn}")
+        else:
+            warnings.append(f"Sequence '{seq.name}': {warn}")
+    stmt = (
+        f"CREATE SEQUENCE {_qident(seq.name, target)}"
+        f"{type_clause} START WITH {seq.start_value} INCREMENT BY {seq.increment}"
+    )
+    if seq.is_cycling:
+        stmt += " CYCLE"
+    statements = [stmt]
+    if seq.current_value is not None and seq.current_value != seq.start_value:
+        if target == "postgres":
+            statements.append(
+                f"SELECT setval({_qstr(seq.name)}, {seq.current_value}, true)"
+            )
+        else:
+            statements.append(
+                f"ALTER SEQUENCE {_qident(seq.name, target)} RESTART WITH {seq.current_value}"
+            )
+    return statements, warnings
+
+
+def build_synonym_ddl(syn: Synonym, target: str) -> tuple[list[str], list[str]]:
+    """PostgreSQL has no synonyms; a table/view synonym is recreated as a view
+    wrapper that SELECTs from the target. Procedure/function synonyms cannot be
+    recreated and are surfaced as warnings. The reverse direction produces no
+    synonyms (PostgreSQL has none to extract)."""
+    if target != "postgres":
+        return [], []
+    if syn.target_kind not in ("table", "view"):
+        return [], [
+            f"Synonym '{syn.name}' targets a {syn.target_kind} — PostgreSQL has no synonym "
+            f"support for it; create an equivalent wrapper manually"
+        ]
+    stmt = (
+        f"CREATE VIEW {_qident(syn.name, 'postgres')} AS "
+        f"SELECT * FROM {_qident(_normalize_object_ref(syn.target_object), 'postgres')}"
+    )
+    return [stmt], []
+
+
+def _normalize_object_ref(name: str) -> str:
+    """Normalize an object reference read from SQL Server catalog text.
+
+    ``sys.synonyms.base_object_name`` returns the target exactly as it was
+    authored, so it may carry bracket delimiters (``[dbo].[Inventory]``) and an
+    optional server/database prefix (``[srv].[db].[dbo].[Inventory]``). Strip
+    the delimiters and drop the leading server/database parts so the remaining
+    ``schema.object`` can be quoted correctly for PostgreSQL."""
+    parts = [p.strip().strip("[]").strip() for p in (name or "").split(".")]
+    parts = [p for p in parts if p]
+    while len(parts) > 2:
+        parts.pop(0)
+    return ".".join(parts)
+
+
+def build_security_ddl(database: Database, target: str) -> tuple[list[str], list[str]]:
+    """Recreate principals (users/roles), role memberships and GRANTs."""
+    statements: list[str] = []
+    warnings: list[str] = []
+    principals = database.roles + database.users
+
+    # 'public' exists implicitly in both engines and its name is reserved in
+    # PostgreSQL; a leftover from manual schema construction must not emit a
+    # failing CREATE ROLE.
+    if target == "postgres":
+        principals = [p for p in principals if p.name.lower() != "public"]
+        for skipped in [p for p in database.roles + database.users if p.name.lower() == "public"]:
+            warnings.append(
+                f"Principal '{skipped.name}' is reserved in PostgreSQL and was not recreated"
+            )
+
+    if target == "postgres":
+        for role in [p for p in principals if p.kind == "role"]:
+            statements.append(
+                f"DO $$ BEGIN CREATE ROLE {_qident(role.name, 'postgres')}; "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+            )
+        for user in [p for p in principals if p.kind == "user"]:
+            statements.append(
+                f"DO $$ BEGIN CREATE ROLE {_qident(user.name, 'postgres')} LOGIN; "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+            )
+    else:
+        for role in database.roles:
+            statements.append(f"CREATE ROLE {_qident(role.name, 'tsql')}")
+        for user in database.users:
+            statements.append(f"CREATE USER {_qident(user.name, 'tsql')} WITHOUT LOGIN")
+
+    for principal in principals:
+        for parent in principal.member_of:
+            if target == "postgres":
+                statements.append(
+                    f"GRANT {_qident(parent, 'postgres')} TO {_qident(principal.name, 'postgres')}"
+                )
+            else:
+                statements.append(
+                    f"ALTER ROLE {_qident(parent, 'tsql')} ADD MEMBER {_qident(principal.name, 'tsql')}"
+                )
+
+    for perm in database.permissions:
+        stmt = _build_grant(perm, target)
+        if stmt:
+            statements.append(stmt)
+        else:
+            warnings.append(
+                f"{perm.grant_type} permission '{perm.action}' on '{perm.object_name}' for "
+                f"'{perm.principal}' cannot be ported to {'PostgreSQL' if target == 'postgres' else 'SQL Server'} and was not migrated"
+            )
+    return statements, warnings
+
+
+def _build_grant(perm: Permission, target: str) -> str | None:
+    if perm.grant_type != "GRANT":
+        return None
+    principal = _qident(perm.principal, target)
+    with_grant = " WITH GRANT OPTION" if perm.with_grant else ""
+
+    if perm.securable == "schema":
+        if target == "postgres":
+            return f"GRANT USAGE ON SCHEMA {_qident(perm.object_name, target)} TO {principal}{with_grant}"
+        return f"GRANT {perm.action} ON SCHEMA::{_qident(perm.object_name, target)} TO {principal}{with_grant}"
+
+    if perm.securable in ("table", "view", "procedure", "function"):
+        if target == "postgres":
+            object_ref = _qident(perm.object_name, target)
+            if perm.securable in ("procedure", "function"):
+                # PostgreSQL identifies routines by name plus argument types,
+                # while SQL Server grants are name-based. Resolve all emitted
+                # overloads at apply time. If conversion skipped a routine,
+                # this safely grants nothing instead of raising another error.
+                parts = perm.object_name.split(".", 1)
+                schema = parts[0] if len(parts) == 2 else "public"
+                routine = parts[-1]
+                grant_option = " WITH GRANT OPTION" if perm.with_grant else ""
+                return (
+                    "DO $$ DECLARE r record; BEGIN FOR r IN "
+                    "SELECT p.oid::regprocedure::text AS signature FROM pg_proc p "
+                    "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    f"WHERE n.nspname = {_sql_string(schema)} "
+                    f"AND p.proname = {_sql_string(routine)} LOOP "
+                    f"EXECUTE format('GRANT EXECUTE ON ROUTINE %s TO %I{grant_option}', "
+                    f"r.signature, {_sql_string(perm.principal)}); END LOOP; END $$"
+                )
+        else:
+            object_ref = f"OBJECT::{_qident(perm.object_name, target)}"
+        return f"GRANT {perm.action} ON {object_ref} TO {principal}{with_grant}"
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -351,11 +755,29 @@ def _translate_default(expr: str | None, target: str) -> str | None:
         return None
     expr = expr.strip()
     if target == "postgres":
-        expr = re.sub(r"\bGETDATE\(\)", "CURRENT_TIMESTAMP", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bNEWID\(\)", "gen_random_uuid()", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bNEWSEQUENTIALID\(\)", "gen_random_uuid()", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bSYSUTCDATETIME\(\)", "CURRENT_TIMESTAMP", expr, flags=re.IGNORECASE)
-        expr = re.sub(r"\bSYSDATETIME\(\)", "CURRENT_TIMESTAMP", expr, flags=re.IGNORECASE)
+        # Defaults come straight from OBJECT_DEFINITION and can contain any
+        # T-SQL expression (CONVERT([nvarchar], GETDATE(), 100), '+'
+        # concatenation, ...). Run the full expression translator instead of a
+        # few regexes so nothing invalid survives into the emitted DDL.
+        from engine.translators.functions import translate_functions
+        expr = translate_functions(expr, "tsql", "postgres")
+        expr = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', expr)
+        expr = re.sub(r'"\[([\w\s\d_]+)\]"', r'"\1"', expr)
+        expr = re.sub(r"\bN'", "'", expr, flags=re.IGNORECASE)
+        expr = _translate_top(expr)
+        expr = re.sub(
+            r"\bNEXT\s+VALUE\s+FOR\s+((?:\"[^\"]+\"|[\w]+)(?:\.(?:\"[^\"]+\"|[\w]+))?)",
+            lambda m: f"nextval({_qstr(m.group(1).replace(chr(34), ''))}::regclass)",
+            expr,
+            flags=re.IGNORECASE,
+        )
+        # Without grouping, PostgreSQL treats AT TIME ZONE as DDL syntax
+        # following the DEFAULT rather than as part of the expression.
+        if re.search(r"\bAT\s+TIME\s+ZONE\b", expr, re.IGNORECASE):
+            expr = f"({expr})"
+        if "'" in expr:
+            from engine.translators.procedure_translator import _replace_concat
+            expr = _replace_concat(expr)
     else:
         expr = re.sub(r"\bCURRENT_TIMESTAMP\b", "GETDATE()", expr, flags=re.IGNORECASE)
         expr = re.sub(r"\bgen_random_uuid\(\)", "NEWID()", expr, flags=re.IGNORECASE)
@@ -375,6 +797,9 @@ def _translate_expr(expr: str, source: str, target: str) -> str:
     if target == "postgres":
         # MSSQL bracket identifiers -> PG quoted identifiers
         out = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', out)
+        # Heal identifiers whose content was already bracketed (e.g. from
+        # catalog text quoted once more) so no '[' survives into PG DDL.
+        out = re.sub(r'"\[([\w\s\d_]+)\]"', r'"\1"', out)
         # MSSQL N-prefixed string literals have no PG equivalent
         out = re.sub(r"\bN'", "'", out, flags=re.IGNORECASE)
         out = _translate_top(out)
@@ -515,6 +940,17 @@ def _qident(name: str, target: str) -> str:
 
 def _qcols(cols: list[str], target: str) -> str:
     return ", ".join(_qident(c, target) for c in cols)
+
+
+def _qstr(name: str) -> str:
+    """Build a PostgreSQL string literal containing a quoted qualified name,
+    e.g. ``'"dbo"."MySeq"'`` for ``setval()``."""
+    parts = name.split(".")
+    return "'" + ".".join('"' + p.replace('"', '""') + '"' for p in parts) + "'"
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def pg_ident(name: str) -> str:

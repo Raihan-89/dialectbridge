@@ -3,11 +3,14 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 
-from engine.schema import CheckConstraint, Column, Constraint, Database, Index, Table, Trigger, View
+from engine.schema import (
+    CheckConstraint, Column, Constraint, Database, Index, PartitionChild, Permission,
+    Principal, Routine, Sequence, Synonym, Table, Trigger, UserType, View,
+)
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from engine.translators.ddl_translator import convert_ddl
 from engine.translators.procedure_translator import translate_routine
-from engine.translators.sql_builder import build_database_ddl, convert_type
+from engine.translators.sql_builder import build_database_ddl, build_security_ddl, convert_type
 from engine.translators.trigger_translator import translate_trigger
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 
@@ -963,3 +966,515 @@ class PortalNavigationTests(TestCase):
         response = self.client.get(reverse("convert-form"))
         self.assertContains(response, 'class="btn btn-ghost nav-toggle"')
         self.assertContains(response, 'id="main-nav"')
+
+
+class AdvancedFeatureDDLTests(TestCase):
+    """Bidirectional conversion of sequences, user types, partitions, materialized
+    views, INCLUDE/clustered indexes, collations, synonyms, security and DDL triggers."""
+
+    class _LegacySqlServerConn:
+        """Simulates SQL Server < 2016: sys.temporal_tables / sys.sequences and
+        the graph columns on sys.tables do not exist, so those probes error."""
+
+        database = "legacy"
+
+        def fetch(self, sql, params=None):
+            lower = sql.lower()
+            if any(m in lower for m in ("temporal_type", "sys.sequences", "is_node")):
+                raise Exception("Invalid object name")
+            return []
+
+        def fetchone(self, sql, params=None):
+            return None
+
+    def test_legacy_sql_server_skips_optional_catalogs(self):
+        from engine.extractors.mssql import extract_schema
+        db = extract_schema(self._LegacySqlServerConn())
+        self.assertEqual(db.tables, [])
+        self.assertTrue(any("Temporal" in w for w in db.warnings))
+        self.assertTrue(any("Graph" in w for w in db.warnings))
+        self.assertTrue(any("Standalone sequences" in w for w in db.warnings))
+
+    class _LegacyIndexColumnConn:
+        """Ensures clustered state is derived from the portable index type."""
+
+        database = "legacy"
+
+        def fetch(self, sql, params=None):
+            lower = sql.lower()
+            if "temporal_type" in lower or "sys.sequences" in lower or "is_node" in lower:
+                raise Exception("Invalid object name")
+            if "i.is_clustered" in lower:
+                raise Exception("Invalid column name 'is_clustered'")
+            if "information_schema.columns" in lower:
+                return [("Id", "INT", None, None, None, None, "NO", None,
+                         False, None, None, None, None)]
+            if "information_schema.tables" in lower:
+                return [("dbo", "Widget")]
+            return []
+
+        def fetchone(self, sql, params=None):
+            return None
+
+    def test_sql_server_index_probe_does_not_read_nonexistent_column(self):
+        from engine.extractors.mssql import extract_schema
+        db = extract_schema(self._LegacyIndexColumnConn())
+        self.assertEqual(len(db.tables), 1)
+        self.assertEqual(db.tables[0].name, "dbo.Widget")
+        self.assertEqual(db.tables[0].indexes, [])
+        self.assertFalse(any("Indexes on dbo.Widget could not be inspected" in w for w in db.warnings))
+
+    class _BytesBigintConn:
+        """Simulates a TDS server that returns bigint values as raw little-endian
+        byte payloads (b'\\x01\\x00...' == 1) instead of Python ints."""
+
+        database = "bytes"
+
+        def fetch(self, sql, params=None):
+            lower = sql.lower()
+            if "information_schema.columns" in lower:
+                return [("Id", "INT", None, None, None, None, "NO", None, True,
+                         b"\x01\x00\x00\x00\x00\x00\x00\x00",
+                         b"\x02\x00\x00\x00\x00\x00\x00\x00", None, None)]
+            if "information_schema.tables" in lower:
+                return [("dbo", "Widget")]
+            if "from sys.sequences" in lower:
+                return [("dbo.Seq", b"\x05\x00\x00\x00\x00\x00\x00\x00",
+                         b"\x01\x00\x00\x00\x00\x00\x00\x00", False,
+                         b"\x07\x00\x00\x00\x00\x00\x00\x00", "INT", None, None)]
+            return []
+
+        def fetchone(self, sql, params=None):
+            return None
+
+    def test_bytes_bigint_values_are_coerced_to_ints(self):
+        from engine.extractors.mssql import extract_schema
+        db = extract_schema(self._BytesBigintConn())
+        col = db.tables[0].columns[0]
+        self.assertTrue(col.is_identity)
+        self.assertEqual(col.identity_seed, 1)
+        self.assertEqual(col.identity_increment, 2)
+        seq = db.sequences[0]
+        self.assertEqual(seq.name, "dbo.Seq")
+        self.assertEqual(seq.start_value, 5)
+        self.assertEqual(seq.increment, 1)
+        self.assertEqual(seq.current_value, 7)
+
+    def test_to_int_handles_raw_bigint_bytes(self):
+        from engine.connectors.base import to_int
+        self.assertEqual(to_int(b"\x01\x00\x00\x00\x00\x00\x00\x00"), 1)
+        self.assertEqual(to_int(b"42"), 42)
+        self.assertEqual(to_int(None), None)
+        self.assertEqual(to_int(7), 7)
+        self.assertEqual(to_int(True), 1)
+
+    def _base_tsql(self) -> Database:
+        return Database(name="src", dialect="tsql")
+
+    def _base_postgres(self) -> Database:
+        return Database(name="src", dialect="postgres")
+
+    # ------------------------------------------------------------------ types
+    def test_alias_type_to_domain(self):
+        db = self._base_tsql()
+        db.types = [UserType(name="dbo.PhoneNumber", kind="alias", base_type="VARCHAR(11)", nullable=False)]
+        db.tables = [Table(name="dbo.Contact", columns=[Column("Id", "INT"), Column("Phone", "PhoneNumber")])]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertIn('CREATE DOMAIN "dbo"."PhoneNumber" AS VARCHAR(11) NOT NULL', stmts)
+        self.assertIn('"dbo"."PhoneNumber"', stmts[-1])
+        self.assertEqual(warnings, [])
+
+    def test_domain_to_alias_type(self):
+        db = self._base_postgres()
+        db.types = [UserType(name="public.phone_number", kind="domain", base_type="character varying(11)")]
+        db.tables = [Table(name="public.contact", columns=[Column("id", "INT"), Column("phone", "phone_number")])]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertIn("CREATE TYPE [public].[phone_number] FROM NVARCHAR(11)", stmts[0])
+        self.assertIn("[public].[phone_number]", stmts[-1])
+        self.assertEqual(warnings, [])
+
+    def test_domain_with_check_warns_on_reverse(self):
+        db = self._base_postgres()
+        db.types = [UserType(name="public.pos", kind="domain", base_type="integer",
+                             constraints=["CHECK ((VALUE > 0))"])]
+        db.tables = [Table(name="public.t", columns=[Column("x", "INT")])]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertTrue(any("cannot express" in w for w in warnings))
+
+    def test_enum_warned_not_created_on_reverse(self):
+        db = self._base_postgres()
+        db.types = [UserType(name="public.status", kind="enum", values=["open", "closed"])]
+        db.tables = [Table(name="public.orders", columns=[Column("id", "INT"), Column("state", "status")])]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertTrue(any("enum type" in w for w in warnings))
+        self.assertIn("NVARCHAR(MAX)", stmts[0])
+        self.assertFalse(any("CREATE TYPE [public].[status]" in s for s in stmts))
+
+    # -------------------------------------------------------------- sequences
+    def test_sequence_to_postgres_with_current_value(self):
+        db = self._base_tsql()
+        db.sequences = [Sequence(name="dbo.OrderSeq", start_value=1, increment=1,
+                                 current_value=500, data_type="BIGINT")]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertIn('CREATE SEQUENCE "dbo"."OrderSeq" AS BIGINT START WITH 1 INCREMENT BY 1', stmts[0])
+        self.assertTrue(any("setval" in s and "500" in s for s in stmts))
+        self.assertEqual(warnings, [])
+
+    def test_sequence_to_tsql(self):
+        db = self._base_postgres()
+        db.sequences = [Sequence(name="public.orders_seq", start_value=1, increment=1,
+                                 current_value=42, data_type="bigint")]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertIn("CREATE SEQUENCE [public].[orders_seq] AS BIGINT START WITH 1 INCREMENT BY 1", stmts[0])
+        self.assertIn("ALTER SEQUENCE [public].[orders_seq] RESTART WITH 42", stmts[1])
+        self.assertEqual(warnings, [])
+
+    # ------------------------------------------------------------ partitioning
+    def test_partitioned_table_to_postgres(self):
+        db = self._base_tsql()
+        db.tables = [Table(
+            name="dbo.Orders", columns=[Column("OrderId", "INT", nullable=False),
+                                        Column("OrderDate", "DATETIME", nullable=False)],
+            primary_key=Constraint("PK_Orders", ["OrderId"]),
+            is_partitioned=True, partition_type="range", partition_key="OrderDate",
+            partition_children=[
+                PartitionChild(name="dbo.Orders_p1", bounds="FROM (MINVALUE) TO ('2024-01-01')"),
+                PartitionChild(name="dbo.Orders_p2", bounds="FROM ('2024-01-01') TO (MAXVALUE)"),
+            ],
+        )]
+        stmts, _ = build_database_ddl(db, "postgres")
+        self.assertIn('PARTITION BY RANGE ("OrderDate")', stmts[0])
+        self.assertIn('CREATE TABLE "dbo"."Orders_p1" PARTITION OF "dbo"."Orders" FOR VALUES FROM (MINVALUE) TO (\'2024-01-01\')', stmts[1])
+        self.assertIn('CREATE TABLE "dbo"."Orders_p2" PARTITION OF "dbo"."Orders" FOR VALUES FROM (\'2024-01-01\') TO (MAXVALUE)', stmts[2])
+
+    def test_partitioned_table_to_tsql_warns(self):
+        db = self._base_postgres()
+        db.tables = [Table(
+            name="public.orders", columns=[Column("id", "INT"), Column("created", "DATE")],
+            is_partitioned=True, partition_type="range", partition_key="created",
+            partition_children=[PartitionChild(name="public.orders_p1", bounds="FROM (MINVALUE) TO ('2024-01-01')")],
+        )]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertTrue(any("created as a regular table" in w for w in warnings))
+        self.assertNotIn("PARTITION OF", stmts[0])
+
+    # ---------------------------------------------------------- materialized
+    def test_indexed_view_to_matview(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Orders", columns=[Column("OrderId", "INT"), Column("Total", "MONEY")])]
+        db.views = [View(
+            name="dbo.vTotals", definition="CREATE VIEW dbo.vTotals AS SELECT OrderId, Total FROM dbo.Orders",
+            is_materialized=True,
+            indexes=[Index("IX_vTotals", ["OrderId"], unique=True, is_clustered=True)],
+        )]
+        stmts, _ = build_database_ddl(db, "postgres")
+        matview_stmt = next(s for s in stmts if "CREATE MATERIALIZED VIEW" in s)
+        matview_index = next(s for s in stmts if "IX_vTotals" in s)
+        self.assertIn("CREATE MATERIALIZED VIEW", matview_stmt)
+        self.assertIn("CREATE UNIQUE INDEX \"IX_vTotals\" ON \"dbo\".\"vTotals\" (\"OrderId\")", matview_index)
+
+    def test_matview_to_indexed_view(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="public.orders", columns=[Column("id", "INT"), Column("total", "NUMERIC")])]
+        db.views = [View(
+            name="public.v_totals", definition="CREATE VIEW public.v_totals AS SELECT id, total FROM public.orders",
+            is_materialized=True,
+            indexes=[Index("idx_v_totals", ["id"], unique=True, is_clustered=True)],
+        )]
+        stmts, _ = build_database_ddl(db, "tsql")
+        view_stmt = next(s for s in stmts if "SCHEMABINDING" in s)
+        index_stmt = next(s for s in stmts if "idx_v_totals" in s and "CREATE" in s)
+        self.assertIn("CREATE VIEW [public].[v_totals] WITH SCHEMABINDING", view_stmt)
+        self.assertIn("CREATE UNIQUE CLUSTERED INDEX [idx_v_totals] ON [public].[v_totals] ([id])", index_stmt)
+
+    # ---------------------------------------------------------------- indexes
+    def test_included_columns_index(self):
+        db = self._base_tsql()
+        db.tables = [Table(
+            name="dbo.Orders",
+            columns=[Column("OrderId", "INT"), Column("CustomerId", "INT"), Column("Total", "MONEY")],
+            indexes=[Index("IX_Orders_customer", ["CustomerId"], included_columns=["OrderId", "Total"])],
+        )]
+        stmts, _ = build_database_ddl(db, "postgres")
+        index_stmt = next(s for s in stmts if "IX_Orders_customer" in s)
+        self.assertIn('INCLUDE ("OrderId", "Total")', index_stmt)
+
+    def test_clustered_index_to_tsql(self):
+        db = self._base_postgres()
+        db.tables = [Table(
+            name="public.orders", columns=[Column("id", "INT"), Column("customer_id", "INT")],
+            indexes=[Index("idx_orders_customer", ["customer_id"], is_clustered=True)],
+        )]
+        stmts, _ = build_database_ddl(db, "tsql")
+        index_stmt = next(s for s in stmts if "idx_orders_customer" in s)
+        self.assertIn("CREATE CLUSTERED INDEX [idx_orders_customer] ON [public].[orders] ([customer_id])", index_stmt)
+
+    def test_clustered_to_postgres_warns(self):
+        db = self._base_tsql()
+        db.tables = [Table(
+            name="dbo.Orders", columns=[Column("OrderId", "INT")],
+            indexes=[Index("IX_Orders", ["OrderId"], is_clustered=True)],
+        )]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertTrue(any("does not enforce clustered storage" in w for w in warnings))
+        self.assertFalse(any("CLUSTERED" in s for s in stmts))
+
+    def test_specialized_index_skipped_with_warning(self):
+        db = self._base_tsql()
+        db.tables = [Table(
+            name="dbo.Docs", columns=[Column("DocId", "INT")],
+            indexes=[Index("IX_Docs_col", ["DocId"], index_type="columnstore")],
+        )]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertFalse(any("IX_Docs_col" in s for s in stmts))
+        self.assertTrue(any("columnstore" in w for w in warnings))
+
+    # -------------------------------------------------------------- collation
+    def test_collation_emitted_for_char_columns(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Users", columns=[
+            Column("Name", "NVARCHAR(100)", collation="SQL_Latin1_General_CP1_CI_AS"),
+            Column("Age", "INT", collation="SQL_Latin1_General_CP1_CI_AS"),
+        ])]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertIn('COLLATE "en_US"', stmts[0])
+        self.assertEqual(stmts[0].count("COLLATE"), 1)  # only the char column
+        self.assertEqual(warnings, [])
+
+    def test_collation_reverse_emitted(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="public.users", columns=[
+            Column("name", "character varying(100)", collation="en_US.UTF-8"),
+        ])]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertIn("COLLATE Latin1_General_CI_AS", stmts[0])
+        self.assertEqual(warnings, [])
+
+    def test_unknown_collation_warns_and_omits(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Users", columns=[
+            Column("Name", "NVARCHAR(100)", collation="Something_Exotic_CI_AS"),
+        ])]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertNotIn("COLLATE", stmts[0])
+        self.assertTrue(any("has no PostgreSQL equivalent" in w for w in warnings))
+
+    # --------------------------------------------------------------- synonyms
+    def test_table_synonym_becomes_view(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Orders", columns=[Column("OrderId", "INT")])]
+        db.synonyms = [Synonym(name="dbo.LegacyOrders", target_object="dbo.Orders", target_kind="table")]
+        stmts, _ = build_database_ddl(db, "postgres")
+        self.assertIn('CREATE VIEW "dbo"."LegacyOrders" AS SELECT * FROM "dbo"."Orders"', stmts[-1])
+
+    def test_procedure_synonym_warns(self):
+        db = self._base_tsql()
+        db.synonyms = [Synonym(name="dbo.old_proc", target_object="dbo.new_proc", target_kind="procedure")]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertEqual(stmts, [])
+        self.assertTrue(any("no synonym support" in w for w in warnings))
+
+    # ---------------------------------------------------------------- security
+    def test_security_to_postgres(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Orders", columns=[Column("OrderId", "INT")])]
+        db.users = [Principal(name="app_user", kind="user", member_of=["readers"])]
+        db.roles = [Principal(name="readers", kind="role")]
+        db.permissions = [Permission(principal="app_user", securable="table", object_name="dbo.Orders",
+                                     action="SELECT", with_grant=True)]
+        stmts, _ = build_database_ddl(db, "postgres")
+        self.assertIn('CREATE ROLE "readers"', stmts[1])
+        self.assertIn('CREATE ROLE "app_user" LOGIN', stmts[2])
+        self.assertIn('GRANT "readers" TO "app_user"', stmts[3])
+        self.assertIn('GRANT SELECT ON "dbo"."Orders" TO "app_user" WITH GRANT OPTION', stmts[4])
+
+    def test_security_to_tsql(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="public.orders", columns=[Column("id", "INT")])]
+        db.roles = [Principal(name="readers", kind="role")]
+        db.users = [Principal(name="app_user", kind="user", member_of=["readers"])]
+        db.permissions = [Permission(principal="app_user", securable="table", object_name="public.orders",
+                                     action="SELECT")]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn("CREATE ROLE [readers]", stmts[1])
+        self.assertIn("CREATE USER [app_user] WITHOUT LOGIN", stmts[2])
+        self.assertIn("ALTER ROLE [readers] ADD MEMBER [app_user]", stmts[3])
+        self.assertIn("GRANT SELECT ON OBJECT::[public].[orders] TO [app_user]", stmts[4])
+
+    # ------------------------------------------------------------- DDL triggers
+    def test_tsql_ddl_trigger_to_event_trigger(self):
+        db = self._base_tsql()
+        db.triggers = [Trigger(
+            name="trg_prevent_drop", table=None, timing="AFTER",
+            events=["CREATE_TABLE", "DROP_TABLE"],
+            definition="CREATE TRIGGER trg_prevent_drop ON DATABASE FOR CREATE_TABLE, DROP_TABLE AS BEGIN RAISERROR('No', 16, 1) END",
+            is_ddl=True, ddl_scope="database",
+        )]
+        stmts, _ = build_database_ddl(db, "postgres")
+        self.assertIn("CREATE EVENT TRIGGER", stmts[0])
+        self.assertIn("RETURNS event_trigger", stmts[0])
+        self.assertIn("WHEN TAG IN ('CREATE TABLE', 'DROP TABLE')", stmts[0])
+        self.assertIn("RAISE EXCEPTION", stmts[0])
+
+    def test_event_trigger_to_tsql_ddl_trigger(self):
+        db = self._base_postgres()
+        db.triggers = [Trigger(
+            name="no_drops", table=None, timing="AFTER", events=["ddl_command_end"],
+            definition="CREATE OR REPLACE FUNCTION no_drops() RETURNS event_trigger AS $$ BEGIN RAISE EXCEPTION 'nope'; END; $$ LANGUAGE plpgsql;",
+            is_ddl=True, ddl_scope="database",
+        )]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertIn("CREATE TRIGGER", stmts[0])
+        self.assertIn("ON DATABASE", stmts[0])
+        self.assertIn("FOR CREATE_TABLE", stmts[0])
+        self.assertTrue(any("conservative event set" in w for w in warnings))
+
+    # ------------------------------------------------------- live-run regression
+    # A real legacy-server migration surfaced these failures; each test locks in
+    # the fix so they cannot regress.
+
+    def test_synonym_with_bracketed_target_quotes_cleanly(self):
+        # sys.synonyms.base_object_name returns the target as authored
+        # (e.g. [dbo].[Inventory]); quoting it verbatim produced the invalid
+        # "[dbo]"."[Inventory]" that broke the created view.
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Inventory", columns=[Column("InventoryID", "INT")])]
+        db.synonyms = [Synonym(name="dbo.Stock", target_object="[dbo].[Inventory]", target_kind="table")]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertIn('CREATE VIEW "dbo"."Stock" AS SELECT * FROM "dbo"."Inventory"', stmts)
+        self.assertEqual(warnings, [])
+
+    def test_synonym_with_four_part_bracketed_target_is_normalized(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Inventory", columns=[Column("InventoryID", "INT")])]
+        db.synonyms = [Synonym(name="dbo.Stock", target_object="[mysrv].[store].[dbo].[Inventory]", target_kind="table")]
+        stmts, _ = build_database_ddl(db, "postgres")
+        self.assertIn('CREATE VIEW "dbo"."Stock" AS SELECT * FROM "dbo"."Inventory"', stmts)
+
+    def test_convert_with_bracketed_type_becomes_cast(self):
+        from engine.translators.functions import _convert_to_cast, translate_functions
+        # CONVERT([nvarchar], ...) in OBJECT_DEFINITION output is bracketed.
+        self.assertEqual(_convert_to_cast("[nvarchar], GETDATE(), 100"), "CAST(GETDATE() AS TEXT)")
+        self.assertEqual(
+            translate_functions("'RET-'+CONVERT([nvarchar], GETDATE(), 100)", "tsql", "postgres"),
+            "'RET-'+CAST(CURRENT_TIMESTAMP AS TEXT)",
+        )
+        self.assertEqual(
+            translate_functions("CONVERT([nvarchar](10), NEXT VALUE FOR dbo.Seq)",
+                                "tsql", "postgres"),
+            "CAST(NEXT VALUE FOR dbo.Seq AS VARCHAR(10))",
+        )
+
+    def test_default_with_convert_and_concat_is_valid_postgres(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.ProductReturns", columns=[
+            Column(name="ReturnNumber", data_type="VARCHAR(50)", nullable=True,
+                   default="'RET-'+CONVERT([nvarchar], GETDATE(), 100)"),
+            Column(name="Status", data_type="VARCHAR(20)", nullable=True, default="N'Pending'"),
+        ])]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        create = [s for s in stmts if s.startswith("CREATE TABLE")][0]
+        self.assertIn("DEFAULT 'RET-' || CAST(CURRENT_TIMESTAMP AS TEXT)", create)
+        self.assertIn("DEFAULT 'Pending'", create)
+        self.assertNotIn("[", create)
+        self.assertEqual(warnings, [])
+
+    def test_utc_and_sequence_defaults_are_valid_postgres(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Events", columns=[
+            Column(name="CreatedDate", data_type="DATETIME2",
+                   default="SYSUTCDATETIME()"),
+            Column(name="EventNumber", data_type="BIGINT",
+                   default="NEXT VALUE FOR [dbo].[EventSequence]"),
+        ])]
+        stmts, _ = build_database_ddl(db, "postgres")
+        create = next(s for s in stmts if s.startswith("CREATE TABLE"))
+        self.assertIn("DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')", create)
+        self.assertIn("DEFAULT nextval('\"dbo\".\"EventSequence\"'::regclass)", create)
+
+    def test_unparenthesized_if_with_single_statement_body(self):
+        fn = """
+CREATE FUNCTION dbo.fn_GetStockStatus (@StockLevel INT)
+RETURNS NVARCHAR(20)
+AS
+BEGIN
+    IF @StockLevel IS NULL SET @Status = 'Unknown';
+    RETURN @Status;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+        self.assertNotIn("SET @Status", conv)
+        self.assertIn("IF StockLevel IS NULL THEN\nStatus := 'Unknown';\nEND IF;", conv)
+        self.assertIn("RETURN Status;", conv)
+        self.assertEqual(warnings, [])
+
+    def test_trigger_header_with_execute_as_and_not_for_replication(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Inventory", columns=[Column("InventoryID", "INT")])]
+        db.triggers = [Trigger(
+            name="trg_Inventory_StockAlert", table="dbo.Inventory", timing="AFTER",
+            events=["INSERT", "UPDATE"],
+            definition=(
+                "CREATE TRIGGER [trg_Inventory_StockAlert] ON [dbo].[Inventory] "
+                "WITH EXECUTE AS CALLER AFTER INSERT, UPDATE NOT FOR REPLICATION "
+                "AS BEGIN SET NOCOUNT ON; END"
+            ),
+        )]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertTrue(any("CREATE OR REPLACE FUNCTION trg_Inventory_StockAlert_fn" in s for s in stmts))
+        self.assertTrue(any("CREATE TRIGGER trg_Inventory_StockAlert AFTER INSERT OR UPDATE" in s for s in stmts))
+        self.assertFalse(any("Could not parse CREATE TRIGGER header" in w for w in warnings))
+
+    def test_compact_trigger_block_translates_raiserror(self):
+        trig = Trigger(
+            name="trg_Inventory_Validate", table="dbo.Inventory", timing="AFTER",
+            events=["UPDATE"],
+            definition=(
+                "CREATE TRIGGER dbo.trg_Inventory_Validate ON dbo.Inventory AFTER UPDATE "
+                "AS BEGIN IF EXISTS (SELECT 1 FROM inserted WHERE Quantity < 0) "
+                "BEGIN RAISERROR('Quantity cannot be negative',16,1); "
+                "ROLLBACK TRANSACTION; END END"
+            ),
+        )
+        converted, _ = translate_trigger(trig, "postgres")
+        self.assertIn("RAISE EXCEPTION 'Quantity cannot be negative'", converted)
+        self.assertNotIn("RAISERROR", converted)
+        self.assertNotIn("ROLLBACK", converted)
+
+    def test_reserved_public_role_is_never_emitted(self):
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Inventory", columns=[Column("InventoryID", "INT")])]
+        db.roles = [Principal(name="public", kind="role"), Principal(name="ProductAdmin", kind="role")]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertFalse(any("public" in s and "CREATE ROLE" in s for s in stmts))
+        self.assertTrue(any('CREATE ROLE "ProductAdmin"' in s for s in stmts))
+        self.assertTrue(any("reserved" in w for w in warnings))
+
+    def test_security_securable_resolved_by_name_when_type_missing(self):
+        from engine.extractors.mssql import _extract_security
+
+        class _Conn:
+            database = "legacy"
+
+            def fetch(self, sql, params=None):
+                if "sys.database_permissions" in sql:
+                    return [
+                        ("app_user", "SELECT", "GRANT", "dbo.Inventory", "OBJECT_OR_COLUMN", None),
+                        ("app_user", "EXECUTE", "GRANT", "dbo.fn_CheckStockAvailability", "OBJECT_OR_COLUMN", None),
+                    ]
+                if "sys.database_role_members" in sql:
+                    return []
+                return [("app_user", "U", 0)]
+
+        db = self._base_tsql()
+        db.tables = [Table(name="dbo.Inventory", columns=[Column("InventoryID", "INT")])]
+        db.functions = [
+            Routine(name="dbo.fn_CheckStockAvailability", kind="function", definition="")
+        ]
+        _extract_security(_Conn(), db)
+        stmts, _ = build_security_ddl(db, "postgres")
+        self.assertIn('GRANT SELECT ON "dbo"."Inventory" TO "app_user"', stmts)
+        routine_grant = next(s for s in stmts if "pg_proc" in s)
+        self.assertIn("n.nspname = 'dbo'", routine_grant)
+        self.assertIn("p.proname = 'fn_CheckStockAvailability'", routine_grant)
+        self.assertIn("GRANT EXECUTE ON ROUTINE %s TO %I", routine_grant)

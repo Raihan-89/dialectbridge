@@ -312,15 +312,28 @@ def _join_declares(declared: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+# Keywords that can start the single-statement body of an unparenthesized
+# ``IF <cond> <stmt>`` / ``WHILE <cond> <stmt>`` (T-SQL allows the branch body
+# on the same line without BEGIN/END).
+_IF_BODY_START = re.compile(
+    r"\b(SET|RETURN|SELECT|UPDATE|DELETE|INSERT|PRINT|RAISERROR|THROW|"
+    r"BREAK|CONTINUE|WAITFOR|BEGIN|DECLARE|EXEC(?:UTE)?|MERGE|GOTO)\b",
+    re.IGNORECASE,
+)
+
+
 def _split_cond_body(rest: str) -> tuple[str, str]:
     """Split ``IF (cond) stmt`` into ``((cond), "stmt")``.
 
     When the rest starts with a balanced parenthesised condition and more
     follows on the same line, the tail is the single-statement branch body.
-    Unparenthesised or unbalanced conditions take the whole rest as the
-    condition with no tail."""
+    Unparenthesised conditions (``IF @x IS NULL SET @y = 1``) are split at the
+    first top-level statement keyword so the body is not swallowed into the
+    condition (which produced invalid ``IF ... SET ... THEN`` output). When no
+    such boundary exists the whole rest is the condition with no tail."""
     if not rest.startswith("("):
-        return rest, ""
+        cond, tail = _split_unparenthesized_cond(rest)
+        return (rest, "") if tail is None else (cond, tail)
     depth = 0
     for i, ch in enumerate(rest):
         if ch == "(":
@@ -330,6 +343,51 @@ def _split_cond_body(rest: str) -> tuple[str, str]:
             if depth == 0:
                 return rest[: i + 1], rest[i + 1 :].strip()
     return rest, ""
+
+
+def _split_unparenthesized_cond(rest: str) -> tuple[str, str | None]:
+    """Split an unparenthesized condition from its single-statement body.
+
+    Returns ``(condition, body)`` with ``body=None`` when no statement keyword
+    is found at paren depth 0 (so the whole rest is the condition). Keywords
+    inside string literals, parenthesised subqueries and ``(x)`` grouping are
+    ignored, and a keyword must be followed by whitespace/``(`` to count."""
+    if not rest:
+        return rest, None
+    depth = 0
+    in_str = False
+    i = 0
+    n = len(rest)
+    while i < n:
+        ch = rest[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < n and rest[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = False
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+            i += 1
+            continue
+        if ch in "([":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            m = _IF_BODY_START.match(rest, i)
+            if m:
+                after = m.end()
+                if after >= n or not (rest[after].isalnum() or rest[after] == "_"):
+                    return rest[:i].strip(), rest[i:].strip()
+        i += 1
+    return rest, None
 
 
 def _paren_delta(text: str) -> int:

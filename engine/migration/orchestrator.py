@@ -27,6 +27,7 @@ from engine.translators.sql_builder import build_database_ddl
 _PRE_DATA_PREFIXES = ("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX",
                       "ALTER TABLE")
 _FK_PREFIXES = ("ALTER TABLE",)
+_PRE_TABLE_PREFIXES = ("CREATE DOMAIN", "CREATE TYPE", "CREATE SEQUENCE")
 
 
 @dataclass
@@ -80,7 +81,14 @@ class MigrationReport:
 def _is_structural(stmt: str) -> bool:
     upper = stmt.lstrip().upper()
     return upper.startswith("CREATE TABLE") or upper.startswith("CREATE INDEX") \
-        or upper.startswith("CREATE UNIQUE INDEX")
+        or upper.startswith("CREATE UNIQUE INDEX") \
+        or upper.startswith("CREATE CLUSTERED INDEX") \
+        or upper.startswith("CREATE UNIQUE CLUSTERED INDEX")
+
+
+def _is_pre_table(stmt: str) -> bool:
+    upper = stmt.lstrip().upper()
+    return any(upper.startswith(p) for p in _PRE_TABLE_PREFIXES)
 
 
 def _is_fk_or_check(stmt: str) -> bool:
@@ -152,6 +160,11 @@ class MigrationOrchestrator:
                 )
             self._apply(report, "schema", stmt, object_name=s)
 
+        # Types and sequences must exist before the tables that reference them.
+        for stmt in ddl:
+            if _is_pre_table(stmt):
+                self._apply(report, _object_kind(stmt), stmt)
+
         for table in schema.all_tables_in_dependency_order():
             self._apply_table(report, schema, table)
 
@@ -175,7 +188,7 @@ class MigrationOrchestrator:
             self.target.execute("SET search_path = " + ", ".join(self.target.quote_ident(s) for s in schemas))
 
         for stmt in ddl:
-            if _is_structural(stmt):
+            if _is_structural(stmt) or _is_pre_table(stmt):
                 continue
             kind = "constraint" if _is_fk_or_check(stmt) else _object_kind(stmt)
             self._apply(report, kind, stmt)
@@ -300,11 +313,26 @@ class MigrationOrchestrator:
 
 def _object_kind(stmt: str) -> str:
     upper = stmt.lstrip().upper()
-    for kind in ("CREATE OR ALTER VIEW", "CREATE VIEW", "CREATE OR REPLACE FUNCTION",
+    for kind in ("CREATE OR ALTER VIEW", "CREATE OR REPLACE VIEW", "CREATE VIEW",
+                 "CREATE MATERIALIZED VIEW", "CREATE OR REPLACE FUNCTION",
                  "CREATE FUNCTION", "CREATE OR REPLACE PROCEDURE", "CREATE PROCEDURE",
-                 "CREATE OR ALTER PROCEDURE", "CREATE TRIGGER"):
+                 "CREATE OR ALTER PROCEDURE", "CREATE TRIGGER", "CREATE EVENT TRIGGER"):
         if upper.startswith(kind):
-            return kind.split()[-1].lower()
+            base = kind.split()[-1].lower()
+            if base == "event":
+                return "trigger"
+            return base
+    for kind in ("CREATE DOMAIN", "CREATE TYPE"):
+        if upper.startswith(kind):
+            return "type"
+    for kind in ("CREATE SEQUENCE",):
+        if upper.startswith(kind):
+            return "sequence"
+    if upper.startswith("SELECT SETVAL"):
+        return "sequence"
+    for kind in ("CREATE ROLE", "CREATE USER", "ALTER ROLE", "GRANT", "ALTER SEQUENCE"):
+        if upper.startswith(kind):
+            return "grant"
     return "object"
 
 

@@ -214,12 +214,26 @@ def _convert_to_cast(args: str) -> str | None:
     # CONVERT(type, expr [, style]) or CONVERT(expr, type [, style])
     if len(parts) < 2:
         return None
-    # heuristic: first arg that is a type keyword
-    type_kw = _TYPE_KEYWORDS
-    if parts[0].upper() in type_kw or re.match(r"^[A-Z]+(\(\d+(,\d+)?\))?$", parts[0], re.I):
-        return f"CAST({parts[1]} AS {_pg_type(parts[0])})"
-    if parts[1].upper() in type_kw or re.match(r"^[A-Z]+(\(\d+(,\d+)?\))?$", parts[1], re.I):
-        return f"CAST({parts[0]} AS {_pg_type(parts[1])})"
+
+    def _type_token(tok: str) -> str | None:
+        # Bracketed type tokens (CONVERT([nvarchar], ...)) are common in
+        # OBJECT_DEFINITION output and must be matched like their bare form.
+        tok = tok.strip()
+        # OBJECT_DEFINITION commonly renders parameterized system types as
+        # [nvarchar](10), not [nvarchar(10)].
+        tok = re.sub(r"^\[([A-Za-z_][A-Za-z0-9_]*)\](\s*\([^)]*\))$", r"\1\2", tok)
+        if tok.startswith("[") and tok.endswith("]"):
+            tok = tok[1:-1].strip()
+        if tok.upper() in _TYPE_KEYWORDS or re.match(r"^[A-Z]+(\(\d+(,\d+)?\))?$", tok, re.I):
+            return tok
+        return None
+
+    t0 = _type_token(parts[0])
+    if t0 is not None:
+        return f"CAST({parts[1]} AS {_pg_type(t0)})"
+    t1 = _type_token(parts[1])
+    if t1 is not None:
+        return f"CAST({parts[0]} AS {_pg_type(t1)})"
     return None
 
 
@@ -232,6 +246,8 @@ _TYPE_KEYWORDS = {"INT", "BIGINT", "SMALLINT", "TINYINT", "BIT", "MONEY", "DECIM
 def _pg_type(t: str) -> str:
     from engine.mappers.type_mappings import MSSQL_TO_POSTGRES_TYPE_OVERRIDES
     t = t.strip()
+    if t.startswith("[") and t.endswith("]"):
+        t = t[1:-1].strip()
     m = re.match(r"^([A-Z]+)(\(\d+(,\d+)?\))?$", t, re.I)
     base = m.group(1).upper() if m else t.upper()
     params = m.group(2) if m else ""

@@ -78,7 +78,7 @@ class _FakeConnector:
         return db
 
     # -- data ---------------------------------------------------------------
-    def iter_table_rows(self, table_name, columns, order_columns, batch_size):
+    def iter_table_rows(self, table_name, columns, order_columns, batch_size, int_columns=None):
         rows = self.data.get(table_name, [])
         cols = {name: i for i, name in enumerate(["id", "payload"])}
         idx = [cols[c] for c in columns]
