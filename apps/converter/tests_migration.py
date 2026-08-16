@@ -11,6 +11,7 @@ from django.test import SimpleTestCase
 
 from engine.connectors.base import ConnectorError
 from engine.connectors.mssql import MSSQLConnector
+from engine.connectors.postgres import PostgresConnector
 from engine.migration.orchestrator import MigrationOrchestrator
 from engine.schema import Column, Constraint, Database, Table
 
@@ -26,6 +27,51 @@ class MSSQLConnectorTests(SimpleTestCase):
 
         self.assertTrue(connect.call_args.kwargs["use_datetime2"])
         raw_connection.autocommit.assert_called_once_with(True)
+
+    def test_keyless_table_streams_every_batch(self):
+        cursor = Mock()
+        cursor.__enter__ = Mock(return_value=cursor)
+        cursor.__exit__ = Mock(return_value=False)
+        cursor.fetchmany.side_effect = [[(1,), (2,)], [(3,), (4,)], [(5,)], []]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        connector = MSSQLConnector("host", 1433, "db", "user", "password")
+        connector._conn = connection
+
+        batches = list(connector.iter_table_rows("dbo.Log", ["Value"], [], batch_size=2))
+
+        self.assertEqual(sum(len(batch) for batch in batches), 5)
+        cursor.execute.assert_called_once_with("SELECT [Value] FROM [dbo].[Log]")
+
+    def test_composite_key_uses_lexicographic_pagination_and_real_column_positions(self):
+        connector = MSSQLConnector("host", 1433, "db", "user", "password")
+        connector.fetch = Mock(side_effect=[[("first", 1, 2), ("second", 1, 3)], [("third", 2, 1)]])
+
+        rows = list(connector.iter_table_rows(
+            "dbo.Items", ["Payload", "TenantID", "ItemID"],
+            ["TenantID", "ItemID"], batch_size=2,
+        ))
+
+        self.assertEqual(sum(len(batch) for batch in rows), 3)
+        second_sql, second_params = connector.fetch.call_args_list[1].args
+        self.assertIn("([TenantID] > %s) OR ([TenantID] = %s AND [ItemID] > %s)", second_sql)
+        self.assertEqual(second_params, (1, 1, 3))
+
+
+class PostgresConnectorPaginationTests(SimpleTestCase):
+    def test_composite_key_uses_tuple_pagination_and_real_column_positions(self):
+        connector = PostgresConnector("host", 5432, "db", "user", "password")
+        connector.fetch = Mock(side_effect=[[("first", 1, 2), ("second", 1, 3)], [("third", 2, 1)]])
+
+        rows = list(connector.iter_table_rows(
+            "public.Items", ["Payload", "TenantID", "ItemID"],
+            ["TenantID", "ItemID"], batch_size=2,
+        ))
+
+        self.assertEqual(sum(len(batch) for batch in rows), 3)
+        second_sql, second_params = connector.fetch.call_args_list[1].args
+        self.assertIn('("TenantID", "ItemID") > (%s, %s)', second_sql)
+        self.assertEqual(second_params, (1, 3))
 
 
 class _FakeConnector:

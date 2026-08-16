@@ -85,18 +85,29 @@ class PostgresConnector(DatabaseConnector):
         tbl = self.quote_ident(table_name)
 
         if not order_columns:
-            rows = self.fetch(f"SELECT {qident} FROM {tbl} LIMIT {batch_size}")
-            if rows:
-                yield rows
+            # Keep one cursor open and stream the complete result. OFFSET-based
+            # pagination is neither stable nor safe for keyless tables, and the
+            # former single LIMIT silently omitted every row after batch one.
+            self._ensure_conn()
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(f"SELECT {qident} FROM {tbl}")
+                    while True:
+                        rows = cur.fetchmany(batch_size)
+                        if not rows:
+                            break
+                        yield rows
+            except psycopg2.Error as exc:
+                raise ConnectorError(f"PostgreSQL query failed: {exc}") from exc
             return
 
-        placeholders = ", ".join(["%s"] * len(order_columns))
+        key_indexes = [columns.index(column) for column in order_columns]
         last_key: tuple | None = None
         while True:
             if last_key is not None:
-                conds = " AND ".join(
-                    f'("{c}" > %s)' if i == 0 else f'("{c}" = %s)' for i, c in enumerate(order_columns)
-                )
+                quoted_keys = ", ".join(f'"{column}"' for column in order_columns)
+                placeholders = ", ".join(["%s"] * len(order_columns))
+                conds = f"({quoted_keys}) > ({placeholders})"
                 sql = (
                     f"SELECT {qident} FROM {tbl} WHERE {conds} {order_clause} "
                     f"LIMIT {batch_size}"
@@ -110,7 +121,7 @@ class PostgresConnector(DatabaseConnector):
             yield rows
             if len(rows) < batch_size:
                 break
-            last_key = tuple(rows[-1][i] for i in range(len(order_columns)))
+            last_key = tuple(rows[-1][i] for i in key_indexes)
 
     def count_rows(self, table_name: str) -> int:
         row = self.fetchone(f"SELECT COUNT(*) FROM {self.quote_ident(table_name)}")

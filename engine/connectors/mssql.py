@@ -98,37 +98,49 @@ class MSSQLConnector(DatabaseConnector):
                 return to_int(value)
             return value
 
+        if not order_columns:
+            # A single live cursor streams all rows without requiring a key.
+            # The former TOP query returned only the first batch.
+            self._ensure_conn()
+            try:
+                with self._conn.cursor() as cur:
+                    cur.execute(f"SELECT {qident} FROM {tbl}")
+                    while True:
+                        rows = cur.fetchmany(batch_size)
+                        if not rows:
+                            break
+                        yield [[_norm(v, c) for v, c in zip(row, columns)] for row in rows]
+            except Exception as exc:
+                raise ConnectorError(f"SQL Server query failed: {exc}") from exc
+            return
+
+        key_indexes = [columns.index(column) for column in order_columns]
+
         while True:
             if order_columns and last_key is not None:
-                # keyset pagination on the PK
-                conds = " AND ".join(
-                    f"([{c}] > %s)" if i == 0 else f"([{c}] = %s)" for i, c in enumerate(order_columns)
-                )
+                # Lexicographic keyset predicate for composite primary keys:
+                # a > ? OR (a = ? AND b > ?) OR (... AND c > ?).
+                branches, params = [], []
+                for index, column in enumerate(order_columns):
+                    equal = [f"[{prior}] = %s" for prior in order_columns[:index]]
+                    branches.append("(" + " AND ".join(equal + [f"[{column}] > %s"]) + ")")
+                    params.extend(last_key[:index])
+                    params.append(last_key[index])
+                conds = " OR ".join(branches)
                 sql = (
                     f"SELECT TOP {batch_size} {qident} FROM {tbl} "
                     f"WHERE {conds} {order_clause}"
                 )
-                rows = self.fetch(sql, tuple(last_key))
+                rows = self.fetch(sql, tuple(params))
             elif order_columns:
                 sql = f"SELECT TOP {batch_size} {qident} FROM {tbl} {order_clause}"
                 rows = self.fetch(sql)
-            else:
-                sql = f"SELECT TOP {batch_size} {qident} FROM {tbl}"
-                rows = self.fetch(sql)
-                if not rows:
-                    break
-                yield [[_norm(v, c) for v, c in zip(row, columns)] for row in rows]
-                # no ordering column — can't paginate; stop after first batch
-                break
-
             if not rows:
                 break
             yield [[_norm(v, c) for v, c in zip(row, columns)] for row in rows]
             if len(rows) < batch_size:
                 break
-            last_key = tuple(
-                _norm(rows[-1][i], order_columns[i]) for i in range(len(order_columns))
-            )
+            last_key = tuple(_norm(rows[-1][i], order_columns[pos]) for pos, i in enumerate(key_indexes))
 
     def count_rows(self, table_name: str) -> int:
         row = self.fetchone(f"SELECT COUNT_BIG(*) FROM {self.quote_ident(table_name)}")

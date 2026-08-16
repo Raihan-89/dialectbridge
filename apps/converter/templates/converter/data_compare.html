@@ -40,18 +40,18 @@
 </div>
 
 {% if selected %}
-<div class="card" id="data-app" data-tables-url="{% url 'data-compare-tables' selected.pk %}" data-rows-url="{% url 'data-compare-rows' selected.pk %}">
+<div class="card" id="data-app" data-tables-url="{% url 'data-compare-tables' selected.pk %}" data-rows-url="{% url 'data-compare-rows' selected.pk %}" data-checksum-url="{% url 'data-compare-checksum' selected.pk %}">
     <div class="data-controls">
         <div class="field"><label for="migration">Migration</label><select id="migration">{% for job in jobs %}<option value="{% url 'data-compare' %}?migration={{ job.pk }}" {% if selected.pk == job.pk %}selected{% endif %}>{{ forloop.revcounter }}. {{ job.name }} — {{ job.source.database }} → {{ job.target.database }}</option>{% endfor %}</select></div>
         <div class="field"><label for="table">Table</label><select id="table" disabled><option>Loading live tables…</option></select></div>
-        <button class="btn" type="button" id="compare" disabled>Compare data</button>
+        <div class="btn-row"><button class="btn" type="button" id="compare" disabled>Compare data</button><button class="btn btn-outline" type="button" id="verify-all" disabled>Verify entire table</button></div>
     </div>
 </div>
 <section class="card" id="data-result"><div class="data-loading"><div class="data-spinner"></div>Discovering tables in both databases…</div></section>
 
 <script>
 (() => {
-    const app=document.getElementById('data-app'), table=document.getElementById('table'), button=document.getElementById('compare'), result=document.getElementById('data-result');
+    const app=document.getElementById('data-app'), table=document.getElementById('table'), button=document.getElementById('compare'), verifyAll=document.getElementById('verify-all'), result=document.getElementById('data-result');
     const escape=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const badge=s=>({match:'<span class="badge badge-ok">Exact match</span>',different:'<span class="badge badge-warn">Values differ</span>',source_only:'<span class="badge badge-fail">Source only</span>',target_only:'<span class="badge badge-fail">Target only</span>'}[s]);
     const display=v=>v===null?'<span class="null">NULL</span>':v===''?'<span class="null">empty string</span>':escape(typeof v==='object'?JSON.stringify(v):v);
@@ -66,7 +66,7 @@
             if(!response.ok)throw new Error(data.error||'Table discovery failed');
             const common=data.tables.filter(t=>t.status==='both');
             table.innerHTML=common.length?common.map(t=>`<option value="${escape(t.key)}">${escape(t.source_name)} · ${t.source_columns} / ${t.target_columns} columns</option>`).join(''):'<option>No shared tables found</option>';
-            table.disabled=!common.length;button.disabled=!common.length;
+            table.disabled=!common.length;button.disabled=!common.length;verifyAll.disabled=!common.length;
             if(common.length)load(1);else result.innerHTML='<div class="empty-state"><div class="big">∅</div><h2>No shared tables</h2><p>The selected databases do not currently contain a matching table.</p></div>';
         }catch(e){failure('Could not load tables',e.message,discover)}
     }
@@ -88,7 +88,18 @@
             document.getElementById('previous').onclick=()=>load(data.page-1);document.getElementById('next').onclick=()=>load(data.page+1);
         }catch(e){failure('Could not compare table data',e.message,()=>load(page))}finally{button.disabled=false}
     }
-    button.addEventListener('click',()=>load(1));table.addEventListener('change',()=>load(1));discover();
+    async function exhaustive(){
+        loading('Streaming and fingerprinting every row in both databases…');button.disabled=true;verifyAll.disabled=true;
+        try{
+            const url=new URL(app.dataset.checksumUrl,window.location.origin);url.searchParams.set('table',table.value);
+            const response=await fetch(url,{headers:{'X-Requested-With':'XMLHttpRequest'}}),data=await response.json();
+            if(!response.ok)throw new Error(data.error||'Exhaustive verification failed');
+            const state=data.exact_match?'<span class="badge badge-ok">Entire table is identical</span>':'<span class="badge badge-fail">Table is not identical</span>';
+            result.innerHTML=`<div class="data-toolbar"><div><h2 class="panel-title" style="margin:0 0 4px">Exhaustive verification</h2><div class="subtitle" style="margin:0">Every row and every shared value was read from both live databases.</div></div>${state}</div><div class="meta-list"><div><span class="label">Source rows</span>${data.source.rows}</div><div><span class="label">Target rows</span>${data.target.rows}</div><div><span class="label">Columns checked</span>${data.columns_checked}</div><div><span class="label">Algorithm</span>${escape(data.algorithm)}</div></div><h3>Source fingerprint</h3><pre class="code-block">${escape(data.source.sha256)}</pre><h3>Target fingerprint</h3><pre class="code-block">${escape(data.target.sha256)}</pre><div class="btn-row" style="margin-top:18px"><button class="btn btn-outline" id="back-rows">Browse rows</button><a class="btn" href="${escape(url.toString())}&download=1">Download report</a></div>`;
+            document.getElementById('back-rows').onclick=()=>load(1);
+        }catch(e){failure('Could not verify the entire table',e.message,exhaustive)}finally{button.disabled=false;verifyAll.disabled=false}
+    }
+    button.addEventListener('click',()=>load(1));verifyAll.addEventListener('click',exhaustive);table.addEventListener('change',()=>load(1));discover();
 })();
 </script>
 {% else %}

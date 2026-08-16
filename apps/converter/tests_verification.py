@@ -6,6 +6,7 @@ from django.test import SimpleTestCase
 from engine.schema import Column, Constraint, Database, Table, View
 from .verification_service import (
     _objects, _pair, compare_live, compare_live_table_data, list_live_data_tables,
+    verify_live_table_checksum,
 )
 
 
@@ -76,3 +77,22 @@ class VerificationServiceTests(SimpleTestCase):
         self.assertEqual(result["counts"]["match"], 1)
         self.assertEqual(result["counts"]["different"], 1)
         self.assertEqual(result["rows"][1]["target"]["name"], "Notebook")
+
+    @patch("apps.converter.verification_service.connector_for")
+    def test_exhaustive_fingerprint_is_order_independent_and_detects_changes(self, connector_for):
+        table = Table("public.products", [Column("id", "integer"), Column("name", "text")])
+        database = Database("db", "postgres", tables=[table])
+
+        def fake(rows):
+            return SimpleNamespace(
+                extract_schema=lambda: database, close=lambda: None,
+                iter_table_rows=lambda *args, **kwargs: iter([rows]),
+            )
+
+        connector_for.side_effect = [fake([(1, "Pen"), (2, "Book")]), fake([(2, "Book"), (1, "Pen")])]
+        matching = verify_live_table_checksum(object(), object(), "products")
+        self.assertTrue(matching["exact_match"])
+
+        connector_for.side_effect = [fake([(1, "Pen")]), fake([(1, "Pencil")])]
+        changed = verify_live_table_checksum(object(), object(), "products")
+        self.assertFalse(changed["exact_match"])

@@ -15,6 +15,7 @@ from engine.service import convert_sql, UnsupportedStatementTypeError
 from . import migration_service
 from .verification_service import (
     SECTION_LABELS, compare_live, compare_live_table_data, list_live_data_tables,
+    verify_live_table_checksum,
 )
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 
@@ -179,29 +180,41 @@ def migrate_view(request):
     # Clean up expired batches after a process restart, when the original
     # in-memory finalizer timer no longer exists.
     MigrationJob.objects.filter(pending_deletion_at__lte=timezone.now()).delete()
+    assessment = None
     if request.method == "POST":
-        active = MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first()
-        if active:
-            messages.warning(request, f"Migration #{active.pk} is already running.")
-            return redirect("migrate-detail", pk=active.pk)
+        action = request.POST.get("action", "run")
         source = get_object_or_404(DatabaseConnection, pk=request.POST.get("source"))
         target = get_object_or_404(DatabaseConnection, pk=request.POST.get("target"))
-        copy_data = request.POST.get("copy_data") == "on"
-        reset_target = request.POST.get("reset_target") == "on"
+        if source.pk == target.pk:
+            messages.error(request, "Source and target must be different connections.")
+            return redirect("migrate")
+        if action == "assess":
+            try:
+                assessment = migration_service.assess_migration(source, target)
+                messages.success(request, "Read-only migration assessment completed. No target changes were made.")
+            except ConnectorError as exc:
+                messages.error(request, f"Assessment failed: {exc}")
+        else:
+            active = MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first()
+            if active:
+                messages.warning(request, f"Migration #{active.pk} is already running.")
+                return redirect("migrate-detail", pk=active.pk)
+            copy_data = request.POST.get("copy_data") == "on"
+            reset_target = request.POST.get("reset_target") == "on"
 
-        job = MigrationJob(
-            name=request.POST.get("name", "").strip() or f"{source.name} → {target.name}",
-            source=source,
-            target=target,
-            copy_data=copy_data,
-            reset_target=reset_target,
-            status=MigrationJob.Status.RUNNING,
-            started_at=timezone.now(),
-            created_by=request.user if request.user.is_authenticated else None,
-        )
-        job.save()
-        threading.Thread(target=_run_migration_job, args=(job.pk,), daemon=True).start()
-        return redirect("migrate-detail", pk=job.pk)
+            job = MigrationJob(
+                name=request.POST.get("name", "").strip() or f"{source.name} → {target.name}",
+                source=source,
+                target=target,
+                copy_data=copy_data,
+                reset_target=reset_target,
+                status=MigrationJob.Status.RUNNING,
+                started_at=timezone.now(),
+                created_by=request.user if request.user.is_authenticated else None,
+            )
+            job.save()
+            threading.Thread(target=_run_migration_job, args=(job.pk,), daemon=True).start()
+            return redirect("migrate-detail", pk=job.pk)
 
     undo = request.session.get("migration_delete_undo")
     if undo and undo.get("deadline_ms", 0) <= int(timezone.now().timestamp() * 1000):
@@ -212,6 +225,7 @@ def migrate_view(request):
         "recent_jobs": MigrationJob.objects.filter(pending_deletion_token__isnull=True).order_by("-created_at", "-pk"),
         "running_job": MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first(),
         "undo_deletion": undo,
+        "assessment": assessment,
     }
     return render(request, "converter/migrate.html", context)
 
@@ -428,3 +442,23 @@ def data_compare_rows_view(request, pk):
         return JsonResponse({"error": str(exc)}, status=400)
     except Exception as exc:
         return JsonResponse({"error": f"Data comparison failed: {exc}"}, status=500)
+
+
+@require_GET
+def data_compare_checksum_view(request, pk):
+    job = get_object_or_404(
+        MigrationJob.objects.select_related("source", "target"), pk=pk,
+        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL],
+        pending_deletion_token__isnull=True,
+    )
+    table = request.GET.get("table", "").strip().casefold()
+    try:
+        result = verify_live_table_checksum(job.source, job.target, table)
+        response = JsonResponse(result)
+        if request.GET.get("download") == "1":
+            response["Content-Disposition"] = f'attachment; filename="{table}-verification.json"'
+        return response
+    except (ConnectorError, ValueError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return JsonResponse({"error": f"Exhaustive verification failed: {exc}"}, status=500)

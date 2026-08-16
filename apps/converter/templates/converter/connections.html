@@ -86,12 +86,12 @@
                                 <form method="post">{% csrf_token %}
                                     <input type="hidden" name="action" value="test">
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
-                                    <button type="submit" class="btn btn-sm btn-outline">Test</button>
+                                    <button type="submit" class="btn btn-sm btn-outline history-action-btn">Test</button>
                                 </form>
                                 <form method="post" data-confirm data-confirm-title="Delete connection?" data-confirm-message="{{ conn.name }} will be removed. Saved migrations using this connection may also be deleted.">{% csrf_token %}
                                     <input type="hidden" name="action" value="delete">
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
-                                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                                    <button type="submit" class="btn btn-sm btn-delete-soft history-action-btn">Delete</button>
                                 </form>
                             </div>
                         </td>

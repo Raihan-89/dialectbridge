@@ -12,6 +12,18 @@
     {% endfor %}
 {% endif %}
 
+{% if assessment %}
+<div class="card">
+    <div class="section-head"><h2 class="panel-title">Pre-migration assessment</h2><span class="badge {% if assessment.readiness == 'ready' %}badge-ok{% elif assessment.readiness == 'blocked' %}badge-fail{% else %}badge-warn{% endif %}">{{ assessment.readiness|title }}</span></div>
+    <div class="meta-list">
+        <div><span class="label">Tables</span>{{ assessment.counts.tables }}</div><div><span class="label">Views</span>{{ assessment.counts.views }}</div><div><span class="label">Routines</span>{{ assessment.counts.functions|add:assessment.counts.procedures }}</div><div><span class="label">Generated statements</span>{{ assessment.statement_count }}</div>
+    </div>
+    {% if assessment.blockers %}<h3>Blocking compatibility findings</h3>{% for item in assessment.blockers %}<div class="alert alert-error">{{ item }}</div>{% endfor %}{% endif %}
+    {% if assessment.warnings %}<details><summary style="cursor:pointer;font-weight:700">All warnings ({{ assessment.warnings|length }})</summary><div style="margin-top:12px">{% for item in assessment.warnings %}<div class="alert alert-warning">{{ item }}</div>{% endfor %}</div></details>{% endif %}
+    <details style="margin-top:16px"><summary style="cursor:pointer;font-weight:700">Preview generated target DDL (dry run)</summary><pre class="code-block" style="margin-top:12px;max-height:520px">{{ assessment.ddl }}</pre></details>
+</div>
+{% endif %}
+
 <div class="grid-2 migration-layout">
     <div class="card">
         <h2 class="panel-title">Run Migration</h2>
@@ -43,9 +55,10 @@
             </div>
             <label class="checkbox-line"><input type="checkbox" name="copy_data" checked> Copy table data</label>
             <label class="checkbox-line"><input type="checkbox" name="reset_target"> <span>Drop target schemas before migrating <span class="badge badge-warn">destructive</span></span></label>
-            <button type="submit" class="btn" id="run-migration" {% if running_job %}disabled{% endif %}>
+            <button type="submit" name="action" value="run" class="btn" id="run-migration" {% if running_job %}disabled{% endif %}>
                 {% if running_job %}Migration in progress…{% else %}Run Migration{% endif %}
             </button>
+            <button type="submit" name="action" value="assess" class="btn btn-outline">Assess &amp; preview first</button>
         </form>
         {% else %}
         <div class="empty-state">

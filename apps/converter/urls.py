@@ -32,4 +32,5 @@ urlpatterns = [
     path("data/", web_views.data_compare_view, name="data-compare"),
     path("data/<int:pk>/tables/", web_views.data_compare_tables_view, name="data-compare-tables"),
     path("data/<int:pk>/rows/", web_views.data_compare_rows_view, name="data-compare-rows"),
+    path("data/<int:pk>/checksum/", web_views.data_compare_checksum_view, name="data-compare-checksum"),
 ]

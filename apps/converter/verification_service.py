@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 from datetime import date, datetime, time
 from decimal import Decimal
 from itertools import zip_longest
@@ -309,6 +311,73 @@ def compare_live_table_data(source_connection, target_connection, table_key: str
             "rows": paired,
             "has_previous": page > 1,
             "has_next": page * page_size < max(source_count, target_count),
+        }
+    finally:
+        source.close()
+        target.close()
+
+
+def _table_fingerprint(connector, table, columns, order_columns) -> dict:
+    """Stream a complete table into an order-independent multiset digest."""
+    total = 0
+    digest_sum = 0
+    digest_xor = 0
+    int_columns = [
+        column.name for column in table.columns
+        if _key(column.name) in {_key(name) for name in columns}
+        and column.data_type.split("(", 1)[0].strip().upper() in {"BIGINT", "INT", "INTEGER", "SMALLINT", "TINYINT"}
+    ]
+    for batch in connector.iter_table_rows(
+        table.name, columns, order_columns, batch_size=5000, int_columns=int_columns,
+    ):
+        for row in batch:
+            normalized = [_json_value(value) for value in row]
+            payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            value = int.from_bytes(hashlib.sha256(payload).digest(), "big")
+            digest_sum = (digest_sum + value) % (1 << 256)
+            digest_xor ^= value
+            total += 1
+    combined = hashlib.sha256(
+        total.to_bytes(16, "big") + digest_sum.to_bytes(32, "big") + digest_xor.to_bytes(32, "big")
+    ).hexdigest()
+    return {"rows": total, "sha256": combined}
+
+
+def verify_live_table_checksum(source_connection, target_connection, table_key: str) -> dict:
+    """Exhaustively stream and fingerprint every shared value in a table."""
+    source = connector_for(source_connection)
+    target = connector_for(target_connection)
+    try:
+        source_tables = _table_map(source.extract_schema())
+        target_tables = _table_map(target.extract_schema())
+        source_table, target_table = source_tables.get(table_key), target_tables.get(table_key)
+        if not source_table or not target_table:
+            raise ValueError("This table is not present in both databases.")
+        source_columns = {_key(c.name): c.name for c in source_table.columns}
+        target_columns = {_key(c.name): c.name for c in target_table.columns}
+        common = [key for key in source_columns if key in target_columns]
+        if not common:
+            raise ValueError("This table has no comparable columns.")
+        source_only = [c.name for c in source_table.columns if _key(c.name) not in target_columns]
+        target_only = [c.name for c in target_table.columns if _key(c.name) not in source_columns]
+        source_pk = [_key(c) for c in (source_table.primary_key.columns if source_table.primary_key else [])]
+        target_pk = {_key(c) for c in (target_table.primary_key.columns if target_table.primary_key else [])}
+        key_columns = [key for key in source_pk if key in target_pk and key in common]
+        shared_pk = bool(key_columns) and len(key_columns) == len(source_pk)
+        left = _table_fingerprint(
+            source, source_table, [source_columns[key] for key in common],
+            [source_columns[key] for key in key_columns] if shared_pk else [],
+        )
+        right = _table_fingerprint(
+            target, target_table, [target_columns[key] for key in common],
+            [target_columns[key] for key in key_columns] if shared_pk else [],
+        )
+        exact = not source_only and not target_only and left == right
+        return {
+            "table": table_key, "source_name": source_table.name, "target_name": target_table.name,
+            "columns_checked": len(common), "source_only_columns": source_only,
+            "target_only_columns": target_only, "source": left, "target": right,
+            "exact_match": exact, "algorithm": "canonical-row-multiset-sha256-v1",
         }
     finally:
         source.close()

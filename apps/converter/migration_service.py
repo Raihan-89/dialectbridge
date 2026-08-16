@@ -8,6 +8,7 @@ and the API.
 from engine.connectors.base import ConnectorError
 from engine.connectors import build_connector
 from engine.migration.orchestrator import MigrationOrchestrator
+from engine.translators.sql_builder import build_database_ddl
 from .models import DatabaseConnection, MigrationError, MigrationJob
 
 
@@ -45,6 +46,37 @@ def run_migration(source: DatabaseConnection, target: DatabaseConnection,
             progress_callback=progress_callback,
         ).run()
         return report.to_dict()
+    finally:
+        source_conn.close()
+        target_conn.close()
+
+
+def assess_migration(source: DatabaseConnection, target: DatabaseConnection) -> dict:
+    """Perform a read-only compatibility assessment and generate target DDL."""
+    source_conn = connector_for(source)
+    target_conn = connector_for(target)
+    try:
+        source_schema = source_conn.extract_schema()
+        target_version = target_conn.test()
+        dialect = "tsql" if target.engine == DatabaseConnection.Engine.MSSQL else "postgres"
+        statements, conversion_warnings = build_database_ddl(source_schema, dialect)
+        counts = {
+            name: len(getattr(source_schema, name))
+            for name in ("tables", "views", "functions", "procedures", "triggers", "sequences", "types", "synonyms")
+        }
+        blockers = [warning for warning in source_schema.warnings + conversion_warnings
+                    if "no clean" in warning.lower() or "skipped" in warning.lower() or "could not" in warning.lower()]
+        return {
+            "source_database": source.database,
+            "target_database": target.database,
+            "target_version": target_version,
+            "counts": counts,
+            "statement_count": len(statements),
+            "warnings": source_schema.warnings + conversion_warnings,
+            "blockers": blockers,
+            "readiness": "blocked" if blockers else ("review" if source_schema.warnings or conversion_warnings else "ready"),
+            "ddl": "\n\n".join(statement.rstrip(";") + ";" for statement in statements),
+        }
     finally:
         source_conn.close()
         target_conn.close()
