@@ -18,16 +18,17 @@ import re
 from engine.translators.functions import translate_functions
 from engine.translators.sql_builder import convert_type, fix_boolean_predicates, _translate_top
 
+# A T-SQL type token: int, [int], decimal(18,2), [decimal](18,2), varchar(50),
+# or a user-defined schema-qualified type such as dbo.ProductBulkType.
+_TSQL_TYPE_RE = r"\[?[A-Za-z_][A-Za-z0-9_]*\]?(?:\s*\.\s*\[?[A-Za-z_][A-Za-z0-9_]*\]?)?\s*(?:\([^)]*\))?"
+
 PARAM_RE = re.compile(
-    r"@([A-Za-z_][A-Za-z0-9_]*)\s+"
-    r"(\[?[A-Za-z_][A-Za-z0-9_]*\]?\s*(?:\([^)]*\))?)"
+    rf"@([A-Za-z_][A-Za-z0-9_]*)\s+"
+    rf"({_TSQL_TYPE_RE})"
     r"\s*(OUTPUT|OUT)?"
     r"(?:\s*=\s*[^,]+)?",
     re.IGNORECASE,
 )
-
-# A T-SQL type token: int, [int], decimal(18,2), [decimal](18,2), varchar(50)
-_TSQL_TYPE_RE = r"\[?[A-Za-z_][A-Za-z0-9_]*\]?\s*(?:\([^)]*\))?"
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +182,7 @@ def _parse_params(param_text: str, source: str) -> tuple[list[tuple[str, str, bo
     if not param_text.strip():
         return params, warnings
     for pname, ptype, output in PARAM_RE.findall(param_text):
-        params.append((pname, ptype, bool(output)))
+        params.append((pname, ptype.strip(), bool(output)))
     return params, warnings
 
 

@@ -245,7 +245,7 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
   - Trigger header tolerance: `WITH EXECUTE AS`/`NOT FOR REPLICATION`; compact trigger bodies with `RAISERROR` → `RAISE EXCEPTION`.
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched keyset inserts, `reset_target` schema drops.
 
-Current verification: `python manage.py test apps.converter` runs **114 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test apps.converter` runs **115 tests**; `python manage.py check` reports no issues.
 
 ---
 

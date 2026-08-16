@@ -193,6 +193,18 @@ END"""
         self.assertIn("CategoryID INTEGER", converted)
         self.assertIn("minprice NUMERIC(18,2)", converted)
 
+    def test_tsql_user_defined_param_type_warns_with_full_name(self):
+        tsql = """CREATE PROCEDURE dbo.sp_BulkInsertProducts
+@Products dbo.ProductBulkType READONLY
+AS BEGIN
+INSERT INTO dbo.ProductMaster (ProductName) SELECT ProductName FROM @Products;
+END"""
+        converted, warnings = translate_routine(tsql, source="procedure", target="postgres")
+        self.assertIn("Products TEXT", converted)
+        self.assertTrue(any(
+            "Parameter @Products type 'dbo.ProductBulkType'" in w
+            and "DBO.PRODUCTBULKTYPE" in w for w in warnings))
+
     def test_postgres_unbounded_routine_types_map_without_warnings(self):
         pg_fn = """CREATE FUNCTION dbo.f(searchterm character varying, amount numeric)
 RETURNS numeric LANGUAGE plpgsql AS $$ BEGIN RETURN amount; END; $$"""
