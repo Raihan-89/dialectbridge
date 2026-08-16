@@ -3,8 +3,10 @@ from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
-from engine.schema import Column, Database, Table, View
-from .verification_service import _objects, _pair, compare_live
+from engine.schema import Column, Constraint, Database, Table, View
+from .verification_service import (
+    _objects, _pair, compare_live, compare_live_table_data, list_live_data_tables,
+)
 
 
 class VerificationServiceTests(SimpleTestCase):
@@ -33,3 +35,44 @@ class VerificationServiceTests(SimpleTestCase):
 
         self.assertTrue(result["all_match"])
         self.assertEqual(result["counts"]["match"], 8)
+
+    @patch("apps.converter.verification_service.connector_for")
+    def test_lists_shared_and_one_sided_data_tables(self, connector_for):
+        source_db = Database("source", "postgres", tables=[Table("public.Products", []), Table("public.Legacy", [])])
+        target_db = Database("target", "tsql", tables=[Table("dbo.products", [])])
+        connector_for.side_effect = [
+            SimpleNamespace(extract_schema=lambda: source_db, close=lambda: None),
+            SimpleNamespace(extract_schema=lambda: target_db, close=lambda: None),
+        ]
+
+        result = list_live_data_tables(object(), object())
+
+        self.assertEqual([table["key"] for table in result["tables"]], ["legacy", "products"])
+        self.assertEqual(result["tables"][0]["status"], "source_only")
+        self.assertEqual(result["tables"][1]["status"], "both")
+
+    @patch("apps.converter.verification_service.connector_for")
+    def test_compares_table_rows_by_shared_primary_key(self, connector_for):
+        source_table = Table("public.Products", [Column("Id", "integer"), Column("Name", "text")], Constraint("products_pkey", ["Id"]))
+        target_table = Table("dbo.products", [Column("id", "int"), Column("name", "nvarchar")], Constraint("PK_products", ["id"]))
+        source_db = Database("source", "postgres", tables=[source_table])
+        target_db = Database("target", "tsql", tables=[target_table])
+
+        def fake(db, dialect, rows):
+            return SimpleNamespace(
+                dialect=dialect, extract_schema=lambda: db, fetch=lambda sql: rows,
+                count_rows=lambda name: len(rows), close=lambda: None,
+                quote_ident=lambda name: ".".join(f'[{part}]' for part in name.split(".")) if dialect == "tsql" else ".".join(f'"{part}"' for part in name.split(".")),
+            )
+
+        connector_for.side_effect = [
+            fake(source_db, "postgres", [(1, "Pen"), (2, "Book")]),
+            fake(target_db, "tsql", [(1, "Pen"), (2, "Notebook")]),
+        ]
+
+        result = compare_live_table_data(object(), object(), "products")
+
+        self.assertTrue(result["has_shared_pk"])
+        self.assertEqual(result["counts"]["match"], 1)
+        self.assertEqual(result["counts"]["different"], 1)
+        self.assertEqual(result["rows"][1]["target"]["name"], "Notebook")

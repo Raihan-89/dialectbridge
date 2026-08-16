@@ -1,0 +1,97 @@
+{% extends "converter/base.html" %}
+{% block title %}Data Comparison — SQL Conversion Engine{% endblock %}
+{% block nav_data %}active{% endblock %}
+{% block content %}
+<style>
+    .data-route { display:grid; grid-template-columns:minmax(0,1fr) 68px minmax(0,1fr); gap:14px; align-items:center; margin-top:24px; position:relative; z-index:1; }
+    .data-db { padding:16px; border:1px solid rgba(255,255,255,.18); border-radius:12px; background:rgba(255,255,255,.09); backdrop-filter:blur(8px); }
+    .data-db small { display:block; color:#a5b4fc; text-transform:uppercase; letter-spacing:.08em; font-size:10px; font-weight:800; }
+    .data-db strong { display:block; margin:3px 0; }
+    .data-db span { color:#dbeafe; font-size:12px; }
+    .data-arrow { text-align:center; color:#bfdbfe; font-size:26px; }
+    .data-controls { display:grid; grid-template-columns:minmax(220px,1fr) minmax(220px,1fr) auto; gap:14px; align-items:end; }
+    .data-toolbar { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap; margin-bottom:16px; }
+    .data-summary { display:flex; gap:7px; flex-wrap:wrap; }
+    .record { border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-bottom:12px; background:#fff; }
+    .record-head { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 14px; background:linear-gradient(180deg,#fbfcff,#f5f7fc); border-bottom:1px solid var(--border); }
+    .record-key { color:var(--muted); font:600 12px var(--font-mono); overflow-wrap:anywhere; }
+    .record-sides { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+    .record-side { padding:14px; min-width:0; }
+    .record-side + .record-side { border-left:1px solid var(--border); background:#fcfcff; }
+    .record-label { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:.07em; text-transform:uppercase; margin-bottom:10px; }
+    .value-grid { display:grid; grid-template-columns:minmax(100px,.45fr) minmax(0,1fr); gap:0; border:1px solid var(--border); border-radius:9px; overflow:hidden; }
+    .value-grid > div { padding:8px 10px; border-bottom:1px solid var(--border); min-width:0; overflow-wrap:anywhere; }
+    .value-grid > div:nth-last-child(-n+2) { border-bottom:0; }
+    .value-name { color:var(--muted); background:#f8fafc; font:600 11px var(--font-mono); }
+    .value { font:12px var(--font-mono); white-space:pre-wrap; word-break:break-word; }
+    .value.changed { color:#92400e; background:var(--warning-soft); }
+    .null { color:#94a3b8; font-style:italic; }
+    .data-pagination { display:flex; justify-content:center; align-items:center; gap:12px; margin-top:18px; }
+    .data-loading { padding:70px 20px; text-align:center; color:var(--muted); }
+    .data-spinner { width:32px; height:32px; margin:0 auto 14px; border:3px solid #e0e7ff; border-top-color:var(--primary); border-radius:50%; animation:data-spin .75s linear infinite; }
+    @keyframes data-spin { to { transform:rotate(360deg); } }
+    @media(max-width:800px){ .data-route{grid-template-columns:1fr}.data-arrow{transform:rotate(90deg)}.data-controls{grid-template-columns:1fr}.record-sides{grid-template-columns:1fr}.record-side+.record-side{border-left:0;border-top:1px solid var(--border)} }
+    @media(max-width:600px){ .value-grid{grid-template-columns:90px minmax(0,1fr)} }
+</style>
+
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">≡</div><div class="page-hero-copy"><p class="page-hero-kicker">Row-level verification</p><h1 class="page-title">Migration data explorer</h1><p class="subtitle">Inspect actual table records from both live databases and see whether each migrated value is identical.</p></div></div>
+    {% if selected %}<div class="data-route"><div class="data-db"><small>Source database</small><strong>{{ selected.source.name }}</strong><span>{{ selected.source.get_engine_display }} · {{ selected.source.database }}</span></div><div class="data-arrow">→</div><div class="data-db"><small>Target database</small><strong>{{ selected.target.name }}</strong><span>{{ selected.target.get_engine_display }} · {{ selected.target.database }}</span></div></div>{% endif %}
+</div>
+
+{% if selected %}
+<div class="card" id="data-app" data-tables-url="{% url 'data-compare-tables' selected.pk %}" data-rows-url="{% url 'data-compare-rows' selected.pk %}">
+    <div class="data-controls">
+        <div class="field"><label for="migration">Migration</label><select id="migration">{% for job in jobs %}<option value="{% url 'data-compare' %}?migration={{ job.pk }}" {% if selected.pk == job.pk %}selected{% endif %}>{{ forloop.revcounter }}. {{ job.name }} — {{ job.source.database }} → {{ job.target.database }}</option>{% endfor %}</select></div>
+        <div class="field"><label for="table">Table</label><select id="table" disabled><option>Loading live tables…</option></select></div>
+        <button class="btn" type="button" id="compare" disabled>Compare data</button>
+    </div>
+</div>
+<section class="card" id="data-result"><div class="data-loading"><div class="data-spinner"></div>Discovering tables in both databases…</div></section>
+
+<script>
+(() => {
+    const app=document.getElementById('data-app'), table=document.getElementById('table'), button=document.getElementById('compare'), result=document.getElementById('data-result');
+    const escape=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const badge=s=>({match:'<span class="badge badge-ok">Exact match</span>',different:'<span class="badge badge-warn">Values differ</span>',source_only:'<span class="badge badge-fail">Source only</span>',target_only:'<span class="badge badge-fail">Target only</span>'}[s]);
+    const display=v=>v===null?'<span class="null">NULL</span>':v===''?'<span class="null">empty string</span>':escape(typeof v==='object'?JSON.stringify(v):v);
+    const loading=message=>result.innerHTML=`<div class="data-loading"><div class="data-spinner"></div>${escape(message)}</div>`;
+    const failure=(title,message,retry)=>{result.innerHTML=`<div class="empty-state"><div class="big">!</div><h2>${escape(title)}</h2><p>${escape(message)}</p><button class="btn btn-outline" id="data-retry">Try again</button></div>`;document.getElementById('data-retry').onclick=retry;};
+    document.getElementById('migration').addEventListener('change',e=>window.location=e.target.value);
+
+    async function discover(){
+        loading('Discovering tables in both databases…');
+        try{
+            const response=await fetch(app.dataset.tablesUrl,{headers:{'X-Requested-With':'XMLHttpRequest'}}),data=await response.json();
+            if(!response.ok)throw new Error(data.error||'Table discovery failed');
+            const common=data.tables.filter(t=>t.status==='both');
+            table.innerHTML=common.length?common.map(t=>`<option value="${escape(t.key)}">${escape(t.source_name)} · ${t.source_columns} / ${t.target_columns} columns</option>`).join(''):'<option>No shared tables found</option>';
+            table.disabled=!common.length;button.disabled=!common.length;
+            if(common.length)load(1);else result.innerHTML='<div class="empty-state"><div class="big">∅</div><h2>No shared tables</h2><p>The selected databases do not currently contain a matching table.</p></div>';
+        }catch(e){failure('Could not load tables',e.message,discover)}
+    }
+    async function load(page){
+        loading(`Reading page ${page} from both live databases…`);button.disabled=true;
+        try{
+            const url=new URL(app.dataset.rowsUrl,window.location.origin);url.searchParams.set('table',table.value);url.searchParams.set('page',page);
+            const response=await fetch(url,{headers:{'X-Requested-With':'XMLHttpRequest'}}),data=await response.json();
+            if(!response.ok)throw new Error(data.error||'Data comparison failed');
+            const summary=`<span class="badge badge-neutral">Source: ${data.source_count} rows</span><span class="badge badge-neutral">Target: ${data.target_count} rows</span><span class="badge badge-ok">${data.counts.match} exact</span>${data.counts.different?`<span class="badge badge-warn">${data.counts.different} changed</span>`:''}${data.counts.source_only?`<span class="badge badge-fail">${data.counts.source_only} source only</span>`:''}${data.counts.target_only?`<span class="badge badge-fail">${data.counts.target_only} target only</span>`:''}`;
+            const warning=data.has_shared_pk?'':`<div class="alert alert-warning">This table has no shared primary key. Rows on this page are compared by position, so add a primary key for guaranteed row alignment.</div>`;
+            const columnWarning=(data.source_only_columns.length||data.target_only_columns.length)?`<div class="alert alert-warning">Columns not shared by both databases are excluded. Source only: ${escape(data.source_only_columns.join(', ')||'none')}. Target only: ${escape(data.target_only_columns.join(', ')||'none')}.</div>`:'';
+            const records=data.rows.map(row=>{
+                const side=(values,other,label)=>values?`<div class="record-side"><div class="record-label">${label}</div><div class="value-grid">${data.columns.map(c=>`<div class="value-name">${escape(label==='Source'?c.source:c.target)}</div><div class="value ${other&&values[c.key]!==other[c.key]?'changed':''}">${display(values[c.key])}</div>`).join('')}</div></div>`:`<div class="record-side"><div class="record-label">${label}</div><div class="empty-state">Row not present</div></div>`;
+                return `<article class="record"><div class="record-head"><span class="record-key">${data.has_shared_pk?'Key':'Row'}: ${escape(Array.isArray(row.key)?row.key.join(' · '):row.key)}</span>${badge(row.status)}</div><div class="record-sides">${side(row.source,row.target,'Source')}${side(row.target,row.source,'Target')}</div></article>`;
+            }).join('')||'<div class="empty-state">No rows on this page.</div>';
+            const pagination=`<div class="data-pagination"><button class="btn btn-outline" id="previous" ${data.has_previous?'':'disabled'}>← Previous</button><span class="badge badge-neutral">Page ${data.page}</span><button class="btn btn-outline" id="next" ${data.has_next?'':'disabled'}>Next →</button></div>`;
+            result.innerHTML=`<div class="data-toolbar"><div><h2 class="panel-title" style="margin:0 0 4px">${escape(data.source_name)}</h2><div class="subtitle" style="margin:0">Comparing ${data.columns.length} shared columns · 50 rows per page</div></div><div class="data-summary">${summary}</div></div>${warning}${columnWarning}${records}${pagination}`;
+            document.getElementById('previous').onclick=()=>load(data.page-1);document.getElementById('next').onclick=()=>load(data.page+1);
+        }catch(e){failure('Could not compare table data',e.message,()=>load(page))}finally{button.disabled=false}
+    }
+    button.addEventListener('click',()=>load(1));table.addEventListener('change',()=>load(1));discover();
+})();
+</script>
+{% else %}
+<div class="card empty-state"><div class="big">≡</div><h2>No completed migration yet</h2><p>Complete a migration first, then return here to inspect its table data.</p><a class="btn" href="{% url 'migrate' %}">Go to migrations</a></div>
+{% endif %}
+{% endblock %}

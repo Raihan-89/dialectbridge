@@ -29,4 +29,7 @@ urlpatterns = [
     path("errors/", web_views.errors_view, name="errors"),
     path("verify/", web_views.verify_view, name="verify"),
     path("verify/<int:pk>/<str:section>/", web_views.verify_section_view, name="verify-section"),
+    path("data/", web_views.data_compare_view, name="data-compare"),
+    path("data/<int:pk>/tables/", web_views.data_compare_tables_view, name="data-compare-tables"),
+    path("data/<int:pk>/rows/", web_views.data_compare_rows_view, name="data-compare-rows"),
 ]

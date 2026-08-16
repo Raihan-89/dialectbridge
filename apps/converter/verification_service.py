@@ -1,7 +1,12 @@
 """Read-only, live source/target database comparison for the verification UI."""
 from __future__ import annotations
 
+import base64
+from datetime import date, datetime, time
+from decimal import Decimal
+from itertools import zip_longest
 from typing import Callable
+from uuid import UUID
 
 from .migration_service import connector_for
 
@@ -169,6 +174,141 @@ def compare_live(source_connection, target_connection, section: str) -> dict:
             "counts": counts,
             "total": len(rows),
             "all_match": counts["different"] == counts["source_only"] == counts["target_only"] == 0,
+        }
+    finally:
+        source.close()
+        target.close()
+
+
+def _table_map(database) -> dict:
+    return {_key(table.name): table for table in database.tables}
+
+
+def list_live_data_tables(source_connection, target_connection) -> dict:
+    """List live tables on both ends without reading application data."""
+    source = connector_for(source_connection)
+    target = connector_for(target_connection)
+    try:
+        source_tables = _table_map(source.extract_schema())
+        target_tables = _table_map(target.extract_schema())
+        tables = []
+        for key in sorted(set(source_tables) | set(target_tables)):
+            left, right = source_tables.get(key), target_tables.get(key)
+            tables.append({
+                "key": key,
+                "source_name": left.name if left else None,
+                "target_name": right.name if right else None,
+                "source_columns": len(left.columns) if left else 0,
+                "target_columns": len(right.columns) if right else 0,
+                "status": "both" if left and right else ("source_only" if left else "target_only"),
+            })
+        return {"tables": tables}
+    finally:
+        source.close()
+        target.close()
+
+
+def _json_value(value):
+    """Produce a stable, JSON-safe representation for cross-driver comparison."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "base64:" + base64.b64encode(bytes(value)).decode("ascii")
+    return str(value)
+
+
+def _fetch_page(connector, table, columns, order_columns, page, page_size):
+    selected = ", ".join(connector.quote_ident(column) for column in columns)
+    order = ", ".join(connector.quote_ident(column) for column in order_columns)
+    offset = (page - 1) * page_size
+    table_name = connector.quote_ident(table.name)
+    if connector.dialect == "tsql":
+        order_clause = order or "(SELECT NULL)"
+        sql = (
+            f"SELECT {selected} FROM {table_name} ORDER BY {order_clause} "
+            f"OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY"
+        )
+    else:
+        order_clause = f" ORDER BY {order}" if order else ""
+        sql = f"SELECT {selected} FROM {table_name}{order_clause} LIMIT {page_size} OFFSET {offset}"
+    return [tuple(_json_value(value) for value in row) for row in connector.fetch(sql)]
+
+
+def compare_live_table_data(source_connection, target_connection, table_key: str, page=1, page_size=50) -> dict:
+    """Read and compare one bounded page of source/target table data."""
+    page = max(1, int(page))
+    page_size = min(100, max(1, int(page_size)))
+    source = connector_for(source_connection)
+    target = connector_for(target_connection)
+    try:
+        source_tables = _table_map(source.extract_schema())
+        target_tables = _table_map(target.extract_schema())
+        source_table, target_table = source_tables.get(table_key), target_tables.get(table_key)
+        if not source_table or not target_table:
+            raise ValueError("This table is not present in both databases.")
+
+        source_columns = {_key(c.name): c.name for c in source_table.columns}
+        target_columns = {_key(c.name): c.name for c in target_table.columns}
+        common_keys = [k for k in source_columns if k in target_columns]
+        if not common_keys:
+            raise ValueError("This table has no comparable columns.")
+
+        source_pk = [_key(c) for c in (source_table.primary_key.columns if source_table.primary_key else [])]
+        target_pk = {_key(c) for c in (target_table.primary_key.columns if target_table.primary_key else [])}
+        key_columns = [k for k in source_pk if k in target_pk and k in common_keys]
+        has_shared_pk = bool(key_columns) and len(key_columns) == len(source_pk)
+        source_order = [source_columns[k] for k in key_columns] if has_shared_pk else []
+        target_order = [target_columns[k] for k in key_columns] if has_shared_pk else []
+        source_rows = _fetch_page(source, source_table, [source_columns[k] for k in common_keys], source_order, page, page_size)
+        target_rows = _fetch_page(target, target_table, [target_columns[k] for k in common_keys], target_order, page, page_size)
+
+        def row_dict(row):
+            return {key: value for key, value in zip(common_keys, row)}
+
+        paired = []
+        if has_shared_pk:
+            source_by_key = {tuple(row[common_keys.index(k)] for k in key_columns): row for row in source_rows}
+            target_by_key = {tuple(row[common_keys.index(k)] for k in key_columns): row for row in target_rows}
+            pairs = ((key, source_by_key.get(key), target_by_key.get(key)) for key in sorted(set(source_by_key) | set(target_by_key), key=str))
+        else:
+            pairs = ((index + 1 + (page - 1) * page_size, left, right)
+                     for index, (left, right) in enumerate(zip_longest(source_rows, target_rows)))
+        for row_key, left, right in pairs:
+            status = "source_only" if right is None else "target_only" if left is None else "match" if left == right else "different"
+            paired.append({
+                "key": list(row_key) if isinstance(row_key, tuple) else row_key,
+                "source": row_dict(left) if left is not None else None,
+                "target": row_dict(right) if right is not None else None,
+                "status": status,
+            })
+
+        source_count = source.count_rows(source_table.name)
+        target_count = target.count_rows(target_table.name)
+        counts = {status: sum(row["status"] == status for row in paired)
+                  for status in ("match", "different", "source_only", "target_only")}
+        return {
+            "table": table_key,
+            "source_name": source_table.name,
+            "target_name": target_table.name,
+            "columns": [{"key": key, "source": source_columns[key], "target": target_columns[key]} for key in common_keys],
+            "source_only_columns": [c.name for c in source_table.columns if _key(c.name) not in target_columns],
+            "target_only_columns": [c.name for c in target_table.columns if _key(c.name) not in source_columns],
+            "key_columns": key_columns,
+            "has_shared_pk": has_shared_pk,
+            "page": page,
+            "page_size": page_size,
+            "source_count": source_count,
+            "target_count": target_count,
+            "counts": counts,
+            "rows": paired,
+            "has_previous": page > 1,
+            "has_next": page * page_size < max(source_count, target_count),
         }
     finally:
         source.close()

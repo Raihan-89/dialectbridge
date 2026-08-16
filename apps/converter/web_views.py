@@ -8,12 +8,14 @@ from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 
 from engine.connectors.base import ConnectorError
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from . import migration_service
-from .verification_service import SECTION_LABELS, compare_live
+from .verification_service import (
+    SECTION_LABELS, compare_live, compare_live_table_data, list_live_data_tables,
+)
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 
 # Statement types the current engine can actually handle — others are shown
@@ -379,3 +381,50 @@ def verify_section_view(request, pk, section):
         return JsonResponse({"error": str(exc)}, status=400)
     except Exception as exc:
         return JsonResponse({"error": f"Verification query failed: {exc}"}, status=500)
+
+
+def data_compare_view(request):
+    """Read-only browser for comparing migrated table records."""
+    jobs = MigrationJob.objects.select_related("source", "target").filter(
+        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL],
+        pending_deletion_token__isnull=True,
+    ).order_by("-created_at", "-pk")
+    selected = None
+    job_id = request.GET.get("migration")
+    if job_id:
+        selected = get_object_or_404(jobs, pk=job_id)
+    elif jobs:
+        selected = jobs.first()
+    return render(request, "converter/data_compare.html", {"jobs": jobs, "selected": selected})
+
+
+@require_GET
+def data_compare_tables_view(request, pk):
+    job = get_object_or_404(
+        MigrationJob.objects.select_related("source", "target"), pk=pk,
+        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL],
+        pending_deletion_token__isnull=True,
+    )
+    try:
+        return JsonResponse(list_live_data_tables(job.source, job.target))
+    except ConnectorError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return JsonResponse({"error": f"Table discovery failed: {exc}"}, status=500)
+
+
+@require_GET
+def data_compare_rows_view(request, pk):
+    job = get_object_or_404(
+        MigrationJob.objects.select_related("source", "target"), pk=pk,
+        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL],
+        pending_deletion_token__isnull=True,
+    )
+    table = request.GET.get("table", "").strip().casefold()
+    try:
+        page = int(request.GET.get("page", 1))
+        return JsonResponse(compare_live_table_data(job.source, job.target, table, page=page))
+    except (ConnectorError, ValueError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return JsonResponse({"error": f"Data comparison failed: {exc}"}, status=500)
