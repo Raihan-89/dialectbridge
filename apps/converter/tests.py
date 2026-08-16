@@ -143,6 +143,41 @@ END; $$ LANGUAGE plpgsql;"""
         self.assertIn("WHERE [ProductID] = @ProductID", converted)
         self.assertNotIn("WHERE @ProductID = @ProductID", converted)
 
+    def test_count_variable_does_not_break_count_star(self):
+        # A local variable named Count must not be substituted inside COUNT(*),
+        # which previously produced @Count(*) and failed with error 102.
+        pg = """CREATE OR REPLACE FUNCTION dbo.fn_getproductcountbycategory(categoryid integer)
+ RETURNS integer LANGUAGE plpgsql AS $function$
+DECLARE
+  Count INTEGER;
+BEGIN
+SELECT COUNT(*) INTO Count FROM "dbo"."ProductMaster" WHERE CategoryID = CategoryID AND "IsActive" = true;
+RETURN Count;
+END;
+$function$"""
+        converted, warnings = translate_routine(pg, source="function", target="tsql")
+        self.assertIn("@Count = COUNT(*)", converted)
+        self.assertNotIn("@Count(*)", converted)
+        self.assertIn("[categoryid] = @categoryid", converted)
+
+    def test_scalar_param_used_as_row_source_gets_table_variable(self):
+        # A table-valued parameter flattened to text by an MSSQL -> PG round
+        # trip re-translates to `FROM @products p`; without a table variable
+        # SQL Server fails with "Must declare the table variable '@products'".
+        pg = """CREATE OR REPLACE PROCEDURE dbo.sp_bulkinsertproducts(IN products text,
+INOUT result_cursor refcursor DEFAULT 'result_cursor'::refcursor) LANGUAGE plpgsql AS $procedure$
+BEGIN
+INSERT INTO "dbo"."ProductMaster" ("SKU", "ProductName", "CategoryID")
+SELECT p."SKU", p."ProductName", c."CategoryID" FROM Products p
+INNER JOIN "dbo"."Category" c ON p."CategoryCode" = c."CategoryCode";
+END;
+$procedure$"""
+        converted, warnings = translate_routine(pg, source="procedure", target="tsql")
+        self.assertIn("DECLARE @products_tbl TABLE ([SKU] NVARCHAR(400)", converted)
+        self.assertIn("FROM @products_tbl p", converted)
+        self.assertIn("p.[CategoryCode] = c.[CategoryCode] COLLATE DATABASE_DEFAULT", converted)
+        self.assertNotIn("FROM @products p", converted)
+
     def test_tsql_parenthesized_params_do_not_consume_procedure_body(self):
         tsql = """CREATE PROCEDURE [dbo].[sp_search]
 (@searchterm NVARCHAR(MAX), @CategoryID INT, @minprice NUMERIC(18,2))
@@ -1068,6 +1103,177 @@ class AdvancedFeatureDDLTests(TestCase):
         self.assertEqual(to_int(7), 7)
         self.assertEqual(to_int(True), 1)
 
+    class _PgSequenceConn:
+        """Simulates a real PostgreSQL server: the pg_sequence catalog view has
+        NO `last_value` column, so PostgreSQL resolves bare `last_value` to the
+        window function and fails with "requires an OVER clause". The extractor
+        must read last_value from the pg_sequences view instead."""
+
+        database = "pg"
+
+        def __init__(self):
+            self.executed = []
+
+        def fetch(self, sql, params=None):
+            self.executed.append(sql)
+            if "pg_sequence" in sql and "pg_sequences" not in sql:
+                raise Exception("column s.last_value does not exist")
+            if "pg_sequences" in sql:
+                return [
+                    ("public.order_seq", 1, 1, True, 42, "bigint"),
+                    ("public.never_used", 1, 2, False, None, "integer"),
+                ]
+            return []
+
+    def test_postgres_sequence_extraction_reads_last_value_from_pg_sequences(self):
+        from engine.extractors.postgres import _extract_sequences, _STANDALONE_SEQ_SQL
+        conn = self._PgSequenceConn()
+        sequences = _extract_sequences(conn)
+
+        self.assertEqual(len(sequences), 2)
+        first, second = sequences
+        self.assertEqual(first.name, "public.order_seq")
+        self.assertEqual(first.start_value, 1)
+        self.assertEqual(first.increment, 1)
+        self.assertTrue(first.is_cycling)
+        self.assertEqual(first.current_value, 42)
+        self.assertEqual(first.data_type, "bigint")
+        self.assertIsNone(second.current_value)
+        self.assertEqual(second.data_type, "integer")
+
+        self.assertIn("FROM pg_sequences s", _STANDALONE_SEQ_SQL)
+        self.assertIn("s.last_value", _STANDALONE_SEQ_SQL)
+        self.assertNotIn("JOIN pg_sequence s", _STANDALONE_SEQ_SQL)
+
+    class _PgDomainConn:
+        """Simulates a PostgreSQL server answering the type queries that
+        _extract_types issues, including typnotnull for domains."""
+
+        database = "pg"
+
+        def __init__(self):
+            self.queries = []
+
+        def fetch(self, sql, params=None):
+            self.queries.append(sql)
+            if "typtype = 'd'" in sql:
+                return [
+                    ("public.no_null", 101, "text", True),
+                    ("public.may_null", 102, "integer", False),
+                ]
+            if "enumtypid" in sql or "typtype = 'e'" in sql or "typtype = 'c'" in sql:
+                return []
+            if "contypid" in sql:
+                return [("CHECK (VALUE > 0)",)]
+            return []
+
+        def fetchone(self, sql, params=None):
+            self.queries.append(sql)
+            return None
+
+    def test_postgres_domain_extraction_honors_notnull_flag(self):
+        from engine.extractors.postgres import _extract_types
+        conn = self._PgDomainConn()
+        types = _extract_types(conn)
+
+        domains = [t for t in types if t.kind == "domain"]
+        self.assertEqual(len(domains), 2)
+        no_null, may_null = domains
+        self.assertFalse(no_null.nullable)
+        self.assertEqual(no_null.base_type, "text")
+        self.assertEqual(no_null.constraints, ["CHECK (VALUE > 0)"])
+        self.assertTrue(may_null.nullable)
+        self.assertEqual(may_null.base_type, "integer")
+
+    class _PgIndexConn:
+        """Simulates a real PostgreSQL server: pg_index has NO `indam` column
+        (the index access method lives in pg_class.relam -> pg_am.amname), so
+        any query referencing ix.indam fails exactly like a live server would."""
+
+        database = "pg"
+
+        def __init__(self):
+            self.executed = []
+
+        def fetch(self, sql, params=None):
+            self.executed.append(sql)
+            if "indam" in sql.lower():
+                raise Exception("column ix.indam does not exist")
+            lower = sql.lower()
+            if "unnest(ix.indkey)" in lower:
+                return [
+                    ("idx_orders_customer", "customer_id", True, None, False, False, "btree"),
+                    ("idx_orders_customer", "order_id", True, None, False, True, "btree"),
+                ]
+            return []
+
+    def test_postgres_index_extraction_reads_method_from_pg_am_not_indam(self):
+        from engine.extractors.postgres import _extract_indexes
+        conn = self._PgIndexConn()
+        indexes = _extract_indexes(conn, 12345)
+
+        self.assertEqual(len(indexes), 1)
+        idx = indexes[0]
+        self.assertEqual(idx.name, "idx_orders_customer")
+        self.assertEqual(idx.columns, ["customer_id"])
+        self.assertEqual(idx.included_columns, ["order_id"])
+        self.assertTrue(idx.unique)
+
+        index_sql = next(s for s in conn.executed if "unnest(ix.indkey)" in s.lower())
+        self.assertIn("JOIN pg_am am ON i.relam = am.oid", index_sql)
+        self.assertIn("am.amname AS index_method", index_sql)
+        self.assertNotIn("indam", index_sql.lower())
+
+        non_btree_sql = next(s for s in conn.executed if "pg_am" in s.lower() and "amname" in s.lower() and "unnest" not in s.lower())
+        self.assertIn("am.amname <> 'btree'", non_btree_sql)
+        self.assertNotIn("indam", non_btree_sql.lower())
+
+    class _PgSecurityConn:
+        """Simulates a PostgreSQL server whose default table ACLs grant the
+        superuser TRIGGER/TRUNCATE/MAINTAIN on every object (including internal
+        pg_toast tables). None of those map to SQL Server, and none belong to
+        migrated roles, so they must not produce per-object warnings."""
+
+        database = "pg"
+
+        def fetch(self, sql, params=None):
+            if "aclexplode" in sql:
+                if "pg_proc" in sql:
+                    return [
+                        ("dbo.fn_CheckStockAvailability", "f", "app_user", "EXECUTE", True),
+                    ]
+                return [
+                    ("pg_toast.pg_toast_1255", "t", "postgres", "TRIGGER", True),
+                    ("pg_toast.pg_toast_1255", "t", "postgres", "TRUNCATE", True),
+                    ("pg_toast.pg_toast_1255", "t", "postgres", "MAINTAIN", True),
+                    ("public.widget", "r", "postgres", "TRIGGER", True),
+                    ("public.widget", "r", "postgres", "MAINTAIN", True),
+                    ("public.widget", "r", "app_user", "SELECT", True),
+                    ("public.widget", "r", "public", "SELECT", True),
+                ]
+            if "pg_auth_members" in sql:
+                return []
+            if "rolcanlogin" in sql:
+                return [("app_user", "t", False)]
+            return []
+
+    def test_postgres_security_skips_toast_and_unmapped_privileges(self):
+        from engine.extractors.postgres import _extract_security
+        db = self._base_postgres()
+        conn = self._PgSecurityConn()
+        _extract_security(conn, db)
+        self.assertEqual(len(db.permissions), 2)
+        self.assertTrue(all(p.principal == "app_user" for p in db.permissions))
+        self.assertTrue(any(p.action == "SELECT" for p in db.permissions))
+        self.assertTrue(any(p.action == "EXECUTE" for p in db.permissions))
+        self.assertFalse(any(p.principal == "postgres" for p in db.permissions))
+        unmapped = [w for w in db.warnings if "no SQL Server equivalent" in w]
+        self.assertEqual(len(unmapped), 3)
+        self.assertTrue(any("'TRIGGER'" in w for w in unmapped))
+        self.assertTrue(any("'TRUNCATE'" in w for w in unmapped))
+        self.assertTrue(any("'MAINTAIN'" in w for w in unmapped))
+        self.assertFalse(any("pg_toast" in w for w in db.warnings))
+
     def _base_tsql(self) -> Database:
         return Database(name="src", dialect="tsql")
 
@@ -1259,6 +1465,95 @@ class AdvancedFeatureDDLTests(TestCase):
         self.assertNotIn("COLLATE", stmts[0])
         self.assertTrue(any("has no PostgreSQL equivalent" in w for w in warnings))
 
+    def test_collation_placed_before_not_null(self):
+        # COLLATE must immediately follow the data type in both dialects;
+        # emitted after NOT NULL it is invalid (T-SQL error 156).
+        db = self._base_postgres()
+        db.tables = [Table(name="public.users", columns=[
+            Column("name", "character varying(100)", collation="en_US.UTF-8", nullable=False),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn(
+            "[name] NVARCHAR(100) COLLATE Latin1_General_CI_AS NOT NULL",
+            stmts[0],
+        )
+        self.assertNotIn("NOT NULL COLLATE", stmts[0])
+
+    def test_collation_placed_before_identity(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="public.users", columns=[
+            Column("code", "character(10)", nullable=False, is_identity=True,
+                   identity_seed=1, identity_increment=1,
+                   collation="en_US.UTF-8"),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn(
+            "[code] NCHAR(10) COLLATE Latin1_General_CI_AS IDENTITY(1,1) NOT NULL",
+            stmts[0],
+        )
+
+    def test_identity_column_omits_nextval_default(self):
+        # A PG serial column is surfaced as identity AND keeps its nextval()
+        # default; the IDENTITY clause must not be emitted next to a DEFAULT
+        # (T-SQL error 195).
+        db = self._base_postgres()
+        db.tables = [Table(name="public.orders", columns=[
+            Column("id", "integer", nullable=False, is_identity=True,
+                   identity_seed=1, identity_increment=1,
+                   default="nextval('public.orders_id_seq'::regclass)"),
+            Column("customer", "character varying(50)", default="'n/a'::character varying"),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn("[id] INT IDENTITY(1,1) NOT NULL", stmts[0])
+        self.assertNotIn("nextval", stmts[0])
+        self.assertNotIn("IDENTITY", stmts[0].split("[customer]")[0].replace("[id] INT IDENTITY(1,1) NOT NULL", ""))
+
+    def test_nextval_default_translated_for_non_identity_column(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="public.events", columns=[
+            Column("seq", "bigint", nullable=False,
+                   default="nextval('public.event_seq'::regclass)"),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn("DEFAULT NEXT VALUE FOR [public].[event_seq]", stmts[0])
+
+    def test_paren_wrapped_nextval_default_emitted_bare(self):
+        # SQL Server rejects DEFAULT (NEXT VALUE FOR ...) with a syntax error
+        # at '(' — the parens must be stripped.
+        db = self._base_postgres()
+        db.tables = [Table(name="public.events", columns=[
+            Column("seq", "bigint", nullable=False,
+                   default="(nextval('public.event_seq'::regclass))"),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn("DEFAULT NEXT VALUE FOR [public].[event_seq]", stmts[0])
+        self.assertNotIn("DEFAULT (NEXT VALUE", stmts[0])
+
+    def test_paren_wrapped_boolean_default_converted(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="public.orders", columns=[
+            Column("active", "boolean", nullable=False, default="(false)"),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertIn("[active] BIT DEFAULT (0) NOT NULL", stmts[0])
+        self.assertNotIn("false", stmts[0])
+
+    def test_nextval_default_strips_regclass_quotes_and_casts(self):
+        # pg_get_expr emits the sequence name through ::regclass which quotes
+        # mixed-case names ('dbo."OrderSequence"'), and wraps casts like
+        # ::character varying(10) around it. Both must not survive into T-SQL.
+        db = self._base_postgres()
+        db.tables = [Table(name="public.returns", columns=[
+            Column("return_number", "character varying(50)", nullable=False,
+                   default="('RET-'::text || ((nextval('dbo.\"OrderSequence\"'::regclass))::character varying(10))::text)"),
+        ])]
+        stmts, _ = build_database_ddl(db, "tsql")
+        self.assertNotIn('"OrderSequence"', stmts[0])
+        self.assertNotIn("(10)", stmts[0])
+        self.assertNotIn("::", stmts[0])
+        self.assertIn("NEXT VALUE FOR [dbo].[OrderSequence]", stmts[0])
+        self.assertNotIn("DEFAULT (NEXT VALUE", stmts[0])
+
     # --------------------------------------------------------------- synonyms
     def test_table_synonym_becomes_view(self):
         db = self._base_tsql()
@@ -1273,6 +1568,27 @@ class AdvancedFeatureDDLTests(TestCase):
         stmts, warnings = build_database_ddl(db, "postgres")
         self.assertEqual(stmts, [])
         self.assertTrue(any("no synonym support" in w for w in warnings))
+
+    def test_synonym_not_recreated_as_view_on_tsql_target(self):
+        db = self._base_postgres()
+        db.tables = [Table(name="dbo.ProductMaster", columns=[Column("ProductID", "INT")])]
+        db.synonyms = [Synonym(name="dbo.Products", target_object="dbo.ProductMaster", target_kind="table")]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertFalse(any("VIEW" in s.upper() for s in stmts))
+        self.assertTrue(any("not recreated" in w for w in warnings))
+
+    def test_postgres_wrapper_view_extracts_as_synonym(self):
+        from engine.extractors.postgres import _synonym_wrapper_target
+        table = Table(name="dbo.Brand", columns=[Column("BrandID", "INT"), Column("BrandName", "NVARCHAR")])
+        body = ('SELECT "BrandID",\n    "BrandName"\n   FROM dbo."Brand";')
+        self.assertIs(_synonym_wrapper_target(body, {"dbo.brand": table}), table)
+
+        joined = ('SELECT b."BrandID",\n    b."BrandName"\n   FROM dbo."Brand" b JOIN dbo."Product" p ON p."BrandID" = b."BrandID";')
+        self.assertIsNone(_synonym_wrapper_target(joined, {"dbo.brand": table}))
+
+        subset = ('SELECT "BrandID"\n   FROM dbo."Brand";')
+        self.assertIsNone(_synonym_wrapper_target(subset, {"dbo.brand": table}))
+
 
     # ---------------------------------------------------------------- security
     def test_security_to_postgres(self):

@@ -1183,6 +1183,81 @@ def _expr(text: str) -> str:
 # PL/pgSQL -> T-SQL
 # ---------------------------------------------------------------------------
 
+def _redeclare_tsql_scalar_param_tables(lines: list[str], params: list[tuple[str, str, bool]]) -> tuple[list[str], list[str]]:
+    """Rebuild local table variables for scalar params used as row sources.
+
+    A table-valued parameter is flattened to ``text`` by an earlier MSSQL ->
+    PG round trip, so the PG body references it as ``FROM Products p`` and the
+    T-SQL re-translation turns that into ``FROM @products p``. SQL Server then
+    fails with "Must declare the table variable '@products'". Detect the row
+    source and declare a renamed local table variable (@name_tbl) shaped from
+    the alias's columns so the CREATE PROCEDURE stays valid.
+    """
+    param_names = {p[0].lower() for p in params}
+    out = []
+    table_declares: list[str] = []
+    rebuilt_aliases: list[str] = []
+    joined = "\n".join(lines)
+    for line in lines:
+        m = re.search(
+            r"\bFROM\s+@([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            line, re.IGNORECASE,
+        )
+        if not m or m.group(1).lower() not in param_names:
+            out.append(line)
+            continue
+        pname, alias = m.group(1), m.group(2)
+        var = f"@{pname}_tbl"
+        if any(alias.lower() == existing.lower() for existing in rebuilt_aliases):
+            out.append(line)
+            continue
+        cols: list[str] = []
+        for cm in re.finditer(
+            rf"(?<![\w.@\[])\b{re.escape(alias)}\.\s*(\[[A-Za-z_][A-Za-z0-9_]*\]|[A-Za-z_][A-Za-z0-9_]*)",
+            joined, re.IGNORECASE,
+        ):
+            col = cm.group(1).strip("[]")
+            if col.lower() not in {c.lower() for c in cols}:
+                cols.append(col)
+        if not cols:
+            out.append(line)
+            continue
+        col_defs = ", ".join(f"[{c}] NVARCHAR(400)" for c in cols)
+        table_declares.append(f"    DECLARE {var} TABLE ({col_defs});\n")
+        rebuilt_aliases.append(alias)
+        out.append(re.sub(
+            rf"\bFROM\s+@{re.escape(pname)}\s+{re.escape(alias)}\b",
+            f"FROM {var} {alias}", line, flags=re.IGNORECASE,
+        ))
+    # The rebuilt table-variable columns carry the database collation with
+    # explicit precedence, so comparing them to a column declared with a
+    # different collation is a CREATE-time error (468). Coerce the real column
+    # side of every comparison against a rebuilt alias to DATABASE_DEFAULT.
+    qcol = r"(?:\[[A-Za-z_][A-Za-z0-9_]*\]|[A-Za-z_][A-Za-z0-9_]*)"
+    ops = r"((?:<=|>=|<>|=|<|>))"
+    for alias in rebuilt_aliases:
+        a = re.escape(alias)
+        other = rf"((?!@?{a}\b)[A-Za-z_][A-Za-z0-9_]*\.\s*{qcol})"
+        alias_side = rf"((?<![\w.@\[])\b{a}\.\s*{qcol})"
+        out = [
+            re.sub(
+                rf"{alias_side}\s*{ops}\s*{other}",
+                lambda m: f"{m.group(1)} {m.group(2)} {m.group(3)} COLLATE DATABASE_DEFAULT",
+                ln, flags=re.IGNORECASE,
+            )
+            for ln in out
+        ]
+        out = [
+            re.sub(
+                rf"{other}\s*{ops}\s*{alias_side}",
+                lambda m: f"{m.group(1)} COLLATE DATABASE_DEFAULT {m.group(2)} {m.group(3)}",
+                ln, flags=re.IGNORECASE,
+            )
+            for ln in out
+        ]
+    return out, table_declares
+
+
 def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
     is_pg_procedure = bool(re.search(
@@ -1250,7 +1325,7 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
                     return m.group(0)
                 return "@" + canon
             return re.sub(
-                r"(?<![.\w\"@\[])([A-Za-z_][A-Za-z0-9_]*)\b",
+                r"(?<![.\w\"@\['])([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()",
                 _repl, ln, flags=re.IGNORECASE,
             )
         transformed = [_qualify(ln) for ln in transformed]
@@ -1273,6 +1348,7 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
                 for ln in transformed
             ]
 
+    transformed, table_var_declares = _redeclare_tsql_scalar_param_tables(transformed, params)
     transformed = [_repair_tsql_parameter_contexts(ln, params) for ln in transformed]
 
     declare_lines = []
@@ -1283,7 +1359,7 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
             warnings.append(f"Variable {var_name}: {type_warn}")
         initializer = f" = {pieces[1]}" if len(pieces) == 2 else ""
         declare_lines.append(f"    DECLARE @{var_name} {mapped_type or 'NVARCHAR(MAX)'}{initializer};\n")
-    declares = "".join(declare_lines)
+    declares = "".join(table_var_declares) + "".join(declare_lines)
 
     lower_returns = returns.lower()
     is_scalar_fn = not is_pg_procedure and not (

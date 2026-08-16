@@ -103,6 +103,36 @@ class _FakeConnector:
         return f'"{name}"'
 
 
+class _FakeTsqlResetTarget(_FakeConnector):
+    """T-SQL target that reports pre-existing objects to the reset routine."""
+
+    def __init__(self):
+        super().__init__({}, dialect="tsql")
+        self.database_user = "migrator"
+        self._table_loop_calls = 0
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        if sql.lstrip().upper().startswith("CREATE TABLE"):
+            name = sql.split(" ")[2].strip('[]"')
+            self.data.setdefault(name, [])
+
+    def fetch(self, sql, params=None):
+        lower = sql.lower()
+        if "sys.tables t" in lower and "top (1)" in lower:
+            self._table_loop_calls += 1
+            return [["[dbo].[users]"]] if self._table_loop_calls == 1 else []
+        if "sys.objects o" in lower and "'so'" in lower:
+            return [["[dbo].[order_seq]"]]
+        if "sys.types t" in lower and "is_user_defined = 1" in lower:
+            return [["[dbo].[EmailType]"]]
+        if "sys.database_principals" in lower and "type in ('s', 'u')" in lower:
+            return [["[dbo].[other_user]"]]
+        if "sys.database_principals" in lower and "type = 'r'" in lower:
+            return [["[dbo].[ProductReader]"]]
+        return []
+
+
 class MigrationPipelineSmokeTests(SimpleTestCase):
     def test_full_pipeline_copies_rows_and_verifies_counts(self):
         source = _FakeConnector({"dbo.users": [(1, "a"), (2, "b"), (3, "c")]}, dialect="tsql")
@@ -137,3 +167,16 @@ class MigrationPipelineSmokeTests(SimpleTestCase):
 
         drops = [s for s in target.executed if s.lstrip().upper().startswith("DROP SCHEMA")]
         self.assertEqual(drops, ['DROP SCHEMA IF EXISTS "dbo" CASCADE'])
+
+    def test_reset_tsql_drops_sequences_types_users_roles(self):
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        target = _FakeTsqlResetTarget()
+
+        MigrationOrchestrator(source, target, copy_data=False, reset_target=True).run()
+
+        self.assertIn("DROP TABLE [dbo].[users]", target.executed)
+        self.assertIn("DROP SEQUENCE [dbo].[order_seq]", target.executed)
+        self.assertIn("DROP TYPE [dbo].[EmailType]", target.executed)
+        self.assertIn("DROP USER [dbo].[other_user]", target.executed)
+        self.assertIn("DROP ROLE [dbo].[ProductReader]", target.executed)
+        self.assertNotIn("DROP USER [dbo].[migrator]", target.executed)

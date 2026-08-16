@@ -274,6 +274,12 @@ def _build_column(col: Column, target: str, source: str,
     if target_type is None:
         return None, warn
 
+    collation_frag, collation_warn = _append_collation(
+        col.collation, target_type, target, database
+    )
+    if collation_warn:
+        warn = collation_warn if warn is None else f"{warn}; {collation_warn}"
+
     parts = [f"{_qident(col.name, target)} {target_type}"]
 
     if col.is_computed:
@@ -290,6 +296,10 @@ def _build_column(col: Column, target: str, source: str,
             parts = [f"{_qident(col.name, target)}"]
             parts[0] += f" AS ({expr}) PERSISTED"
     else:
+        # COLLATE must directly follow the data type in both dialects — never
+        # after IDENTITY/DEFAULT/NOT NULL (T-SQL error 156).
+        parts[0] += collation_frag
+
         identity = ""
         if col.is_identity:
             seed = col.identity_seed if col.identity_seed is not None else 1
@@ -301,18 +311,18 @@ def _build_column(col: Column, target: str, source: str,
 
         parts[0] += identity
 
-        default = _translate_default(col.default, target)
-        if default:
-            if target == "postgres" and target_type.upper() == "BOOLEAN" and default in ("1", "0"):
-                default = "true" if default == "1" else "false"
-            parts[0] += f" DEFAULT {default}"
+        # IDENTITY and DEFAULT are mutually exclusive in both dialects. A PG
+        # serial column carries a nextval() default that must not be emitted
+        # next to the IDENTITY clause (T-SQL error 195).
+        if not col.is_identity:
+            default = _translate_default(col.default, target)
+            if default:
+                if target == "postgres" and target_type.upper() == "BOOLEAN" and default in ("1", "0"):
+                    default = "true" if default == "1" else "false"
+                parts[0] += f" DEFAULT {default}"
 
         if not col.nullable:
             parts[0] += " NOT NULL"
-
-    collation_warn = _append_collation(parts, col.collation, target_type, target, database)
-    if collation_warn:
-        warn = collation_warn if warn is None else f"{warn}; {collation_warn}"
 
     return parts[0], warn
 
@@ -346,27 +356,30 @@ def _resolve_column_type(data_type: str, source: str, target: str,
     return convert_type(data_type, source, target)
 
 
-def _append_collation(parts: list[str], collation: str | None, target_type: str,
-                      target: str, database: Database | None) -> str | None:
-    """Append a COLLATE clause for character columns where a mapping is known."""
+def _append_collation(collation: str | None, target_type: str,
+                      target: str, database: Database | None) -> tuple[str, str | None]:
+    """Build a COLLATE clause for character columns where a mapping is known.
+
+    Returns ``(clause, warning)``. The clause is empty when the column inherits
+    the source database's default collation or no mapping exists; the warning
+    explains why the clause was omitted.
+    """
     if not collation or not _is_character_type(target_type):
-        return None
+        return "", None
     if database and database.collation and collation.lower() == database.collation.lower():
         # Column uses the source database's default collation, which the target
         # database will apply anyway — no need to pin it per column.
-        return None
+        return "", None
     key = collation.strip().lower()
     if target == "postgres":
         mapped = MSSQL_TO_PG_COLLATIONS.get(key)
         if not mapped:
-            return f"Collation '{collation}' has no PostgreSQL equivalent — column created with the database collation"
-        parts[0] += f' COLLATE "{mapped}"'
-        return None
+            return "", (f"Collation '{collation}' has no PostgreSQL equivalent — column created with the database collation")
+        return f' COLLATE "{mapped}"', None
     mapped = PG_TO_MSSQL_COLLATIONS.get(key)
     if not mapped:
-        return f"Collation '{collation}' has no SQL Server equivalent — column created with the database collation"
-    parts[0] += f" COLLATE {mapped}"
-    return None
+        return "", (f"Collation '{collation}' has no SQL Server equivalent — column created with the database collation")
+    return f" COLLATE {mapped}", None
 
 
 def _is_character_type(target_type: str) -> bool:
@@ -620,8 +633,15 @@ def build_sequence_ddl(seq: Sequence, target: str, source: str) -> tuple[list[st
 def build_synonym_ddl(syn: Synonym, target: str) -> tuple[list[str], list[str]]:
     """PostgreSQL has no synonyms; a table/view synonym is recreated as a view
     wrapper that SELECTs from the target. Procedure/function synonyms cannot be
-    recreated and are surfaced as warnings. The reverse direction produces no
-    synonyms (PostgreSQL has none to extract)."""
+    recreated and are surfaced as warnings. The reverse direction emits a
+    warning instead of SQL: such wrappers were synonyms on the original SQL
+    Server database and are assumed to already exist on the target."""
+    if target == "tsql":
+        return [], [
+            f"Synonym '{syn.name}' was materialized as a view during the SQL Server -> "
+            f"PostgreSQL migration; it is not recreated as a view (the target should "
+            f"already define the original synonym '{syn.target_object}')"
+        ]
     if target != "postgres":
         return [], []
     if syn.target_kind not in ("table", "view"):
@@ -779,15 +799,30 @@ def _translate_default(expr: str | None, target: str) -> str | None:
             from engine.translators.procedure_translator import _replace_concat
             expr = _replace_concat(expr)
     else:
+        # SQL Server rejects a DEFAULT written as `(NEXT VALUE FOR ...)` with a
+        # syntax error at '(' — emit the bare form. Handle both the bare and the
+        # parenthesized forms pg_get_expr can produce.
+        expr = re.sub(
+            r"\(\s*nextval\(\s*'([^']+)'\s*::regclass\s*\)\s*\)",
+            lambda m: f"NEXT VALUE FOR {_qident(m.group(1).replace(chr(34), ''), 'mssql')}",
+            expr,
+            flags=re.IGNORECASE,
+        )
+        expr = re.sub(
+            r"\bnextval\(\s*'([^']+)'\s*::regclass\s*\)",
+            lambda m: f"NEXT VALUE FOR {_qident(m.group(1).replace(chr(34), ''), 'mssql')}",
+            expr,
+            flags=re.IGNORECASE,
+        )
         expr = re.sub(r"\bCURRENT_TIMESTAMP\b", "GETDATE()", expr, flags=re.IGNORECASE)
         expr = re.sub(r"\bgen_random_uuid\(\)", "NEWID()", expr, flags=re.IGNORECASE)
         expr = re.sub(r"\bnow\(\)", "GETDATE()", expr, flags=re.IGNORECASE)
-        # PG casts come out of pg_get_expr (e.g. 'Pending'::character varying)
-        expr = re.sub(r"::[\w\s.]+", "", expr)
-        if expr.lower() == "true":
-            expr = "1"
-        elif expr.lower() == "false":
-            expr = "0"
+        # PG casts come out of pg_get_expr (e.g. 'Pending'::character varying,
+        # (nextval(...))::character varying(10)). Strip them fully including
+        # any type modifiers, otherwise the leftover parentheses break the DDL.
+        expr = _strip_pg_casts(expr)
+        # true/false -> 1/0, including parenthesized forms like `(false)`
+        expr = _translate_pg_boolean_literals(expr)
     return expr
 
 

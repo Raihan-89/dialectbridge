@@ -189,7 +189,7 @@ Routine kinds are preserved by the live migration engine: functions remain funct
 - Types with no clean equivalent (e.g. `GEOGRAPHY`, `SQL_VARIANT`, `HIERARCHYID`, `ROWVERSION`, `CURSOR`, PG `ARRAY`/`HSTORE`/range types/`INET`/`CIDR`/`MACADDR`) are flagged for manual review rather than converted.
 - Trigger translation is best-effort — statement-level vs row-level semantics are surfaced as warnings.
 - DDL trigger ↔ event trigger conversion is best-effort: `EVENTDATA()` maps to `TG_TAG`, and PG event triggers are recreated with a conservative event set that must be reviewed.
-- Synonyms only become PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings.
+- Synonyms only become PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings. The reverse leg skips these wrapper views with a warning (the SQL Server target already holds the original synonyms) so view counts stay identical.
 - PostgreSQL enums/composites/table-types/CLR types have no SQL Server equivalent and are flagged (enums/composites map to `NVARCHAR(MAX)` with a warning when used as column types).
 - Only `GRANT` permissions are ported; `DENY`/`REVOKE` are surfaced as warnings.
 - Partitioned tables: PostgreSQL requires the partition key to be part of the primary key (warned when violated); SQL Server partition functions migrate as non-partitioned tables with a warning.

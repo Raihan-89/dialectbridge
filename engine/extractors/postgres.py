@@ -17,7 +17,7 @@ import re
 
 from engine.schema import (
     CheckConstraint, Column, Constraint, Database, ForeignKey, Index, Permission,
-    PartitionChild, Principal, Routine, Sequence, Table, Trigger, UserType, View,
+    PartitionChild, Principal, Routine, Sequence, Synonym, Table, Trigger, UserType, View,
 )
 
 _SYSTEM_SCHEMAS = (
@@ -123,9 +123,10 @@ SELECT
     pg_get_expr(ix.indpred, ix.indrelid) AS filter_def,
     ix.indisclustered,
     k.ord > ix.indnkeyatts AS is_included,
-    ix.indam::regclass::text AS index_method
+    am.amname AS index_method
 FROM pg_index ix
 JOIN pg_class i ON i.oid = ix.indexrelid
+JOIN pg_am am ON i.relam = am.oid
 JOIN pg_class t ON t.oid = ix.indrelid
 CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
 LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
@@ -146,11 +147,12 @@ ORDER BY i.relname
 """
 
 _NON_BTREE_INDEX_SQL = """
-SELECT i.relname, ix.indam::regclass::text AS method
+SELECT i.relname, am.amname AS method
 FROM pg_index ix
 JOIN pg_class i ON i.oid = ix.indexrelid
+JOIN pg_am am ON i.relam = am.oid
 JOIN pg_class t ON t.oid = ix.indrelid
-WHERE t.oid = %s AND ix.indam::regclass::text <> 'btree'
+WHERE t.oid = %s AND am.amname <> 'btree'
 ORDER BY i.relname
 """
 
@@ -166,7 +168,7 @@ SELECT n.nspname || '.' || c.relname, pg_get_viewdef(c.oid, true)
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind = 'v'
-    AND n.nspname NOT IN {_SYSTEM_SCHEMAS}
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_catalog_fts_config')
 ORDER BY n.nspname, c.relname
 """
 
@@ -238,24 +240,24 @@ ORDER BY n.nspname, c.relname
 
 _STANDALONE_SEQ_SQL = f"""
 SELECT
-    n.nspname || '.' || c.relname,
-    s.seqstart,
-    s.seqincrement,
-    s.seqcycle,
+    s.schemaname || '.' || s.sequencename,
+    s.start_value,
+    s.increment_by,
+    s.cycle,
     s.last_value,
-    format_type(s.seqtypid, NULL)
-FROM pg_class c
+    s.data_type
+FROM pg_sequences s
+JOIN pg_class c ON c.relname = s.sequencename
 JOIN pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_sequence s ON s.seqrelid = c.oid
-WHERE c.relkind = 'S'
-    AND n.nspname NOT IN {_SYSTEM_SCHEMAS}
+    AND n.nspname = s.schemaname
+WHERE s.schemaname NOT IN {_SYSTEM_SCHEMAS}
     AND NOT EXISTS (
         SELECT 1 FROM pg_depend d
         WHERE d.objid = c.oid
             AND d.classid = 'pg_class'::regclass
             AND d.deptype IN ('a', 'i')
     )
-ORDER BY n.nspname, c.relname
+ORDER BY s.schemaname, s.sequencename
 """
 
 _DOMAINS_SQL = f"""
@@ -337,7 +339,9 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl, acldefault('r', c.relowner))) p
 JOIN pg_roles u ON u.oid = p.grantee
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND n.nspname NOT LIKE 'pg_toast%'
     AND u.rolname NOT LIKE 'pg_%'
+    AND u.rolname NOT IN ('postgres', 'public')
     AND p.grantee <> 0
 ORDER BY n.nspname, c.relname, u.rolname, p.privilege_type
 """
@@ -355,6 +359,7 @@ CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) q
 JOIN pg_roles u ON u.oid = q.grantee
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
     AND u.rolname NOT LIKE 'pg_%'
+    AND u.rolname NOT IN ('postgres', 'public')
     AND q.grantee <> 0
 ORDER BY n.nspname, p.proname, u.rolname, q.privilege_type
 """
@@ -372,10 +377,16 @@ def extract_schema(conn) -> Database:
 
     _extract_partitioned_tables(conn, database)
 
-    database.views = [
-        View(name=row[0], definition=_wrap_view(row[0], row[1]))
-        for row in conn.fetch(_VIEWS_SQL)
-    ]
+    tables_by_name = {t.name.lower().replace(chr(34), ""): t for t in database.tables}
+    views, synonyms = [], []
+    for name, body in conn.fetch(_VIEWS_SQL):
+        target = _synonym_wrapper_target(body, tables_by_name)
+        if target:
+            synonyms.append(Synonym(name=name, target_object=target.name, target_kind="table"))
+        else:
+            views.append(View(name=name, definition=_wrap_view(name, body)))
+    database.views = views
+    database.synonyms = synonyms
     database.views += _extract_matviews(conn)
 
     database.functions = [
@@ -387,17 +398,7 @@ def extract_schema(conn) -> Database:
         for row in conn.fetch(_PROCEDURES_SQL)
     ]
     database.triggers = _extract_triggers(conn)
-    database.sequences = [
-        Sequence(
-            name=row[0],
-            start_value=int(row[1]),
-            increment=int(row[2]),
-            is_cycling=bool(row[3]),
-            current_value=int(row[4]) if row[4] is not None else None,
-            data_type=row[5],
-        )
-        for row in conn.fetch(_STANDALONE_SEQ_SQL)
-    ]
+    database.sequences = _extract_sequences(conn)
     database.types = _extract_types(conn)
     _extract_security(conn, database)
     return database
@@ -547,6 +548,20 @@ def _extract_partitioned_tables(conn, database: Database) -> None:
 # views / triggers / types
 # ---------------------------------------------------------------------------
 
+def _extract_sequences(conn) -> list[Sequence]:
+    return [
+        Sequence(
+            name=row[0],
+            start_value=int(row[1]),
+            increment=int(row[2]),
+            is_cycling=bool(row[3]),
+            current_value=int(row[4]) if row[4] is not None else None,
+            data_type=row[5],
+        )
+        for row in conn.fetch(_STANDALONE_SEQ_SQL)
+    ]
+
+
 def _extract_matviews(conn) -> list[View]:
     matviews: list[View] = []
     for oid, schema, name in conn.fetch(
@@ -609,7 +624,7 @@ def _extract_types(conn) -> list[UserType]:
         types.append(
             UserType(
                 name=name, kind="domain", base_type=base_type,
-                default=default, nullable=not notnotnull, constraints=checks,
+                default=default, nullable=not notnull, constraints=checks,
             )
         )
 
@@ -646,14 +661,13 @@ def _extract_security(conn, database: Database) -> None:
         "TRUNCATE": None, "USAGE": None, "MAINTAIN": None,
     }
     seen: set[tuple] = set()
+    unmapped: set[str] = set()
     for obj_name, relkind, rolname, priv, grantable in conn.fetch(_OBJECT_GRANTS_SQL):
         action = action_map.get(priv)
-        if action is None or rolname not in by_name:
-            if action is None:
-                database.warnings.append(
-                    f"PostgreSQL privilege '{priv}' on '{obj_name}' has no SQL Server equivalent "
-                    f"and was not migrated"
-                )
+        if action is None:
+            unmapped.add(priv)
+            continue
+        if rolname not in by_name:
             continue
         securable = securable_map.get(relkind, "object")
         key = (rolname, securable, obj_name, action)
@@ -670,7 +684,10 @@ def _extract_security(conn, database: Database) -> None:
     routine_map = {"f": "function", "w": "function", "p": "procedure"}
     for obj_name, prokind, rolname, priv, grantable in conn.fetch(_ROUTINE_GRANTS_SQL):
         action = action_map.get(priv)
-        if action is None or rolname not in by_name:
+        if action is None:
+            unmapped.add(priv)
+            continue
+        if rolname not in by_name:
             continue
         key = (rolname, routine_map.get(prokind, "function"), obj_name, action)
         if key in seen:
@@ -682,6 +699,10 @@ def _extract_security(conn, database: Database) -> None:
                 object_name=obj_name, action=action, grant_type="GRANT",
                 with_grant=bool(grantable),
             )
+        )
+    for priv in sorted(unmapped):
+        database.warnings.append(
+            f"PostgreSQL privilege '{priv}' has no SQL Server equivalent and was not migrated"
         )
 
 
@@ -726,6 +747,34 @@ def _fk_action(code: str) -> str:
 def _wrap_view(name: str, body: str) -> str:
     body = body.strip().rstrip(";")
     return f"CREATE VIEW {name} AS {body}"
+
+
+def _synonym_wrapper_target(body: str, tables_by_name: dict[str, Table]) -> Table | None:
+    """Detect a view that materializes a SQL Server synonym.
+
+    The MSSQL->PG migration recreates table synonyms as `CREATE VIEW ... AS
+    SELECT * FROM <target>`. PostgreSQL stores such views with the column list
+    expanded, so a wrapper is recognised as `SELECT <all of one table's
+    columns> FROM <that table>` with no joins, expressions, or aliases. A match
+    means the object was a synonym on the source; it should not come back as a
+    view on the SQL Server target (the target already holds the synonym).
+    """
+    text = body.strip().rstrip(";").strip()
+    m = re.fullmatch(r"\s*select\s+(.+?)\s+from\s+(\S+)\s*", text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    cols, ref = m.group(1), m.group(2)
+    table = tables_by_name.get(ref.lower().replace(chr(34), ""))
+    if table is None:
+        return None
+    if re.search(r"join|\bunion\b|\bwhere\b|\(|\bas\b|\bdistinct\b|\bcoalesce\b|\bcase\b|\bcast\b", cols, re.IGNORECASE):
+        return None
+    identifiers = cols.split(",")
+    view_cols = {c.strip().replace(chr(34), "").lower() for c in identifiers}
+    table_cols = {c.name.lower() for c in table.columns}
+    if view_cols and view_cols == table_cols:
+        return table
+    return None
 
 
 def _trigger_timing(definition: str) -> str:

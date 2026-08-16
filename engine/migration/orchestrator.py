@@ -250,7 +250,8 @@ class MigrationOrchestrator:
             self.target.execute(f"DROP TABLE {rows[0][0]}")
 
         for type_code, kind in (("'V'", "view"), ("'P'", "procedure"),
-                                ("'FN','IF','TF'", "function"), ("'TR'", "trigger")):
+                                ("'FN','IF','TF'", "function"), ("'TR'", "trigger"),
+                                ("'SO'", "sequence")):
             rows = self.target.fetch(
                 f"""
                 SELECT QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name)
@@ -261,6 +262,49 @@ class MigrationOrchestrator:
             )
             for (obj_name,) in rows:
                 self.target.execute(f"DROP {kind.upper()} {obj_name}")
+
+        # user-defined types (alias types / domains recreated by the migration)
+        rows = self.target.fetch(
+            f"""
+            SELECT QUOTENAME(SCHEMA_NAME(t.schema_id)) + '.' + QUOTENAME(t.name)
+            FROM sys.types t
+            WHERE t.is_user_defined = 1
+                AND SCHEMA_NAME(t.schema_id) IN ({in_list})
+            """
+        )
+        for (obj_name,) in rows:
+            self.target.execute(f"DROP TYPE {obj_name}")
+
+        # database users (migration recreates them with WITHOUT LOGIN). The
+        # current connection's principal is preserved so the run can continue.
+        rows = self.target.fetch(
+            f"""
+            SELECT QUOTENAME(name)
+            FROM sys.database_principals
+            WHERE type IN ('S', 'U')
+                AND name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys')
+                AND name <> USER_NAME()
+            """
+        )
+        for (obj_name,) in rows:
+            self.target.execute(f"DROP USER {obj_name}")
+
+        # application/database roles created by the migration. Fixed roles are
+        # skipped and members are dropped alongside their users above.
+        rows = self.target.fetch(
+            f"""
+            SELECT QUOTENAME(name)
+            FROM sys.database_principals
+            WHERE type = 'R'
+                AND name NOT IN ('public', 'db_owner', 'db_accessadmin',
+                                 'db_securityadmin', 'db_ddladmin',
+                                 'db_backupoperator', 'db_datareader',
+                                 'db_datawriter', 'db_denydatareader',
+                                 'db_denydatawriter')
+            """
+        )
+        for (obj_name,) in rows:
+            self.target.execute(f"DROP ROLE {obj_name}")
 
     def _apply_table(self, report: MigrationReport, schema, table) -> None:
         from engine.translators.sql_builder import build_table_ddl
@@ -287,7 +331,10 @@ class MigrationOrchestrator:
             report.schema_results.append(ObjectResult(kind=kind, name=name))
         except ConnectorError as exc:
             report.schema_results.append(
-                ObjectResult(kind=kind, name=name, status="failed", detail=str(exc)[:300])
+                ObjectResult(
+                    kind=kind, name=name, status="failed",
+                    detail=f"{exc}; Statement: {stmt}"[:4000],
+                )
             )
 
     # ------------------------------------------------------------------

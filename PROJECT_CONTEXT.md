@@ -245,7 +245,7 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
   - Trigger header tolerance: `WITH EXECUTE AS`/`NOT FOR REPLICATION`; compact trigger bodies with `RAISERROR` → `RAISE EXCEPTION`.
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched keyset inserts, `reset_target` schema drops.
 
-Current verification: `python manage.py test apps.converter` runs **98 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test apps.converter` runs **114 tests**; `python manage.py check` reports no issues.
 
 ---
 
@@ -256,7 +256,7 @@ Current verification: `python manage.py test apps.converter` runs **98 tests**; 
 - Manual-review types are **flagged with warnings, never silently converted**.
 - Trigger translation is best-effort: statement-level vs row-level semantics and multi-row `FROM inserted/deleted` patterns produce warnings for manual review.
 - DDL trigger translation is best-effort: PostgreSQL event triggers cannot reconstruct the rich `EVENTDATA()` XML (approximated by `TG_TAG`), and the reverse direction only captures the firing point, so the tag set is reconstructed conservatively with a warning.
-- Synonyms only map to PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings.
+- Synonyms map to PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings. On the reverse leg, the wrapper views created this way are recognised (single-table, all-columns view) and skipped with a warning — the SQL Server target is expected to already hold the original synonym, so they are never recreated as views.
 - PostgreSQL enums/composites/table-types/CLR types have no SQL Server equivalent: enums and composites are flagged (enums/composites map to `NVARCHAR(MAX)` with a warning when used as column types), table types/CLR types are not migrated.
 - Only `GRANT` permissions are ported; `DENY`/`REVOKE` are surfaced as warnings (SQL Server's deny-everything and per-object permission model has no clean PostgreSQL equivalent).
 - Partitioned tables: PostgreSQL requires the partition key to be part of the primary key — the DDL is emitted but flagged when that requirement is violated. SQL Server partition functions with boundary-value semantics (`[lower, upper)`) are migrated as non-partitioned tables with a warning because the range interpretations differ.
