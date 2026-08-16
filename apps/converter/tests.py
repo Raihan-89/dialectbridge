@@ -223,6 +223,28 @@ END"""
         self.assertIn("FROM unnest(Products) AS p", converted)
         self.assertFalse(any("DBO.PRODUCTBULKTYPE" in warning for warning in warnings))
 
+    def test_postgres_composite_array_restores_tsql_table_parameter(self):
+        pg = '''CREATE OR REPLACE PROCEDURE "dbo"."sp_BulkInsertProducts"(
+IN "Products" "dbo"."ProductBulkType"[])
+LANGUAGE plpgsql AS $procedure$
+BEGIN
+INSERT INTO "dbo"."ProductMaster" ("ProductName")
+SELECT p."ProductName" FROM unnest("Products") AS p
+JOIN "dbo"."Category" c ON p."CategoryCode" = c."CategoryCode";
+END;
+$procedure$'''
+        composite = UserType(
+            name="dbo.ProductBulkType", kind="composite",
+            columns=[Column("ProductName", "character varying(200)")],
+        )
+        converted, warnings = translate_routine(
+            pg, source="procedure", target="tsql", user_types=[composite],
+        )
+        self.assertIn("@Products [dbo].[ProductBulkType] READONLY", converted)
+        self.assertIn("FROM @products AS p", converted)
+        self.assertIn("c.[CategoryCode] COLLATE DATABASE_DEFAULT", converted)
+        self.assertNotIn("DECLARE @products_tbl TABLE", converted)
+
     def test_postgres_unbounded_routine_types_map_without_warnings(self):
         pg_fn = """CREATE FUNCTION dbo.f(searchterm character varying, amount numeric)
 RETURNS numeric LANGUAGE plpgsql AS $$ BEGIN RETURN amount; END; $$"""
@@ -1340,6 +1362,20 @@ END""",
         )
         self.assertTrue(any('"dbo"."ProductBulkType"[]' in stmt for stmt in stmts))
         self.assertTrue(any("converted to a PostgreSQL composite type" in warning for warning in warnings))
+
+    def test_postgres_composite_type_to_mssql_table_type(self):
+        db = self._base_postgres()
+        db.types = [UserType(
+            name="dbo.ProductBulkType", kind="composite",
+            columns=[Column("ProductName", "character varying(200)", nullable=False),
+                     Column("Price", "numeric(18,2)")],
+        )]
+        stmts, warnings = build_database_ddl(db, "tsql")
+        self.assertIn(
+            "CREATE TYPE [dbo].[ProductBulkType] AS TABLE ([ProductName] NVARCHAR(200) NOT NULL, [Price] NUMERIC(18,2) NULL)",
+            stmts,
+        )
+        self.assertTrue(any("converted to a SQL Server table type" in warning for warning in warnings))
 
     def test_domain_to_alias_type(self):
         db = self._base_postgres()

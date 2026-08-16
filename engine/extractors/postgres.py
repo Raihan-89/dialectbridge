@@ -300,13 +300,20 @@ ORDER BY e.enumsortorder
 """
 
 _COMPOSITES_SQL = f"""
-SELECT n.nspname || '.' || t.typname
+SELECT n.nspname || '.' || t.typname, t.typrelid
 FROM pg_type t
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE t.typtype = 'c'
     AND n.nspname NOT IN {_SYSTEM_SCHEMAS}
     AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind IN ('r', 'p', 'v', 'm', 'S'))
 ORDER BY n.nspname, t.typname
+"""
+
+_COMPOSITE_COLUMNS_SQL = """
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull
+FROM pg_attribute a
+WHERE a.attrelid = %s AND a.attnum > 0 AND NOT a.attisdropped
+ORDER BY a.attnum
 """
 
 _ROLES_SQL = """
@@ -632,8 +639,12 @@ def _extract_types(conn) -> list[UserType]:
         values = [r[0] for r in conn.fetch(_ENUM_VALUES_SQL, (oid,))]
         types.append(UserType(name=name, kind="enum", values=values))
 
-    for (name,) in conn.fetch(_COMPOSITES_SQL):
-        types.append(UserType(name=name, kind="composite"))
+    for name, relid in conn.fetch(_COMPOSITES_SQL):
+        columns = [
+            Column(name=col_name, data_type=data_type, nullable=bool(nullable))
+            for col_name, data_type, nullable in conn.fetch(_COMPOSITE_COLUMNS_SQL, (relid,))
+        ]
+        types.append(UserType(name=name, kind="composite", columns=columns))
 
     return types
 

@@ -1217,7 +1217,8 @@ def _expr(text: str) -> str:
 # PL/pgSQL -> T-SQL
 # ---------------------------------------------------------------------------
 
-def _redeclare_tsql_scalar_param_tables(lines: list[str], params: list[tuple[str, str, bool]]) -> tuple[list[str], list[str]]:
+def _redeclare_tsql_scalar_param_tables(lines: list[str], params: list[tuple[str, str, bool]],
+                                        tvp_names: set[str] | None = None) -> tuple[list[str], list[str]]:
     """Rebuild local table variables for scalar params used as row sources.
 
     A table-valued parameter is flattened to ``text`` by an earlier MSSQL ->
@@ -1227,7 +1228,7 @@ def _redeclare_tsql_scalar_param_tables(lines: list[str], params: list[tuple[str
     source and declare a renamed local table variable (@name_tbl) shaped from
     the alias's columns so the CREATE PROCEDURE stays valid.
     """
-    param_names = {p[0].lower() for p in params}
+    param_names = {p[0].lower() for p in params} - (tvp_names or set())
     out = []
     table_declares: list[str] = []
     rebuilt_aliases: list[str] = []
@@ -1292,7 +1293,44 @@ def _redeclare_tsql_scalar_param_tables(lines: list[str], params: list[tuple[str
     return out, table_declares
 
 
-def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
+def _collate_tsql_tvp_comparisons(lines: list[str], tvp_names: set[str]) -> list[str]:
+    """Resolve comparisons between TVP strings and differently collated columns.
+
+    SQL Server table-type character attributes inherit the target database
+    collation. Migrated table columns can retain an explicit source collation,
+    so equality joins fail at CREATE PROCEDURE time with error 468 unless the
+    persistent-table side is coerced to DATABASE_DEFAULT.
+    """
+    aliases: set[str] = set()
+    joined = "\n".join(lines)
+    for pname in tvp_names:
+        for match in re.finditer(
+            rf"\b(?:FROM|JOIN)\s+@{re.escape(pname)}\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)",
+            joined, re.IGNORECASE,
+        ):
+            aliases.add(match.group(1))
+
+    qcol = r"(?:\[[A-Za-z_][A-Za-z0-9_]*\]|[A-Za-z_][A-Za-z0-9_]*)"
+    ops = r"((?:<=|>=|<>|=|<|>))"
+    out = lines
+    for alias in aliases:
+        escaped = re.escape(alias)
+        other = rf"((?!@?{escaped}\b)[A-Za-z_][A-Za-z0-9_]*\.\s*{qcol})"
+        tvp_side = rf"((?<![\w.@\[])\b{escaped}\.\s*{qcol})"
+        out = [re.sub(
+            rf"{tvp_side}\s*{ops}\s*{other}",
+            lambda m: f"{m.group(1)} {m.group(2)} {m.group(3)} COLLATE DATABASE_DEFAULT",
+            line, flags=re.IGNORECASE,
+        ) for line in out]
+        out = [re.sub(
+            rf"{other}\s*{ops}\s*{tvp_side}",
+            lambda m: f"{m.group(1)} COLLATE DATABASE_DEFAULT {m.group(2)} {m.group(3)}",
+            line, flags=re.IGNORECASE,
+        ) for line in out]
+    return out
+
+
+def _plpgsql_to_tsql(sql: str, user_types: list | None = None) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
     is_pg_procedure = bool(re.search(
         r"CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\b", sql, re.IGNORECASE
@@ -1337,12 +1375,28 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
             transformed[catch_end] = "END CATCH"
 
     param_list = []
+    tvp_names: set[str] = set()
     for pname, ptype, output in params:
-        tgt_type, warn = convert_type(ptype, "postgres", "tsql")
+        is_array = bool(re.search(r"\[\]\s*$", ptype))
+        raw_base = re.sub(r"\[\]\s*$", "", ptype) if is_array else ptype
+        base_type = re.sub(r'[\[\]"\s]', '', raw_base).casefold()
+        composite = next((ut for ut in user_types or [] if ut.kind == "composite" and
+                          base_type in {
+                              re.sub(r'[\[\]"\s]', '', ut.name).casefold(),
+                              re.sub(r'[\[\]"\s]', '', ut.name).casefold().rsplit('.', 1)[-1],
+                          }), None)
+        if composite is not None and is_array:
+            parts = [part.strip('[]"') for part in composite.name.split(".")]
+            tgt_type = ".".join(f'[{part}]' for part in parts)
+            warn = None
+            tvp_names.add(pname.casefold())
+        else:
+            tgt_type, warn = convert_type(ptype, "postgres", "tsql")
         if warn:
             warnings.append(f"Parameter {pname}: {warn}")
         tgt_type = tgt_type or "NVARCHAR(MAX)"
-        param_list.append(f"@{pname} {tgt_type}{' OUTPUT' if output else ''}")
+        suffix = " READONLY" if pname.casefold() in tvp_names else (' OUTPUT' if output else '')
+        param_list.append(f"@{pname} {tgt_type}{suffix}")
 
     # Rewrite bare references to parameters/declared variables with @ so they
     # resolve as T-SQL variables — case-insensitively, skipping SQL keywords,
@@ -1367,6 +1421,15 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
         # Initializers are stored separately from body statements.
         declared = {name: _qualify(value) for name, value in declared.items()}
 
+        # Composite arrays are the PostgreSQL representation of SQL Server
+        # TVPs. Restore the relational table-parameter reference.
+        if tvp_names:
+            for pname in tvp_names:
+                transformed = [re.sub(
+                    rf"\b(FROM|JOIN)\s+unnest\s*\(\s*@{re.escape(pname)}\s*\)",
+                    rf"\1 @{pname}", line, flags=re.IGNORECASE,
+                ) for line in transformed]
+
         # Older round-tripped bodies can quote a local variable. In an
         # assignment "v" = "v", the left token is the local and the right
         # token is the source column; later bracketed uses are procedural.
@@ -1382,8 +1445,14 @@ def _plpgsql_to_tsql(sql: str) -> tuple[str | None, list[str]]:
                 for ln in transformed
             ]
 
-    transformed, table_var_declares = _redeclare_tsql_scalar_param_tables(transformed, params)
+    transformed, table_var_declares = _redeclare_tsql_scalar_param_tables(transformed, params, tvp_names)
     transformed = [_repair_tsql_parameter_contexts(ln, params) for ln in transformed]
+    for pname in tvp_names:
+        transformed = [re.sub(
+            rf"\b(FROM|JOIN)\s+unnest\s*\(\s*@{re.escape(pname)}\s*\)",
+            rf"\1 @{pname}", line, flags=re.IGNORECASE,
+        ) for line in transformed]
+    transformed = _collate_tsql_tvp_comparisons(transformed, tvp_names)
 
     declare_lines = []
     for var_name, type_and_init in declared.items():
@@ -1679,7 +1748,7 @@ def translate_routine(sql: str, source: str = "procedure", target: str = "postgr
     """
     if target == "postgres":
         return _tsql_to_plpgsql(sql, tables, user_types)
-    return _plpgsql_to_tsql(sql)
+    return _plpgsql_to_tsql(sql, user_types)
 
 
 if __name__ == "__main__":

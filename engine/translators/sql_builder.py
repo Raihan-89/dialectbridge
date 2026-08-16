@@ -616,7 +616,22 @@ def build_type_ddl(ut: UserType, target: str, source: str) -> tuple[list[str], l
         if ut.kind == "enum":
             return [], [f"PostgreSQL enum type '{ut.name}' has no SQL Server equivalent and was not migrated"]
         if ut.kind == "composite":
-            return [], [f"PostgreSQL composite type '{ut.name}' has no SQL Server equivalent and was not migrated"]
+            if not ut.columns:
+                return [], [f"PostgreSQL composite type '{ut.name}' has no attributes and was not migrated"]
+            columns = []
+            warnings = []
+            for column in ut.columns:
+                mapped, warn = convert_type(column.data_type, "postgres", "tsql")
+                if not mapped:
+                    return [], [f"Composite type '{ut.name}' attribute '{column.name}' could not be mapped: {warn}"]
+                nullability = " NULL" if column.nullable else " NOT NULL"
+                columns.append(f"{_qident(column.name, 'tsql')} {mapped}{nullability}")
+                if warn:
+                    warnings.append(f"Composite type '{ut.name}' attribute '{column.name}': {warn}")
+            warnings.append(
+                f"PostgreSQL composite type '{ut.name}' was converted to a SQL Server table type"
+            )
+            return [f"CREATE TYPE {_qident(ut.name, 'tsql')} AS TABLE ({', '.join(columns)})"], warnings
     return [], []
 
 
