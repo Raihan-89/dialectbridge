@@ -24,6 +24,10 @@ class MSSQLConnector(DatabaseConnector):
                 password=self.password,
                 login_timeout=10,
                 as_dict=False,
+                # pymssql otherwise binds Python datetime values using the
+                # legacy DATETIME representation, losing PostgreSQL's
+                # microseconds even when the target column is DATETIME2.
+                use_datetime2=True,
             )
             self._conn.autocommit(True)
         except Exception as exc:  # pymssql raises various exceptions on failure

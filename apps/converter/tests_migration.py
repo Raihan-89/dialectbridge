@@ -5,11 +5,27 @@ DatabaseConnector surface over plain Python dicts, so the orchestrator
 (extract -> convert -> DDL -> data copy -> FK/objects -> verify) runs
 exactly as it would against real MSSQL/PostgreSQL servers.
 """
+from unittest.mock import Mock, patch
+
 from django.test import SimpleTestCase
 
 from engine.connectors.base import ConnectorError
+from engine.connectors.mssql import MSSQLConnector
 from engine.migration.orchestrator import MigrationOrchestrator
 from engine.schema import Column, Constraint, Database, Table
+
+
+class MSSQLConnectorTests(SimpleTestCase):
+    @patch("engine.connectors.mssql.pymssql.connect")
+    def test_connect_uses_datetime2_binding_to_preserve_microseconds(self, connect):
+        raw_connection = Mock()
+        connect.return_value = raw_connection
+        connector = MSSQLConnector("db-host", 1433, "products", "user", "password")
+
+        connector.connect()
+
+        self.assertTrue(connect.call_args.kwargs["use_datetime2"])
+        raw_connection.autocommit.assert_called_once_with(True)
 
 
 class _FakeConnector:
