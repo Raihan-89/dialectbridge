@@ -184,7 +184,7 @@
     <div class="btn-row" style="margin-top:24px;justify-content:space-between;">
         <a href="{% url 'migrate' %}">← Back to migrations</a>
         {% if job.status != 'running' and job.status != 'pending' %}
-        <form method="post" action="{% url 'migration-delete' job.pk %}" data-confirm data-confirm-title="Delete migration #{{ job.pk }}?" data-confirm-message="{{ job.name }} and its complete report and captured errors will be permanently deleted.">
+        <form method="post" action="{% url 'migration-delete' job.pk %}" data-confirm data-confirm-title="Delete this migration?" data-confirm-message="{{ job.name }} and its complete report and captured errors will be permanently deleted.">
             {% csrf_token %}
             <button type="submit" class="btn btn-danger">Delete migration</button>
         </form>

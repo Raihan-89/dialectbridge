@@ -52,7 +52,7 @@
             z-index: 100;
         }
         .topbar-inner {
-            max-width: 1240px;
+            max-width: 1440px;
             margin: 0 auto;
             padding: 0 20px;
             display: flex;
@@ -100,7 +100,7 @@
 
         /* ---- layout ---- */
         .container {
-            max-width: 1240px;
+            max-width: 1440px;
             margin: 0 auto;
             padding: 32px 20px;
             width: 100%;
@@ -121,7 +121,7 @@
         .card h2 { margin-top: 0; }
         .grid-2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 24px; }
         .grid-2 > * { min-width: 0; }
-        .migration-layout { grid-template-columns: minmax(300px,.72fr) minmax(0,1.58fr); }
+        .migration-layout { grid-template-columns: minmax(300px,.55fr) minmax(0,1.85fr); }
         .connection-layout { grid-template-columns: minmax(300px,.72fr) minmax(0,1.58fr); }
         .migration-history-wrap { overflow: visible; }
         .connection-list-wrap { overflow: visible; }
@@ -180,7 +180,7 @@
             border: none;
             border-radius: 8px;
             cursor: pointer;
-            transition: background .15s, transform .08s, box-shadow .15s;
+            transition: background-color .09s cubic-bezier(.2,.8,.2,1), color .09s cubic-bezier(.2,.8,.2,1), border-color .09s cubic-bezier(.2,.8,.2,1), box-shadow .11s cubic-bezier(.2,.8,.2,1), transform .06s ease-out;
             background: var(--primary);
             color: #fff;
             white-space: nowrap;
@@ -196,6 +196,11 @@
         .btn-outline:hover { background: var(--primary-soft); }
         .btn-danger { background: var(--danger); }
         .btn-danger:hover { background: #b91c1c; }
+        .btn-delete-soft { background:var(--danger-soft); color:var(--danger); border:1px solid #fecaca; transition-duration:.08s; }
+        .btn-delete-soft:hover { background:var(--danger); color:#fff; border-color:var(--danger); box-shadow:0 6px 14px rgba(220,38,38,.18); }
+        .history-action-btn { min-width:78px; min-height:34px; padding:7px 13px; border-radius:8px; }
+        .confirm-action-btn { min-width:124px; min-height:40px; border-radius:9px; transition:background-color .045s ease-out,color .045s ease-out,border-color .045s ease-out,box-shadow .07s ease-out,transform .04s ease-out; }
+        .confirm-dialog .btn-delete-soft { transition:background-color 0s,color 0s,border-color 0s,box-shadow .045s ease-out,transform .035s ease-out; }
         .btn-ghost { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
         .btn-ghost:hover { background: var(--border); }
         .btn-sm { padding: 5px 10px; font-size: 13px; border-radius: 6px; }
@@ -302,6 +307,11 @@
         .confirm-card h2 { margin:0 0 8px; font-size:21px; }
         .confirm-card p { margin:0; color:var(--muted); font-size:14px; line-height:1.6; overflow-wrap:anywhere; }
         .confirm-actions { display:flex; justify-content:flex-end; gap:10px; padding:16px 26px; border-top:1px solid var(--border); background:#f8fafc; }
+        .bulk-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; margin-bottom:10px; border:1px solid var(--border); border-radius:10px; background:#f8fafc; }
+        .bulk-toolbar[hidden] { display:none; }
+        .bulk-count { color:var(--muted); font-size:13px; font-weight:600; }
+        .bulk-delete-btn { min-width:148px; padding:9px 16px; box-shadow:0 5px 12px rgba(220,38,38,.14); }
+        .row-select { width:16px; height:16px; accent-color:var(--primary); cursor:pointer; }
 
         @media (max-width: 900px) {
             .topbar-inner { height: 60px; position: relative; }
@@ -329,9 +339,12 @@
             .migration-history td::before, .connection-list td::before { content: attr(data-label); color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
             .migration-history td.table-actions { width: 100%; white-space: normal; }
             .connection-list td.table-actions { width: 100%; white-space: normal; }
-            .migration-history td.table-actions .btn { width: 100%; margin-top: 4px; }
+            .migration-history td.table-actions .btn { width: 100%; margin-top: 4px; min-height:38px; }
             .connection-list td.table-actions .btn-row { display: grid; grid-template-columns: 1fr 1fr; width: 100%; margin-top: 4px; }
             .connection-list td.table-actions .btn, .connection-list td.table-actions form { width: 100%; }
+        }
+        @media (max-width: 1120px) and (min-width: 901px) {
+            .migration-layout { grid-template-columns:1fr; }
         }
         @media (max-width: 600px) {
             body { font-size: 14px; line-height: 1.5; }
@@ -371,6 +384,8 @@
             .empty-state .big { font-size: 30px; }
             .progress-meta { align-items: flex-start; }
             .footer { padding: 14px 10px; font-size: 11px; }
+            .confirm-actions { flex-direction:column-reverse; padding:14px 18px; }
+            .confirm-action-btn { width:100%; }
         }
         @media (max-width: 380px) {
             .brand-name { display: none; }
@@ -418,8 +433,8 @@
             <p id="confirm-message">This action cannot be undone.</p>
         </div>
         <div class="confirm-actions">
-            <button type="button" class="btn btn-ghost" id="confirm-cancel">No, keep it</button>
-            <button type="button" class="btn btn-danger" id="confirm-delete">Yes, delete</button>
+            <button type="button" class="btn btn-ghost confirm-action-btn" id="confirm-cancel">No, keep it</button>
+            <button type="button" class="btn btn-delete-soft confirm-action-btn" id="confirm-delete">Yes, delete</button>
         </div>
     </dialog>
     <script>
@@ -438,6 +453,33 @@
                     toggle.setAttribute('aria-expanded', 'false');
                     toggle.textContent = '☰';
                 }
+            });
+        })();
+        (() => {
+            document.querySelectorAll('[data-bulk-table]').forEach(table => {
+                const key = table.dataset.bulkTable;
+                const toolbar = document.querySelector(`[data-bulk-toolbar="${key}"]`);
+                const selectAll = table.querySelector('[data-select-all]');
+                const rows = [...table.querySelectorAll('[data-row-select]')];
+                if (!toolbar || !selectAll || !rows.length) return;
+                const bulkForm = document.getElementById(rows[0].getAttribute('form'));
+                const update = () => {
+                    const selected = rows.filter(box => box.checked).length;
+                    toolbar.hidden = selected === 0;
+                    toolbar.querySelector('[data-selected-count]').textContent = selected;
+                    selectAll.checked = selected === rows.length;
+                    selectAll.indeterminate = selected > 0 && selected < rows.length;
+                    if (bulkForm) {
+                        const noun = key === 'migration-history' ? 'migration' : 'conversion';
+                        bulkForm.dataset.confirmMessage = `${selected} selected ${noun}${selected === 1 ? '' : 's'} will be permanently deleted${noun === 'migration' ? ', including reports and captured errors' : ''}.`;
+                    }
+                };
+                selectAll.addEventListener('change', () => {
+                    rows.forEach(box => { box.checked = selectAll.checked; });
+                    update();
+                });
+                rows.forEach(box => box.addEventListener('change', update));
+                update();
             });
         })();
         (() => {

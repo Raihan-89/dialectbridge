@@ -57,10 +57,16 @@
     <div class="card">
         <h2>Migration History</h2>
         {% if recent_jobs %}
+        <form id="migration-bulk-form" method="post" action="{% url 'migration-bulk-delete' %}" data-confirm data-confirm-title="Delete selected migrations?" data-confirm-message="The selected migration reports and captured errors will be permanently deleted.">{% csrf_token %}</form>
+        <div class="bulk-toolbar" data-bulk-toolbar="migration-history" hidden>
+            <span class="bulk-count"><strong data-selected-count>0</strong> selected</span>
+            <button type="submit" form="migration-bulk-form" class="btn btn-danger bulk-delete-btn">Delete selected</button>
+        </div>
         <div class="table-wrap migration-history-wrap">
-            <table class="migration-history">
+            <table class="migration-history" data-bulk-table="migration-history">
                 <thead>
                     <tr>
+                        <th><input class="row-select" type="checkbox" data-select-all aria-label="Select all finished migrations"></th>
                         <th>Serial</th>
                         <th>Name</th>
                         <th>Source → Target</th>
@@ -72,7 +78,8 @@
                 <tbody>
                     {% for job in recent_jobs %}
                     <tr>
-                        <td data-label="Serial"><a class="mono" href="{% url 'migrate-detail' job.pk %}"><strong>#{{ job.pk }}</strong></a></td>
+                        <td data-label="Select">{% if job.status != 'running' and job.status != 'pending' %}<input class="row-select" type="checkbox" name="selected_ids" value="{{ job.pk }}" form="migration-bulk-form" data-row-select aria-label="Select migration {{ job.name }}">{% else %}<span class="badge badge-neutral">Locked</span>{% endif %}</td>
+                        <td data-label="Serial"><a class="mono" href="{% url 'migrate-detail' job.pk %}"><strong>{{ forloop.revcounter }}</strong></a></td>
                         <td data-label="Name"><strong>{{ job.name }}</strong></td>
                         <td data-label="Route">{{ job.source.name }} → {{ job.target.name }}</td>
                         <td data-label="Status">
@@ -85,11 +92,11 @@
                         <td data-label="Run">{{ job.created_at|date:"Y-m-d H:i" }}</td>
                         <td data-label="Actions" class="table-actions">
                             <div class="btn-row">
-                                <a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline">View</a>
+                                <a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline history-action-btn">View</a>
                                 {% if job.status != 'running' and job.status != 'pending' %}
-                                <form method="post" action="{% url 'migration-delete' job.pk %}" data-confirm data-confirm-title="Delete migration #{{ job.pk }}?" data-confirm-message="{{ job.name }} and its complete report and captured errors will be permanently deleted.">
+                                <form method="post" action="{% url 'migration-delete' job.pk %}" data-confirm data-confirm-title="Delete this migration?" data-confirm-message="{{ job.name }} and its complete report and captured errors will be permanently deleted.">
                                     {% csrf_token %}
-                                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                                    <button type="submit" class="btn btn-sm btn-delete-soft history-action-btn">Delete</button>
                                 </form>
                                 {% endif %}
                             </div>

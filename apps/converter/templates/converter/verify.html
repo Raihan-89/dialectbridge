@@ -77,7 +77,7 @@
 
 <div class="card">
     <form method="get" class="form-grid" style="grid-template-columns:minmax(220px,1fr) auto;align-items:end;">
-        <div class="field"><label for="migration">Migration to verify</label><select id="migration" name="migration">{% for job in jobs %}<option value="{{ job.pk }}" {% if selected.pk == job.pk %}selected{% endif %}>{{ job.name }} — {{ job.source.database }} → {{ job.target.database }}</option>{% endfor %}</select></div>
+        <div class="field"><label for="migration">Migration to verify</label><select id="migration" name="migration">{% for job in jobs %}<option value="{{ job.pk }}" {% if selected.pk == job.pk %}selected{% endif %}>{{ forloop.revcounter }}. {{ job.name }} — {{ job.source.database }} → {{ job.target.database }}</option>{% endfor %}</select></div>
         <button class="btn" type="submit">Open migration</button>
     </form>
 </div>

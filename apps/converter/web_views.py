@@ -69,7 +69,7 @@ def convert_form_view(request):
 
 def history_view(request):
     """Lists past conversion jobs, most recent first."""
-    jobs = ConversionJob.objects.all()[:50]
+    jobs = ConversionJob.objects.order_by("-created_at", "-pk")[:50]
     return render(request, "converter/history.html", {"jobs": jobs})
 
 
@@ -79,6 +79,17 @@ def conversion_delete_view(request, pk):
     job = get_object_or_404(ConversionJob, pk=pk)
     job.delete()
     messages.success(request, "Conversion history entry deleted.")
+    return redirect("history")
+
+
+@require_POST
+def conversion_bulk_delete_view(request):
+    ids = request.POST.getlist("selected_ids")
+    deleted, _ = ConversionJob.objects.filter(pk__in=ids).delete() if ids else (0, {})
+    if deleted:
+        messages.success(request, f"Deleted {deleted} conversion history entries.")
+    else:
+        messages.warning(request, "Select at least one conversion to delete.")
     return redirect("history")
 
 
@@ -151,7 +162,7 @@ def migrate_view(request):
 
     context = {
         "connections": DatabaseConnection.objects.all(),
-        "recent_jobs": MigrationJob.objects.all(),
+        "recent_jobs": MigrationJob.objects.order_by("-created_at", "-pk"),
         "running_job": MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first(),
     }
     return render(request, "converter/migrate.html", context)
@@ -172,6 +183,24 @@ def migration_delete_view(request, pk):
     label = job.name or f"Migration #{job.pk}"
     job.delete()
     messages.success(request, f"'{label}' was deleted from migration history.")
+    return redirect("migrate")
+
+
+@require_POST
+def migration_bulk_delete_view(request):
+    ids = request.POST.getlist("selected_ids")
+    jobs = MigrationJob.objects.filter(pk__in=ids).exclude(
+        status__in=[MigrationJob.Status.RUNNING, MigrationJob.Status.PENDING]
+    )
+    selected_count = len(set(ids))
+    job_count = jobs.count()
+    if job_count:
+        jobs.delete()
+        messages.success(request, f"Deleted {job_count} migration history entries and their captured errors.")
+    else:
+        messages.warning(request, "Select at least one finished migration to delete.")
+    if selected_count > job_count:
+        messages.warning(request, "Running or pending migrations were kept.")
     return redirect("migrate")
 
 
@@ -257,7 +286,7 @@ def verify_view(request):
     """Live, read-only database comparison workspace."""
     jobs = MigrationJob.objects.select_related("source", "target").filter(
         status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL]
-    )
+    ).order_by("-created_at", "-pk")
     selected = None
     job_id = request.GET.get("migration")
     if job_id:

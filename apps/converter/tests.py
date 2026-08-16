@@ -1036,7 +1036,7 @@ class MigrationProgressViewTests(TestCase):
         self.job.report = {"summary": {"tables": 3}, "schema_results": [], "data_results": []}
         self.job.save()
         listing = self.client.get(reverse("migrate"))
-        self.assertContains(listing, f"#{self.job.pk}")
+        self.assertContains(listing, "<strong>1</strong>", html=True)
         self.assertContains(listing, reverse("migrate-detail", args=[self.job.pk]))
         detail = self.client.get(reverse("migrate-detail", args=[self.job.pk]))
         self.assertContains(detail, "Saved migration")
@@ -1091,6 +1091,88 @@ class HistoryDeletionTests(TestCase):
         self.assertContains(response, "data-confirm")
         self.assertContains(response, "Yes, delete")
         self.assertNotContains(response, "return confirm(")
+
+    def test_bulk_delete_conversions(self):
+        jobs = [ConversionJob.objects.create(
+            direction="mssql_to_postgres", statement_type="ddl", source_sql=f"SELECT {n}",
+        ) for n in range(3)]
+        response = self.client.post(reverse("conversion-bulk-delete"), {
+            "selected_ids": [jobs[0].pk, jobs[2].pk],
+        })
+        self.assertRedirects(response, reverse("history"))
+        self.assertEqual(list(ConversionJob.objects.values_list("pk", flat=True)), [jobs[1].pk])
+
+    def test_bulk_delete_migrations_keeps_running_job(self):
+        finished = MigrationJob.objects.create(
+            name="finished", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        running = MigrationJob.objects.create(
+            name="running", source=self.source, target=self.target,
+            status=MigrationJob.Status.RUNNING,
+        )
+        response = self.client.post(reverse("migration-bulk-delete"), {
+            "selected_ids": [finished.pk, running.pk],
+        })
+        self.assertRedirects(response, reverse("migrate"))
+        self.assertFalse(MigrationJob.objects.filter(pk=finished.pk).exists())
+        self.assertTrue(MigrationJob.objects.filter(pk=running.pk).exists())
+
+    def test_history_pages_render_bulk_selection_controls(self):
+        ConversionJob.objects.create(
+            direction="mssql_to_postgres", statement_type="ddl", source_sql="SELECT 1",
+        )
+        MigrationJob.objects.create(
+            name="finished", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        history = self.client.get(reverse("history"))
+        migration = self.client.get(reverse("migrate"))
+        self.assertContains(history, 'data-bulk-table="conversion-history"')
+        self.assertContains(history, "Delete selected")
+        self.assertContains(migration, 'data-bulk-table="migration-history"')
+        self.assertContains(migration, "Delete selected")
+
+    def test_migration_history_displays_consecutive_serials_not_database_ids(self):
+        first = MigrationJob.objects.create(
+            name="first", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        removed = MigrationJob.objects.create(
+            name="removed", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        MigrationJob.objects.create(
+            name="latest", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        removed.delete()
+        response = self.client.get(reverse("migrate"))
+        self.assertContains(response, "<strong>1</strong>", html=True)
+        self.assertContains(response, "<strong>2</strong>", html=True)
+        self.assertNotContains(response, f"<strong>#{first.pk}</strong>", html=True)
+
+    def test_latest_history_entries_are_rendered_first(self):
+        MigrationJob.objects.create(
+            name="older migration", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        MigrationJob.objects.create(
+            name="latest migration", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        ConversionJob.objects.create(
+            direction="mssql_to_postgres", statement_type="ddl", source_sql="older conversion",
+        )
+        ConversionJob.objects.create(
+            direction="postgres_to_mssql", statement_type="ddl", source_sql="latest conversion",
+        )
+        migration_html = self.client.get(reverse("migrate")).content.decode()
+        history_html = self.client.get(reverse("history")).content.decode()
+        self.assertLess(migration_html.index("latest migration"), migration_html.index("older migration"))
+        latest_row = migration_html[migration_html.rfind("<tr", 0, migration_html.index("latest migration")):migration_html.find("</tr>", migration_html.index("latest migration"))]
+        self.assertIn("<strong>2</strong>", latest_row)
+        self.assertLess(history_html.index("PostgreSQL → SQL Server"), history_html.index("SQL Server → PostgreSQL"))
 
     def test_finished_migration_delete_cascades_errors(self):
         job = MigrationJob.objects.create(

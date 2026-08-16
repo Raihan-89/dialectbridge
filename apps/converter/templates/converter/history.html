@@ -11,10 +11,16 @@
 
 <div class="card">
     {% if jobs %}
+    <form id="conversion-bulk-form" method="post" action="{% url 'conversion-bulk-delete' %}" data-confirm data-confirm-title="Delete selected conversions?" data-confirm-message="The selected conversion history entries will be permanently deleted.">{% csrf_token %}</form>
+    <div class="bulk-toolbar" data-bulk-toolbar="conversion-history" hidden>
+        <span class="bulk-count"><strong data-selected-count>0</strong> selected</span>
+        <button type="submit" form="conversion-bulk-form" class="btn btn-danger bulk-delete-btn">Delete selected</button>
+    </div>
     <div class="table-wrap">
-        <table class="conversion-history">
+        <table class="conversion-history" data-bulk-table="conversion-history">
             <thead>
                 <tr>
+                    <th><input class="row-select" type="checkbox" data-select-all aria-label="Select all conversions"></th>
                     <th>When</th>
                     <th>Direction</th>
                     <th>Type</th>
@@ -26,6 +32,7 @@
             <tbody>
                 {% for job in jobs %}
                 <tr>
+                    <td><input class="row-select" type="checkbox" name="selected_ids" value="{{ job.pk }}" form="conversion-bulk-form" data-row-select aria-label="Select conversion from {{ job.created_at|date:'Y-m-d H:i' }}"></td>
                     <td>{{ job.created_at|date:"Y-m-d H:i" }}</td>
                     <td>{{ job.get_direction_display }}</td>
                     <td><span class="badge badge-neutral">{{ job.get_statement_type_display }}</span></td>
@@ -34,7 +41,7 @@
                     <td class="table-actions">
                         <form method="post" action="{% url 'conversion-delete' job.pk %}" data-confirm data-confirm-title="Delete conversion history?" data-confirm-message="This {{ job.get_direction_display }} conversion from {{ job.created_at|date:'Y-m-d H:i' }} will be permanently deleted.">
                             {% csrf_token %}
-                            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                            <button type="submit" class="btn btn-sm btn-delete-soft history-action-btn">Delete</button>
                         </form>
                     </td>
                 </tr>
