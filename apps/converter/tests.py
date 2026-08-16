@@ -2,6 +2,8 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
+from unittest.mock import patch
+from datetime import timedelta
 
 from engine.schema import (
     CheckConstraint, Column, Constraint, Database, Index, PartitionChild, Permission,
@@ -1102,7 +1104,8 @@ class HistoryDeletionTests(TestCase):
         self.assertRedirects(response, reverse("history"))
         self.assertEqual(list(ConversionJob.objects.values_list("pk", flat=True)), [jobs[1].pk])
 
-    def test_bulk_delete_migrations_keeps_running_job(self):
+    @patch("apps.converter.web_views._schedule_migration_deletion")
+    def test_bulk_delete_migrations_keeps_running_job(self, _schedule):
         finished = MigrationJob.objects.create(
             name="finished", source=self.source, target=self.target,
             status=MigrationJob.Status.COMPLETED,
@@ -1115,7 +1118,8 @@ class HistoryDeletionTests(TestCase):
             "selected_ids": [finished.pk, running.pk],
         })
         self.assertRedirects(response, reverse("migrate"))
-        self.assertFalse(MigrationJob.objects.filter(pk=finished.pk).exists())
+        finished.refresh_from_db()
+        self.assertIsNotNone(finished.pending_deletion_token)
         self.assertTrue(MigrationJob.objects.filter(pk=running.pk).exists())
 
     def test_history_pages_render_bulk_selection_controls(self):
@@ -1174,7 +1178,8 @@ class HistoryDeletionTests(TestCase):
         self.assertIn("<strong>2</strong>", latest_row)
         self.assertLess(history_html.index("PostgreSQL → SQL Server"), history_html.index("SQL Server → PostgreSQL"))
 
-    def test_finished_migration_delete_cascades_errors(self):
+    @patch("apps.converter.web_views._schedule_migration_deletion")
+    def test_finished_migration_delete_can_be_undone(self, _schedule):
         job = MigrationJob.objects.create(
             name="finished", source=self.source, target=self.target,
             status=MigrationJob.Status.COMPLETED,
@@ -1182,6 +1187,30 @@ class HistoryDeletionTests(TestCase):
         MigrationError.objects.create(job=job, object_kind="table", object_name="dbo.T")
         response = self.client.post(reverse("migration-delete", args=[job.pk]))
         self.assertRedirects(response, reverse("migrate"))
+        job.refresh_from_db()
+        self.assertIsNotNone(job.pending_deletion_token)
+        listing = self.client.get(reverse("migrate"))
+        self.assertNotContains(listing, '<td data-label="Name"><strong>finished</strong></td>', html=True)
+        self.assertContains(listing, "Undo")
+        response = self.client.post(reverse("migration-undo-delete"), {
+            "token": str(job.pending_deletion_token),
+        })
+        self.assertRedirects(response, reverse("migrate"))
+        job.refresh_from_db()
+        self.assertIsNone(job.pending_deletion_token)
+        self.assertTrue(MigrationError.objects.filter(job_id=job.pk).exists())
+
+    def test_expired_pending_migration_is_permanently_deleted(self):
+        from apps.converter.web_views import _finalize_migration_deletion
+        token = "33333333-3333-3333-3333-333333333333"
+        job = MigrationJob.objects.create(
+            name="expired", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+            pending_deletion_token=token,
+            pending_deletion_at=timezone.now() - timedelta(seconds=1),
+        )
+        MigrationError.objects.create(job=job, object_kind="table", object_name="dbo.T")
+        _finalize_migration_deletion(token)
         self.assertFalse(MigrationJob.objects.filter(pk=job.pk).exists())
         self.assertFalse(MigrationError.objects.filter(job_id=job.pk).exists())
 

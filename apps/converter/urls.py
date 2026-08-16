@@ -24,6 +24,7 @@ urlpatterns = [
     path("migrate/<int:pk>/", web_views.migrate_detail_view, name="migrate-detail"),
     path("migrate/<int:pk>/delete/", web_views.migration_delete_view, name="migration-delete"),
     path("migrate/delete/", web_views.migration_bulk_delete_view, name="migration-bulk-delete"),
+    path("migrate/delete/undo/", web_views.migration_undo_delete_view, name="migration-undo-delete"),
     path("migrate/<int:pk>/status/", web_views.migrate_status_view, name="migrate-status"),
     path("errors/", web_views.errors_view, name="errors"),
     path("verify/", web_views.verify_view, name="verify"),

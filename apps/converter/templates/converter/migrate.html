@@ -56,6 +56,19 @@
 
     <div class="card">
         <h2>Migration History</h2>
+        {% if undo_deletion %}
+        <div class="undo-banner" id="migration-undo" data-deadline="{{ undo_deletion.deadline_ms }}">
+            <div>
+                <strong>'{{ undo_deletion.label }}' was deleted from migration history.</strong>
+                <span>Permanently deleting in <b data-undo-seconds>5</b> seconds.</span>
+            </div>
+            <form method="post" action="{% url 'migration-undo-delete' %}">
+                {% csrf_token %}
+                <input type="hidden" name="token" value="{{ undo_deletion.token }}">
+                <button type="submit" class="btn btn-outline">Undo</button>
+            </form>
+        </div>
+        {% endif %}
         {% if recent_jobs %}
         <form id="migration-bulk-form" method="post" action="{% url 'migration-bulk-delete' %}" data-confirm data-confirm-title="Delete selected migrations?" data-confirm-message="The selected migration reports and captured errors will be permanently deleted.">{% csrf_token %}</form>
         <div class="bulk-toolbar" data-bulk-toolbar="migration-history" hidden>
@@ -114,4 +127,20 @@
         {% endif %}
     </div>
 </div>
+{% if undo_deletion %}
+<script>
+(() => {
+    const banner=document.getElementById('migration-undo');
+    if(!banner)return;
+    const counter=banner.querySelector('[data-undo-seconds]');
+    const tick=()=>{
+        const remaining=Math.max(0,Math.ceil((Number(banner.dataset.deadline)-Date.now())/1000));
+        counter.textContent=remaining;
+        if(remaining>0) window.setTimeout(tick,200);
+        else banner.remove();
+    };
+    tick();
+})();
+</script>
+{% endif %}
 {% endblock %}

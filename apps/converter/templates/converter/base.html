@@ -312,6 +312,10 @@
         .bulk-count { color:var(--muted); font-size:13px; font-weight:600; }
         .bulk-delete-btn { min-width:148px; padding:9px 16px; box-shadow:0 5px 12px rgba(220,38,38,.14); }
         .row-select { width:16px; height:16px; accent-color:var(--primary); cursor:pointer; }
+        .undo-banner { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:13px 15px; margin-bottom:14px; border:1px solid #a7f3d0; border-radius:11px; background:var(--success-soft); color:#065f46; }
+        .undo-banner strong { display:block; font-size:14px; }
+        .undo-banner span { font-size:12px; opacity:.82; }
+        .undo-banner form { flex:0 0 auto; }
 
         @media (max-width: 900px) {
             .topbar-inner { height: 60px; position: relative; }
@@ -386,6 +390,8 @@
             .footer { padding: 14px 10px; font-size: 11px; }
             .confirm-actions { flex-direction:column-reverse; padding:14px 18px; }
             .confirm-action-btn { width:100%; }
+            .undo-banner { align-items:stretch; flex-direction:column; }
+            .undo-banner .btn { width:100%; }
         }
         @media (max-width: 380px) {
             .brand-name { display: none; }

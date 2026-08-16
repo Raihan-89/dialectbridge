@@ -1,4 +1,6 @@
 import threading
+import uuid
+from datetime import timedelta
 
 from django.contrib import messages
 from django.db import close_old_connections
@@ -17,6 +19,42 @@ from .models import ConversionJob, DatabaseConnection, MigrationError, Migration
 # Statement types the current engine can actually handle — others are shown
 # disabled in the form until their translators land.
 SUPPORTED_STATEMENT_TYPES = {"ddl", "dml"}
+DELETE_UNDO_SECONDS = 5
+
+
+def _finalize_migration_deletion(token: str) -> None:
+    """Permanently remove a pending batch once its undo window expires."""
+    close_old_connections()
+    try:
+        MigrationJob.objects.filter(
+            pending_deletion_token=token,
+            pending_deletion_at__lte=timezone.now(),
+        ).delete()
+    finally:
+        close_old_connections()
+
+
+def _schedule_migration_deletion(token: str) -> None:
+    timer = threading.Timer(DELETE_UNDO_SECONDS + 0.1, _finalize_migration_deletion, args=(token,))
+    timer.daemon = True
+    timer.start()
+
+
+def _queue_migration_deletion(request, jobs, label: str) -> int:
+    ids = list(jobs.values_list("pk", flat=True))
+    if not ids:
+        return 0
+    token = str(uuid.uuid4())
+    delete_at = timezone.now() + timedelta(seconds=DELETE_UNDO_SECONDS)
+    MigrationJob.objects.filter(pk__in=ids).update(
+        pending_deletion_token=token, pending_deletion_at=delete_at,
+    )
+    request.session["migration_delete_undo"] = {
+        "token": token, "label": label, "count": len(ids),
+        "deadline_ms": int(delete_at.timestamp() * 1000),
+    }
+    _schedule_migration_deletion(token)
+    return len(ids)
 
 
 def convert_form_view(request):
@@ -136,6 +174,9 @@ def connections_view(request):
 
 def migrate_view(request):
     """Run a migration between two saved connections and show the report."""
+    # Clean up expired batches after a process restart, when the original
+    # in-memory finalizer timer no longer exists.
+    MigrationJob.objects.filter(pending_deletion_at__lte=timezone.now()).delete()
     if request.method == "POST":
         active = MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first()
         if active:
@@ -160,16 +201,21 @@ def migrate_view(request):
         threading.Thread(target=_run_migration_job, args=(job.pk,), daemon=True).start()
         return redirect("migrate-detail", pk=job.pk)
 
+    undo = request.session.get("migration_delete_undo")
+    if undo and undo.get("deadline_ms", 0) <= int(timezone.now().timestamp() * 1000):
+        request.session.pop("migration_delete_undo", None)
+        undo = None
     context = {
         "connections": DatabaseConnection.objects.all(),
-        "recent_jobs": MigrationJob.objects.order_by("-created_at", "-pk"),
+        "recent_jobs": MigrationJob.objects.filter(pending_deletion_token__isnull=True).order_by("-created_at", "-pk"),
         "running_job": MigrationJob.objects.filter(status=MigrationJob.Status.RUNNING).first(),
+        "undo_deletion": undo,
     }
     return render(request, "converter/migrate.html", context)
 
 
 def migrate_detail_view(request, pk):
-    job = get_object_or_404(MigrationJob, pk=pk)
+    job = get_object_or_404(MigrationJob, pk=pk, pending_deletion_token__isnull=True)
     return render(request, "converter/migrate_detail.html", {"job": job})
 
 
@@ -181,8 +227,7 @@ def migration_delete_view(request, pk):
         messages.error(request, "A running or pending migration cannot be deleted.")
         return redirect("migrate-detail", pk=job.pk)
     label = job.name or f"Migration #{job.pk}"
-    job.delete()
-    messages.success(request, f"'{label}' was deleted from migration history.")
+    _queue_migration_deletion(request, MigrationJob.objects.filter(pk=job.pk), label)
     return redirect("migrate")
 
 
@@ -195,12 +240,33 @@ def migration_bulk_delete_view(request):
     selected_count = len(set(ids))
     job_count = jobs.count()
     if job_count:
-        jobs.delete()
-        messages.success(request, f"Deleted {job_count} migration history entries and their captured errors.")
+        label = f"{job_count} migrations"
+        _queue_migration_deletion(request, jobs, label)
     else:
         messages.warning(request, "Select at least one finished migration to delete.")
     if selected_count > job_count:
         messages.warning(request, "Running or pending migrations were kept.")
+    return redirect("migrate")
+
+
+@require_POST
+def migration_undo_delete_view(request):
+    token = request.POST.get("token", "")
+    try:
+        uuid.UUID(token)
+    except (ValueError, AttributeError):
+        messages.warning(request, "This undo request is invalid or has expired.")
+        return redirect("migrate")
+    restored = MigrationJob.objects.filter(
+        pending_deletion_token=token,
+        pending_deletion_at__gt=timezone.now(),
+    ).update(pending_deletion_token=None, pending_deletion_at=None)
+    request.session.pop("migration_delete_undo", None)
+    if restored:
+        messages.success(request, f"Restored {restored} migration history entr{'y' if restored == 1 else 'ies'}.")
+    else:
+        _finalize_migration_deletion(token)
+        messages.warning(request, "The five-second undo window has expired.")
     return redirect("migrate")
 
 
@@ -285,7 +351,8 @@ def errors_view(request):
 def verify_view(request):
     """Live, read-only database comparison workspace."""
     jobs = MigrationJob.objects.select_related("source", "target").filter(
-        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL]
+        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL],
+        pending_deletion_token__isnull=True,
     ).order_by("-created_at", "-pk")
     selected = None
     job_id = request.GET.get("migration")

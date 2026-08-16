@@ -93,6 +93,8 @@ class MigrationJob(models.Model):
     error_message = models.TextField(blank=True)
     progress_percent = models.PositiveSmallIntegerField(default=0)
     progress_stage = models.CharField(max_length=255, blank=True, default="Queued")
+    pending_deletion_token = models.UUIDField(null=True, blank=True, db_index=True)
+    pending_deletion_at = models.DateTimeField(null=True, blank=True)
 
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
