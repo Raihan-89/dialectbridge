@@ -60,7 +60,12 @@ def _objects(database, section: str) -> dict:
             "detail": f"{t.timing} {' / '.join(t.events)}", "table": t.table, "definition": t.definition,
         })
     if section == "types":
-        return _simple(database.types, lambda t: {"detail": f"{t.kind}: {t.base_type or ', '.join(t.values)}"})
+        return _simple(database.types, lambda t: {
+            "detail": f"{t.kind}: " + (
+                t.base_type or ", ".join(t.values)
+                or ", ".join(f"{c.name} {c.data_type}" for c in t.columns)
+            )
+        })
     if section == "synonyms":
         return _simple(database.synonyms, lambda s: {"detail": f"{s.target_kind} → {s.target_object}"})
     if section == "security":

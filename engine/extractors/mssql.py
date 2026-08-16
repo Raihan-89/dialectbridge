@@ -238,6 +238,21 @@ WHERE t.is_user_defined = 1
 ORDER BY t.name
 """
 
+_TABLE_TYPE_COLUMNS_SQL = """
+SELECT
+    c.name,
+    TYPE_NAME(c.user_type_id),
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    OBJECT_DEFINITION(c.default_object_id)
+FROM sys.table_types tt
+JOIN sys.columns c ON c.object_id = tt.type_table_object_id
+WHERE SCHEMA_NAME(tt.schema_id) + '.' + tt.name = %s
+ORDER BY c.column_id
+"""
+
 _SYNONYMS_SQL = """
 SELECT SCHEMA_NAME(schema_id) + '.' + name, base_object_name
 FROM sys.synonyms
@@ -619,11 +634,22 @@ def _extract_types(conn, database: Database) -> list[UserType]:
         name, is_table_type, is_assembly_type, base, length, precision, scale = row[:7]
         nullable, default = row[7], row[8]
         if is_table_type:
-            database.warnings.append(
-                f"User-defined table type '{name}' has no PostgreSQL equivalent (table-valued "
-                f"parameters are not supported) — type not migrated"
-            )
-            types.append(UserType(name=name, kind="table_type"))
+            columns = []
+            try:
+                column_rows = conn.fetch(_TABLE_TYPE_COLUMNS_SQL, (name,))
+            except Exception as exc:
+                database.warnings.append(
+                    f"Columns for table type '{name}' could not be inspected: {exc}"
+                )
+                column_rows = []
+            for col_name, col_type, col_len, col_precision, col_scale, col_nullable, col_default in column_rows:
+                columns.append(Column(
+                    name=col_name,
+                    data_type=_rebuild_type(col_type, col_len, col_precision, col_scale, None),
+                    nullable=bool(col_nullable),
+                    default=_clean_default(col_default),
+                ))
+            types.append(UserType(name=name, kind="table_type", columns=columns))
             continue
         if is_assembly_type:
             database.warnings.append(

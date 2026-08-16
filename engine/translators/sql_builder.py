@@ -185,12 +185,12 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
         warnings.extend(tw)
 
     for fn in database.functions:
-        stmts, tw = build_function_ddl(fn, target_dialect, database.tables)
+        stmts, tw = build_function_ddl(fn, target_dialect, database.tables, database.types)
         statements.extend(stmts)
         warnings.extend(tw)
 
     for proc in database.procedures:
-        stmts, tw = build_procedure_ddl(proc, target_dialect, database.tables)
+        stmts, tw = build_procedure_ddl(proc, target_dialect, database.tables, database.types)
         statements.extend(stmts)
         warnings.extend(tw)
 
@@ -518,17 +518,21 @@ def build_view_ddl(view: View, target: str, source: str, tables: list | None = N
     return [stmt], []
 
 
-def build_function_ddl(fn: Routine, target: str, tables: list | None = None) -> tuple[list[str], list[str]]:
+def build_function_ddl(fn: Routine, target: str, tables: list | None = None,
+                       user_types: list | None = None) -> tuple[list[str], list[str]]:
     from engine.translators.procedure_translator import translate_routine
-    converted, warnings = translate_routine(fn.definition, source=f"{fn.kind}", target=target, tables=tables)
+    converted, warnings = translate_routine(fn.definition, source=f"{fn.kind}", target=target,
+                                            tables=tables, user_types=user_types)
     if converted:
         return [converted], warnings
     return [], [f"Function '{fn.name}' could not be converted: {warnings}"]
 
 
-def build_procedure_ddl(proc: Routine, target: str, tables: list | None = None) -> tuple[list[str], list[str]]:
+def build_procedure_ddl(proc: Routine, target: str, tables: list | None = None,
+                        user_types: list | None = None) -> tuple[list[str], list[str]]:
     from engine.translators.procedure_translator import translate_routine
-    converted, warnings = translate_routine(proc.definition, source="procedure", target=target, tables=tables)
+    converted, warnings = translate_routine(proc.definition, source="procedure", target=target,
+                                            tables=tables, user_types=user_types)
     if converted:
         return [converted], warnings
     return [], [f"Procedure '{proc.name}' could not be converted: {warnings}"]
@@ -551,12 +555,30 @@ def build_trigger_ddl(trigger: Trigger, target: str) -> tuple[list[str], list[st
 def build_type_ddl(ut: UserType, target: str, source: str) -> tuple[list[str], list[str]]:
     """Convert a user-defined type into target-dialect DDL.
 
-    MSSQL alias types become PostgreSQL DOMAINs; PostgreSQL DOMAINs become
-    MSSQL alias types. Enums/composites/table-types/CLR types have no
-    equivalent in the other engine and are surfaced as warnings (the
-    extractors already flag them, so this is a defensive no-op for them).
+    MSSQL alias types become PostgreSQL DOMAINs and MSSQL table types become
+    PostgreSQL composite types (TVP parameters use composite arrays).
+    PostgreSQL DOMAINs become MSSQL alias types. Other composite/enum/CLR
+    conversions without a safe equivalent are surfaced as warnings.
     """
     if source == "tsql" and target == "postgres":
+        if ut.kind == "table_type":
+            if not ut.columns:
+                return [], [f"Table type '{ut.name}' has no columns and could not be converted"]
+            attributes = []
+            warnings = []
+            for column in ut.columns:
+                mapped, warn = convert_type(column.data_type, "tsql", "postgres")
+                if not mapped:
+                    return [], [f"Table type '{ut.name}' column '{column.name}' could not be mapped: {warn}"]
+                attributes.append(f"{_qident(column.name, 'postgres')} {mapped}")
+                if warn:
+                    warnings.append(f"Table type '{ut.name}' column '{column.name}': {warn}")
+            stmt = f"CREATE TYPE {_qident(ut.name, 'postgres')} AS ({', '.join(attributes)})"
+            warnings.append(
+                f"Table type '{ut.name}' was converted to a PostgreSQL composite type; "
+                "table-valued parameters use an array of this type"
+            )
+            return [stmt], warnings
         if ut.kind != "alias":
             return [], []
         base, warn = convert_type(ut.base_type or "", "tsql", "postgres")

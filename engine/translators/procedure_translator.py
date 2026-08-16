@@ -35,7 +35,8 @@ PARAM_RE = re.compile(
 # T-SQL -> PL/pgSQL
 # ---------------------------------------------------------------------------
 
-def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, list[str]]:
+def _tsql_to_plpgsql(sql: str, tables: list | None = None,
+                     user_types: list | None = None) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
 
     # ---- header -----------------------------------------------------------
@@ -71,6 +72,32 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
     params, param_warns = _parse_params(param_text, "tsql")
     warnings.extend(param_warns)
 
+    table_params: dict[str, object] = {}
+    for pname, ptype, _output in params:
+        normalized = re.sub(r"[\[\]\"\s]", "", ptype).casefold()
+        for user_type in user_types or []:
+            full_name = re.sub(r"[\[\]\"\s]", "", user_type.name).casefold()
+            if user_type.kind == "table_type" and normalized in {full_name, full_name.rsplit(".", 1)[-1]}:
+                table_params[pname.casefold()] = user_type
+                break
+
+    # SQL Server TVPs are relations. PostgreSQL receives an array of composite
+    # rows, so every FROM/JOIN reference must expand that array with unnest().
+    for pname, _ptype, _output in params:
+        if pname.casefold() not in table_params:
+            continue
+        pattern = re.compile(
+            rf"\b(FROM|JOIN)\s+@{re.escape(pname)}\b"
+            rf"(?:\s+(?:AS\s+)?(?!(?:WHERE|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|ON|ORDER|GROUP)\b)"
+            rf"([A-Za-z_][A-Za-z0-9_]*))?",
+            re.IGNORECASE,
+        )
+        def replace_tvp(match):
+            alias = match.group(2)
+            suffix = f" AS {alias}" if alias else f" AS {pname}"
+            return f"{match.group(1)} unnest(@{pname}){suffix}"
+        body = pattern.sub(replace_tvp, body)
+
     # detect result-returning SELECTs
     has_result_select = _has_result_select(body)
 
@@ -98,7 +125,13 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None) -> tuple[str | None, 
 
     param_list = []
     for pname, ptype, output in params:
-        tgt_type, warn = convert_type(ptype, "tsql", "postgres")
+        table_type = table_params.get(pname.casefold())
+        if table_type is not None:
+            parts = [part.strip('[]"') for part in table_type.name.split(".")]
+            tgt_type = ".".join(f'"{part}"' for part in parts) + "[]"
+            warn = None
+        else:
+            tgt_type, warn = convert_type(ptype, "tsql", "postgres")
         if warn:
             warnings.append(f"Parameter @{pname} type '{ptype}': {warn}")
         tgt_type = tgt_type or "TEXT"
@@ -1635,7 +1668,8 @@ _TSQL_KEYWORDS = frozenset(
 # ---------------------------------------------------------------------------
 
 def translate_routine(sql: str, source: str = "procedure", target: str = "postgres",
-                      tables: list | None = None) -> tuple[str | None, list[str]]:
+                      tables: list | None = None,
+                      user_types: list | None = None) -> tuple[str | None, list[str]]:
     """Translate a CREATE FUNCTION/PROCEDURE between dialects.
 
     source is 'procedure' or 'function' (used as a hint when T-SQL header
@@ -1644,7 +1678,7 @@ def translate_routine(sql: str, source: str = "procedure", target: str = "postgr
     replaces the awkward `SETOF record`. Returns (converted_sql, warnings).
     """
     if target == "postgres":
-        return _tsql_to_plpgsql(sql, tables)
+        return _tsql_to_plpgsql(sql, tables, user_types)
     return _plpgsql_to_tsql(sql)
 
 

@@ -205,6 +205,24 @@ END"""
             "Parameter @Products type 'dbo.ProductBulkType'" in w
             and "DBO.PRODUCTBULKTYPE" in w for w in warnings))
 
+    def test_tsql_table_parameter_converts_to_composite_array_and_unnest(self):
+        tsql = """CREATE PROCEDURE dbo.sp_BulkInsertProducts
+@Products dbo.ProductBulkType READONLY
+AS BEGIN
+INSERT INTO dbo.ProductMaster (ProductName)
+SELECT p.ProductName FROM @Products AS p;
+END"""
+        table_type = UserType(
+            name="dbo.ProductBulkType", kind="table_type",
+            columns=[Column("ProductName", "NVARCHAR(200)", nullable=False)],
+        )
+        converted, warnings = translate_routine(
+            tsql, source="procedure", target="postgres", user_types=[table_type],
+        )
+        self.assertIn('Products "dbo"."ProductBulkType"[]', converted)
+        self.assertIn("FROM unnest(Products) AS p", converted)
+        self.assertFalse(any("DBO.PRODUCTBULKTYPE" in warning for warning in warnings))
+
     def test_postgres_unbounded_routine_types_map_without_warnings(self):
         pg_fn = """CREATE FUNCTION dbo.f(searchterm character varying, amount numeric)
 RETURNS numeric LANGUAGE plpgsql AS $$ BEGIN RETURN amount; END; $$"""
@@ -1301,6 +1319,27 @@ class AdvancedFeatureDDLTests(TestCase):
         self.assertIn('CREATE DOMAIN "dbo"."PhoneNumber" AS VARCHAR(11) NOT NULL', stmts)
         self.assertIn('"dbo"."PhoneNumber"', stmts[-1])
         self.assertEqual(warnings, [])
+
+    def test_table_type_to_postgres_composite_type(self):
+        db = self._base_tsql()
+        db.types = [UserType(
+            name="dbo.ProductBulkType", kind="table_type",
+            columns=[Column("ProductName", "NVARCHAR(200)"), Column("Price", "DECIMAL(18,2)")],
+        )]
+        db.procedures = [Routine(
+            name="dbo.sp_BulkInsertProducts", kind="procedure",
+            definition="""CREATE PROCEDURE dbo.sp_BulkInsertProducts
+@Products dbo.ProductBulkType READONLY AS BEGIN
+SELECT ProductName FROM @Products;
+END""",
+        )]
+        stmts, warnings = build_database_ddl(db, "postgres")
+        self.assertIn(
+            'CREATE TYPE "dbo"."ProductBulkType" AS ("ProductName" VARCHAR(200), "Price" NUMERIC(18,2))',
+            stmts,
+        )
+        self.assertTrue(any('"dbo"."ProductBulkType"[]' in stmt for stmt in stmts))
+        self.assertTrue(any("converted to a PostgreSQL composite type" in warning for warning in warnings))
 
     def test_domain_to_alias_type(self):
         db = self._base_postgres()

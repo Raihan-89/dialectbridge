@@ -190,7 +190,7 @@ Routine kinds are preserved by the live migration engine: functions remain funct
 - Trigger translation is best-effort — statement-level vs row-level semantics are surfaced as warnings.
 - DDL trigger ↔ event trigger conversion is best-effort: `EVENTDATA()` maps to `TG_TAG`, and PG event triggers are recreated with a conservative event set that must be reviewed.
 - Synonyms only become PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings. The reverse leg skips these wrapper views with a warning (the SQL Server target already holds the original synonyms) so view counts stay identical.
-- PostgreSQL enums/composites/table-types/CLR types have no SQL Server equivalent and are flagged (enums/composites map to `NVARCHAR(MAX)` with a warning when used as column types).
+- SQL Server table types migrate to PostgreSQL composite types and TVP routine parameters become composite arrays expanded with `unnest()`. In the reverse direction, general PostgreSQL enums/composites and CLR types still have no safe SQL Server equivalent and are flagged.
 - Only `GRANT` permissions are ported; `DENY`/`REVOKE` are surfaced as warnings.
 - Partitioned tables: PostgreSQL requires the partition key to be part of the primary key (warned when violated); SQL Server partition functions migrate as non-partitioned tables with a warning.
 - Collation mapping is best-effort; unknown collations fall back to the target database collation with a warning.

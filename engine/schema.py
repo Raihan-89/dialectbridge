@@ -135,6 +135,7 @@ class UserType:
     nullable: bool = True
     constraints: list[str] = field(default_factory=list)   # CHECK definitions
     values: list[str] = field(default_factory=list)        # enum labels
+    columns: list[Column] = field(default_factory=list)    # table/composite attributes
 
 
 @dataclass
@@ -362,6 +363,11 @@ def _type_to_dict(t: UserType) -> dict:
         "nullable": t.nullable,
         "constraints": t.constraints,
         "values": t.values,
+        "columns": [
+            {"name": c.name, "data_type": c.data_type, "nullable": c.nullable,
+             "default": c.default}
+            for c in t.columns
+        ],
     }
 
 
