@@ -22,4 +22,6 @@ urlpatterns = [
     path("migrate/<int:pk>/", web_views.migrate_detail_view, name="migrate-detail"),
     path("migrate/<int:pk>/status/", web_views.migrate_status_view, name="migrate-status"),
     path("errors/", web_views.errors_view, name="errors"),
+    path("verify/", web_views.verify_view, name="verify"),
+    path("verify/<int:pk>/<str:section>/", web_views.verify_section_view, name="verify-section"),
 ]

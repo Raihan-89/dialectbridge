@@ -1,0 +1,121 @@
+{% extends "converter/base.html" %}
+{% block title %}Migration Verification — SQL Conversion Engine{% endblock %}
+{% block nav_verify %}active{% endblock %}
+{% block content %}
+<style>
+    .verify-hero { padding:30px; color:#fff; border:0; overflow:hidden; position:relative; background:linear-gradient(120deg,#111827 0%,#312e81 58%,#2563eb 100%); }
+    .verify-hero::after { content:""; position:absolute; width:260px; height:260px; right:-55px; top:-110px; border:1px solid rgba(255,255,255,.16); border-radius:50%; box-shadow:0 0 0 38px rgba(255,255,255,.035),0 0 0 76px rgba(255,255,255,.025); }
+    .verify-hero h1,.verify-hero p { position:relative; z-index:1; }
+    .verify-hero p { color:#c7d2fe; margin:8px 0 0; max-width:680px; }
+    .route-card { display:grid; grid-template-columns:minmax(0,1fr) 68px minmax(0,1fr); gap:14px; align-items:center; margin-top:24px; position:relative; z-index:1; }
+    .db-chip { padding:16px; border:1px solid rgba(255,255,255,.18); border-radius:12px; background:rgba(255,255,255,.09); backdrop-filter:blur(8px); }
+    .db-chip small { display:block; color:#a5b4fc; text-transform:uppercase; letter-spacing:.08em; font-size:10px; font-weight:800; }
+    .db-chip strong { display:block; margin:3px 0; }
+    .db-chip span { color:#dbeafe; font-size:12px; }
+    .route-arrow { text-align:center; color:#bfdbfe; font-size:26px; }
+    .verify-shell { display:grid; grid-template-columns:230px minmax(0,1fr); gap:22px; align-items:start; }
+    .verify-menu { padding:10px; position:sticky; top:82px; }
+    .verify-tab { width:100%; border:0; background:transparent; color:var(--muted); display:flex; justify-content:space-between; align-items:center; padding:11px 12px; border-radius:9px; cursor:pointer; font:600 13px inherit; text-align:left; }
+    .verify-tab:hover { background:var(--bg); color:var(--text); }
+    .verify-tab.active { background:var(--primary-soft); color:var(--primary); }
+    .verify-tab .dot { width:7px; height:7px; border-radius:50%; background:#cbd5e1; }
+    .verify-tab.loaded .dot { background:var(--success); }
+    .verify-tab.failed .dot { background:var(--danger); }
+    .verify-toolbar { display:flex; gap:10px; align-items:center; justify-content:space-between; margin-bottom:16px; flex-wrap:wrap; }
+    .result-summary { display:flex; gap:7px; flex-wrap:wrap; }
+    .compare-grid { display:grid; grid-template-columns:minmax(0,1fr) 108px minmax(0,1fr); border-bottom:1px solid var(--border); min-width:0; }
+    .compare-grid:last-child { border-bottom:0; }
+    .compare-cell { padding:13px 14px; min-width:0; }
+    .compare-cell.center { display:flex; align-items:center; justify-content:center; border-left:1px solid var(--border); border-right:1px solid var(--border); background:#fafbff; text-align:center; }
+    .compare-cell.center .badge { min-width:82px; text-align:center; }
+    .compare-name { font:600 13px var(--font-mono); overflow-wrap:anywhere; }
+    .compare-detail { color:var(--muted); font-size:12px; margin-top:3px; overflow-wrap:anywhere; }
+    .compare-head { background:#f8fafc; font-size:11px; text-transform:uppercase; letter-spacing:.06em; font-weight:800; color:var(--muted); }
+    .loading-panel { padding:70px 20px; text-align:center; color:var(--muted); }
+    .spinner { width:32px; height:32px; margin:0 auto 14px; border:3px solid #e0e7ff; border-top-color:var(--primary); border-radius:50%; animation:spin .75s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @media(max-width:800px){
+        .verify-shell{grid-template-columns:1fr}
+        .verify-menu{position:static;display:flex;overflow-x:auto;scrollbar-width:thin}
+        .verify-tab{min-width:max-content}
+        .route-card{grid-template-columns:1fr}
+        .route-arrow{transform:rotate(90deg)}
+    }
+    @media(max-width:650px){
+        .verify-hero{padding:22px 18px}
+        .verify-hero::after{display:none}
+        .verify-hero .route-card{margin-top:18px}
+        .verify-shell section.card{padding:14px!important}
+        .verify-toolbar{align-items:flex-start}
+        .compare-head{display:none}
+        .compare-grid:not(.compare-head){grid-template-columns:minmax(0,1fr) auto; margin:10px; border:1px solid var(--border); border-radius:10px; overflow:hidden}
+        .compare-grid:not(.compare-head) .compare-cell:first-child{grid-column:1;grid-row:1;padding-top:30px;position:relative}
+        .compare-grid:not(.compare-head) .compare-cell:first-child::before{content:'Source';position:absolute;top:9px;left:14px;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+        .compare-grid:not(.compare-head) .compare-cell.center{grid-column:2;grid-row:1;border:0;border-left:1px solid var(--border);padding:12px;min-width:106px}
+        .compare-grid:not(.compare-head) .compare-cell:last-child{grid-column:1 / -1;grid-row:2;border-top:1px solid var(--border);padding-top:30px;position:relative;background:#fcfcff}
+        .compare-grid:not(.compare-head) .compare-cell:last-child::before{content:'Target';position:absolute;top:9px;left:14px;color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
+    }
+    @media(max-width:420px){
+        .compare-grid:not(.compare-head){grid-template-columns:1fr}
+        .compare-grid:not(.compare-head) .compare-cell:first-child{grid-column:1;grid-row:1}
+        .compare-grid:not(.compare-head) .compare-cell.center{grid-column:1;grid-row:2;border-left:0;border-top:1px solid var(--border);justify-content:flex-start}
+        .compare-grid:not(.compare-head) .compare-cell:last-child{grid-column:1;grid-row:3}
+    }
+</style>
+
+<div class="card verify-hero">
+    <h1>Migration verification center</h1>
+    <p>Inspect both live databases side by side. Every section runs fresh, read-only catalog queries when you open it.</p>
+    {% if selected %}
+    <div class="route-card">
+        <div class="db-chip"><small>Source database</small><strong>{{ selected.source.name }}</strong><span>{{ selected.source.get_engine_display }} · {{ selected.source.database }}</span></div>
+        <div class="route-arrow">→</div>
+        <div class="db-chip"><small>Target database</small><strong>{{ selected.target.name }}</strong><span>{{ selected.target.get_engine_display }} · {{ selected.target.database }}</span></div>
+    </div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <form method="get" class="form-grid" style="grid-template-columns:minmax(220px,1fr) auto;align-items:end;">
+        <div class="field"><label for="migration">Migration to verify</label><select id="migration" name="migration">{% for job in jobs %}<option value="{{ job.pk }}" {% if selected.pk == job.pk %}selected{% endif %}>{{ job.name }} — {{ job.source.database }} → {{ job.target.database }}</option>{% endfor %}</select></div>
+        <button class="btn" type="submit">Open migration</button>
+    </form>
+</div>
+
+{% if selected %}
+<div class="verify-shell" data-endpoint="{% url 'verify-section' selected.pk 'SECTION' %}" id="verify-app">
+    <aside class="card verify-menu">
+        {% for key,label in sections.items %}<button class="verify-tab {% if forloop.first %}active{% endif %}" data-section="{{ key }}"><span>{{ label }}</span><i class="dot"></i></button>{% endfor %}
+    </aside>
+    <section class="card" style="padding:20px;min-width:0;">
+        <div class="verify-toolbar"><div><h2 id="result-title" style="margin:0;">Overview</h2><div class="subtitle" style="margin:3px 0 0;">Live comparison result</div></div><div class="result-summary" id="result-summary"></div></div>
+        <div class="table-wrap" id="result"><div class="loading-panel"><div class="spinner"></div>Connecting to both databases…</div></div>
+    </section>
+</div>
+{% else %}
+<div class="card empty-state"><div class="big">↔</div><h2>No completed migration yet</h2><p>Complete a migration first, then return here to compare its source and target connections.</p><a class="btn" href="{% url 'migrate' %}">Go to migrations</a></div>
+{% endif %}
+
+{% if selected %}<script>
+(() => {
+    const app=document.getElementById('verify-app'), result=document.getElementById('result'), summary=document.getElementById('result-summary'), title=document.getElementById('result-title');
+    const escape=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const detail=o=>o ? `<div class="compare-name">${escape(o.name)}</div><div class="compare-detail">${escape(o.detail ?? (o.rows!==undefined ? `${o.rows} rows` : o.count!==undefined ? `${o.count} objects` : ''))}</div>${o.definition?`<details class="compare-detail"><summary>Show SQL definition</summary><pre class="code-block" style="margin-top:8px;max-height:260px;">${escape(o.definition)}</pre></details>`:''}` : '<span class="compare-detail">Not present</span>';
+    const badge=s=>({match:'<span class="badge badge-ok">Match</span>',different:'<span class="badge badge-warn">Changed</span>',source_only:'<span class="badge badge-fail">Source only</span>',target_only:'<span class="badge badge-fail">Target only</span>'}[s]);
+    async function load(button){
+        document.querySelectorAll('.verify-tab').forEach(x=>x.classList.remove('active')); button.classList.add('active');
+        title.textContent=button.querySelector('span').textContent; summary.innerHTML=''; result.innerHTML='<div class="loading-panel"><div class="spinner"></div>Running read-only queries on both databases…</div>';
+        try {
+            const url=app.dataset.endpoint.replace('SECTION',button.dataset.section), response=await fetch(url,{headers:{'X-Requested-With':'XMLHttpRequest'}}), data=await response.json();
+            if(!response.ok) throw new Error(data.error||'Comparison failed');
+            button.classList.add('loaded');
+            summary.innerHTML=`<span class="badge badge-ok">${data.counts.match} matched</span>${data.counts.different?`<span class="badge badge-warn">${data.counts.different} changed</span>`:''}${data.counts.source_only?`<span class="badge badge-fail">${data.counts.source_only} source only</span>`:''}${data.counts.target_only?`<span class="badge badge-fail">${data.counts.target_only} target only</span>`:''}`;
+            const head='<div class="compare-grid compare-head"><div class="compare-cell">Source · {{ selected.source.database|escapejs }}</div><div class="compare-cell center">Status</div><div class="compare-cell">Target · {{ selected.target.database|escapejs }}</div></div>';
+            result.innerHTML=head+(data.rows.length?data.rows.map(r=>`<div class="compare-grid"><div class="compare-cell">${detail(r.source)}</div><div class="compare-cell center">${badge(r.status)}</div><div class="compare-cell">${detail(r.target)}</div></div>`).join(''):'<div class="empty-state">No objects found in this section.</div>');
+        } catch(e) { button.classList.add('failed'); result.innerHTML=`<div class="empty-state"><div class="big">!</div><h3>Could not run comparison</h3><p>${escape(e.message)}</p><button class="btn btn-outline" id="retry">Try again</button></div>`; document.getElementById('retry').onclick=()=>load(button); }
+    }
+    document.querySelectorAll('.verify-tab').forEach(b=>b.addEventListener('click',()=>load(b)));
+    load(document.querySelector('.verify-tab.active'));
+})();
+</script>{% endif %}
+{% endblock %}

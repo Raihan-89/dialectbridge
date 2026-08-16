@@ -10,6 +10,7 @@ from django.utils import timezone
 from engine.connectors.base import ConnectorError
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from . import migration_service
+from .verification_service import SECTION_LABELS, compare_live
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 
 # Statement types the current engine can actually handle — others are shown
@@ -227,3 +228,35 @@ def errors_view(request):
         },
     }
     return render(request, "converter/errors.html", context)
+
+
+def verify_view(request):
+    """Live, read-only database comparison workspace."""
+    jobs = MigrationJob.objects.select_related("source", "target").filter(
+        status__in=[MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL]
+    )
+    selected = None
+    job_id = request.GET.get("migration")
+    if job_id:
+        selected = get_object_or_404(jobs, pk=job_id)
+    elif jobs:
+        selected = jobs.first()
+    return render(request, "converter/verify.html", {
+        "jobs": jobs,
+        "selected": selected,
+        "sections": SECTION_LABELS,
+    })
+
+
+def verify_section_view(request, pk, section):
+    """Return one live comparison section for progressive loading in the UI."""
+    job = get_object_or_404(
+        MigrationJob.objects.select_related("source", "target"), pk=pk,
+    )
+    try:
+        result = compare_live(job.source, job.target, section)
+        return JsonResponse(result)
+    except (ConnectorError, ValueError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return JsonResponse({"error": f"Verification query failed: {exc}"}, status=500)
