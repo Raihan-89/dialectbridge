@@ -294,6 +294,15 @@
         details summary { transition: color .15s; }
         details summary:hover { color: var(--primary) !important; }
 
+        /* ---- confirmation modal ---- */
+        .confirm-dialog { width:min(440px,calc(100vw - 28px)); padding:0; border:0; border-radius:18px; color:var(--text); background:var(--surface); box-shadow:0 24px 70px rgba(15,23,42,.28); }
+        .confirm-dialog::backdrop { background:rgba(15,23,42,.58); backdrop-filter:blur(4px); }
+        .confirm-card { padding:26px; }
+        .confirm-icon { width:48px; height:48px; display:grid; place-items:center; border-radius:14px; background:var(--danger-soft); color:var(--danger); font-size:24px; font-weight:800; margin-bottom:18px; }
+        .confirm-card h2 { margin:0 0 8px; font-size:21px; }
+        .confirm-card p { margin:0; color:var(--muted); font-size:14px; line-height:1.6; overflow-wrap:anywhere; }
+        .confirm-actions { display:flex; justify-content:flex-end; gap:10px; padding:16px 26px; border-top:1px solid var(--border); background:#f8fafc; }
+
         @media (max-width: 900px) {
             .topbar-inner { height: 60px; position: relative; }
             .nav-toggle { display: inline-flex; }
@@ -402,6 +411,17 @@
     <footer class="footer">
         SQL Conversion Engine — MSSQL ⇄ PostgreSQL
     </footer>
+    <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+        <div class="confirm-card">
+            <div class="confirm-icon" aria-hidden="true">!</div>
+            <h2 id="confirm-title">Delete this item?</h2>
+            <p id="confirm-message">This action cannot be undone.</p>
+        </div>
+        <div class="confirm-actions">
+            <button type="button" class="btn btn-ghost" id="confirm-cancel">No, keep it</button>
+            <button type="button" class="btn btn-danger" id="confirm-delete">Yes, delete</button>
+        </div>
+    </dialog>
     <script>
         (() => {
             const toggle = document.querySelector('.nav-toggle');
@@ -418,6 +438,40 @@
                     toggle.setAttribute('aria-expanded', 'false');
                     toggle.textContent = '☰';
                 }
+            });
+        })();
+        (() => {
+            const dialog = document.getElementById('confirm-dialog');
+            const title = document.getElementById('confirm-title');
+            const message = document.getElementById('confirm-message');
+            const cancel = document.getElementById('confirm-cancel');
+            const approve = document.getElementById('confirm-delete');
+            let pendingForm = null;
+
+            document.querySelectorAll('form[data-confirm]').forEach(form => {
+                form.addEventListener('submit', event => {
+                    event.preventDefault();
+                    pendingForm = form;
+                    title.textContent = form.dataset.confirmTitle || 'Delete this item?';
+                    message.textContent = form.dataset.confirmMessage || 'This action cannot be undone.';
+                    dialog.showModal();
+                    cancel.focus();
+                });
+            });
+            cancel.addEventListener('click', () => dialog.close());
+            approve.addEventListener('click', () => {
+                if (!pendingForm) return;
+                approve.disabled = true;
+                approve.textContent = 'Deleting…';
+                pendingForm.submit();
+            });
+            dialog.addEventListener('click', event => {
+                if (event.target === dialog) dialog.close();
+            });
+            dialog.addEventListener('close', () => {
+                pendingForm = null;
+                approve.disabled = false;
+                approve.textContent = 'Yes, delete';
             });
         })();
     </script>

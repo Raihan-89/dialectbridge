@@ -83,7 +83,17 @@
                             {% else %}<span class="badge badge-neutral">Pending</span>{% endif %}
                         </td>
                         <td data-label="Run">{{ job.created_at|date:"Y-m-d H:i" }}</td>
-                        <td data-label="Report" class="table-actions"><a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline">View</a></td>
+                        <td data-label="Actions" class="table-actions">
+                            <div class="btn-row">
+                                <a href="{% url 'migrate-detail' job.pk %}" class="btn btn-sm btn-outline">View</a>
+                                {% if job.status != 'running' and job.status != 'pending' %}
+                                <form method="post" action="{% url 'migration-delete' job.pk %}" data-confirm data-confirm-title="Delete migration #{{ job.pk }}?" data-confirm-message="{{ job.name }} and its complete report and captured errors will be permanently deleted.">
+                                    {% csrf_token %}
+                                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                                </form>
+                                {% endif %}
+                            </div>
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>

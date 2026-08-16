@@ -6,6 +6,7 @@ from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
+from django.views.decorators.http import require_POST
 
 from engine.connectors.base import ConnectorError
 from engine.service import convert_sql, UnsupportedStatementTypeError
@@ -70,6 +71,15 @@ def history_view(request):
     """Lists past conversion jobs, most recent first."""
     jobs = ConversionJob.objects.all()[:50]
     return render(request, "converter/history.html", {"jobs": jobs})
+
+
+@require_POST
+def conversion_delete_view(request, pk):
+    """Delete one saved SQL conversion after the UI confirmation step."""
+    job = get_object_or_404(ConversionJob, pk=pk)
+    job.delete()
+    messages.success(request, "Conversion history entry deleted.")
+    return redirect("history")
 
 
 def connections_view(request):
@@ -150,6 +160,19 @@ def migrate_view(request):
 def migrate_detail_view(request, pk):
     job = get_object_or_404(MigrationJob, pk=pk)
     return render(request, "converter/migrate_detail.html", {"job": job})
+
+
+@require_POST
+def migration_delete_view(request, pk):
+    """Delete a finished migration report and its cascading captured errors."""
+    job = get_object_or_404(MigrationJob, pk=pk)
+    if job.status in {MigrationJob.Status.RUNNING, MigrationJob.Status.PENDING}:
+        messages.error(request, "A running or pending migration cannot be deleted.")
+        return redirect("migrate-detail", pk=job.pk)
+    label = job.name or f"Migration #{job.pk}"
+    job.delete()
+    messages.success(request, f"'{label}' was deleted from migration history.")
+    return redirect("migrate")
 
 
 def migrate_status_view(request, pk):

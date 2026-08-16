@@ -5,6 +5,10 @@
 <h1 class="page-title">Conversion History</h1>
 <p class="subtitle">Audit trail of every SQL conversion run through the converter.</p>
 
+{% if messages %}{% for message in messages %}
+<div class="alert {% if message.tags == 'success' %}alert-success{% elif message.tags == 'error' %}alert-error{% else %}alert-warning{% endif %}">{{ message }}</div>
+{% endfor %}{% endif %}
+
 <div class="card">
     {% if jobs %}
     <div class="table-wrap">
@@ -16,6 +20,7 @@
                     <th>Type</th>
                     <th>Status</th>
                     <th>Warnings</th>
+                    <th class="table-actions">Action</th>
                 </tr>
             </thead>
             <tbody>
@@ -26,6 +31,12 @@
                     <td><span class="badge badge-neutral">{{ job.get_statement_type_display }}</span></td>
                     <td>{% if job.succeeded %}<span class="badge badge-ok">✓ Success</span>{% else %}<span class="badge badge-fail">✕ Failed</span>{% endif %}</td>
                     <td>{% if job.warnings %}<span class="badge badge-warn">{{ job.warnings|length }} warning{{ job.warnings|pluralize }}</span>{% else %}<span class="badge badge-neutral">none</span>{% endif %}</td>
+                    <td class="table-actions">
+                        <form method="post" action="{% url 'conversion-delete' job.pk %}" data-confirm data-confirm-title="Delete conversion history?" data-confirm-message="This {{ job.get_direction_display }} conversion from {{ job.created_at|date:'Y-m-d H:i' }} will be permanently deleted.">
+                            {% csrf_token %}
+                            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                        </form>
+                    </td>
                 </tr>
                 {% endfor %}
             </tbody>

@@ -7,6 +7,10 @@
     {{ job.source.name }} ({{ job.source.get_engine_display }}) → {{ job.target.name }} ({{ job.target.get_engine_display }})
 </p>
 
+{% if messages %}{% for message in messages %}
+<div class="alert {% if message.tags == 'success' %}alert-success{% elif message.tags == 'error' %}alert-error{% else %}alert-warning{% endif %}">{{ message }}</div>
+{% endfor %}{% endif %}
+
 <div class="card">
     <div class="btn-row" style="margin-bottom: 16px;">
         <span class="badge
@@ -177,7 +181,15 @@
     <p class="subtitle">No per-object errors recorded for this migration.</p>
     {% endif %}
 
-    <p><a href="{% url 'migrate' %}">← Back to migrations</a></p>
+    <div class="btn-row" style="margin-top:24px;justify-content:space-between;">
+        <a href="{% url 'migrate' %}">← Back to migrations</a>
+        {% if job.status != 'running' and job.status != 'pending' %}
+        <form method="post" action="{% url 'migration-delete' job.pk %}" data-confirm data-confirm-title="Delete migration #{{ job.pk }}?" data-confirm-message="{{ job.name }} and its complete report and captured errors will be permanently deleted.">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-danger">Delete migration</button>
+        </form>
+        {% endif %}
+    </div>
 </div>
 {% if job.status == 'running' or job.status == 'pending' %}
 <script>

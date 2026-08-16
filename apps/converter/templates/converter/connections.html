@@ -87,7 +87,7 @@
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
                                     <button type="submit" class="btn btn-sm btn-outline">Test</button>
                                 </form>
-                                <form method="post" onsubmit="return confirm('Delete {{ conn.name }}?');">{% csrf_token %}
+                                <form method="post" data-confirm data-confirm-title="Delete connection?" data-confirm-message="{{ conn.name }} will be removed. Saved migrations using this connection may also be deleted.">{% csrf_token %}
                                     <input type="hidden" name="action" value="delete">
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
                                     <button type="submit" class="btn btn-sm btn-danger">Delete</button>

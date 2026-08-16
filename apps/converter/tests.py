@@ -1055,6 +1055,64 @@ class PortalNavigationTests(TestCase):
         self.assertContains(response, 'id="main-nav"')
 
 
+class HistoryDeletionTests(TestCase):
+    def setUp(self):
+        self.source = DatabaseConnection.objects.create(
+            name="source", engine="mssql", role="source", host="localhost",
+            port=1433, database="source_db", username="user",
+        )
+        self.target = DatabaseConnection.objects.create(
+            name="target", engine="postgres", role="target", host="localhost",
+            port=5432, database="target_db", username="user",
+        )
+
+    def test_conversion_history_delete_requires_post(self):
+        job = ConversionJob.objects.create(
+            direction="mssql_to_postgres", statement_type="ddl", source_sql="SELECT 1",
+        )
+        response = self.client.get(reverse("conversion-delete", args=[job.pk]))
+        self.assertEqual(response.status_code, 405)
+        self.assertTrue(ConversionJob.objects.filter(pk=job.pk).exists())
+
+    def test_conversion_history_entry_can_be_deleted(self):
+        job = ConversionJob.objects.create(
+            direction="mssql_to_postgres", statement_type="ddl", source_sql="SELECT 1",
+        )
+        response = self.client.post(reverse("conversion-delete", args=[job.pk]))
+        self.assertRedirects(response, reverse("history"))
+        self.assertFalse(ConversionJob.objects.filter(pk=job.pk).exists())
+
+    def test_history_uses_styled_confirmation_dialog(self):
+        ConversionJob.objects.create(
+            direction="mssql_to_postgres", statement_type="ddl", source_sql="SELECT 1",
+        )
+        response = self.client.get(reverse("history"))
+        self.assertContains(response, 'id="confirm-dialog"')
+        self.assertContains(response, "data-confirm")
+        self.assertContains(response, "Yes, delete")
+        self.assertNotContains(response, "return confirm(")
+
+    def test_finished_migration_delete_cascades_errors(self):
+        job = MigrationJob.objects.create(
+            name="finished", source=self.source, target=self.target,
+            status=MigrationJob.Status.COMPLETED,
+        )
+        MigrationError.objects.create(job=job, object_kind="table", object_name="dbo.T")
+        response = self.client.post(reverse("migration-delete", args=[job.pk]))
+        self.assertRedirects(response, reverse("migrate"))
+        self.assertFalse(MigrationJob.objects.filter(pk=job.pk).exists())
+        self.assertFalse(MigrationError.objects.filter(job_id=job.pk).exists())
+
+    def test_running_migration_cannot_be_deleted(self):
+        job = MigrationJob.objects.create(
+            name="running", source=self.source, target=self.target,
+            status=MigrationJob.Status.RUNNING,
+        )
+        response = self.client.post(reverse("migration-delete", args=[job.pk]))
+        self.assertRedirects(response, reverse("migrate-detail", args=[job.pk]))
+        self.assertTrue(MigrationJob.objects.filter(pk=job.pk).exists())
+
+
 class AdvancedFeatureDDLTests(TestCase):
     """Bidirectional conversion of sequences, user types, partitions, materialized
     views, INCLUDE/clustered indexes, collations, synonyms, security and DDL triggers."""
