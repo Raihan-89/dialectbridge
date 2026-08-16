@@ -1,9 +1,11 @@
+{% load static %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}SQL Conversion Engine{% endblock %}</title>
+    <title>{% block title %}DialectBridge{% endblock %}</title>
+    <link rel="shortcut icon" type="image/x-icon" href="{% static 'converter/favicon.ico' %}?v=4">
     <style>
         :root {
             --bg: #f5f7fc;
@@ -58,30 +60,31 @@
             display: flex;
             align-items: center;
             gap: 24px;
-            height: 60px;
+            height: 68px;
         }
         .brand {
             display: flex;
             align-items: center;
             gap: 10px;
             font-weight: 700;
-            font-size: 16px;
+            font-size: 18px;
             color: var(--text);
             min-width: 0;
         }
         .brand:hover { text-decoration: none; }
         .brand-logo {
-            width: 32px;
-            height: 32px;
-            border-radius: 8px;
+            width: 40px;
+            height: 40px;
+            border-radius: 11px;
             background: linear-gradient(135deg, #4f46e5, #7c3aed);
             color: #fff;
             display: grid;
             place-items: center;
-            font-size: 16px;
-            font-weight: 800;
             box-shadow: 0 6px 16px rgba(79,70,229,.25);
         }
+        .brand-logo svg { width: 29px; height: 29px; display: block; }
+        .brand-copy { display: flex; flex-direction: column; line-height: 1.05; }
+        .brand-tagline { margin-top: 4px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .055em; text-transform: uppercase; }
         .nav-toggle { display: none; margin-left: auto; width: 40px; height: 40px; padding: 0; font-size: 20px; }
         .nav-links { display: flex; gap: 4px; margin-left: auto; }
         .nav-links a {
@@ -359,10 +362,10 @@
         .undo-banner form { flex:0 0 auto; }
 
         @media (max-width: 900px) {
-            .topbar-inner { height: 60px; position: relative; }
+            .topbar-inner { height: 68px; position: relative; }
             .nav-toggle { display: inline-flex; }
             .nav-links {
-                display: none; position: absolute; top: 52px; left: 16px; right: 16px;
+                display: none; position: absolute; top: 60px; left: 16px; right: 16px;
                 padding: 10px; border: 1px solid var(--border); border-radius: 12px;
                 background: var(--surface); box-shadow: var(--shadow-lg); flex-direction: column;
             }
@@ -400,8 +403,10 @@
             .page-hero::after { display: none; }
             .page-hero-content { gap: 12px; }
             .page-hero-icon { width: 40px; height: 40px; flex-basis: 40px; border-radius: 11px; font-size: 18px; }
-            .brand { font-size: 13px; gap: 8px; white-space: nowrap; }
-            .brand-logo { width: 29px; height: 29px; font-size: 13px; }
+            .brand { font-size: 16px; gap: 9px; white-space: nowrap; }
+            .brand-logo { width: 35px; height: 35px; border-radius: 10px; }
+            .brand-logo svg { width: 25px; height: 25px; }
+            .brand-tagline { font-size: 9px; }
             h1 { font-size: 23px; line-height: 1.2; }
             h2 { font-size: 17px; }
             h3 { font-size: 15px; }
@@ -439,7 +444,7 @@
             .undo-banner .btn { width:100%; }
         }
         @media (max-width: 380px) {
-            .brand-name { display: none; }
+            .brand-copy { display: none; }
             h1 { font-size: 21px; }
             .container { padding-inline: 9px; }
             .card { padding: 13px; }
@@ -455,8 +460,8 @@
     <header class="topbar">
         <div class="topbar-inner">
             <a class="brand" href="{% url 'convert-form' %}">
-                <span class="brand-logo">&lt;/&gt;</span>
-                <span class="brand-name">SQL Conversion Engine</span>
+                <span class="brand-logo" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none"><ellipse cx="16" cy="16" rx="10" ry="5" stroke="currentColor" stroke-width="4"/><path d="M6 16v19c0 2.8 4.5 5 10 5s10-2.2 10-5V16M6 25c0 2.8 4.5 5 10 5s10-2.2 10-5" stroke="currentColor" stroke-width="4"/><ellipse cx="48" cy="29" rx="10" ry="5" stroke="currentColor" stroke-width="4"/><path d="M38 29v19c0 2.8 4.5 5 10 5s10-2.2 10-5V29M38 38c0 2.8 4.5 5 10 5s10-2.2 10-5M26 22h8l5 5M38 22l-5 5" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                <span class="brand-copy"><span class="brand-name">DialectBridge</span><span class="brand-tagline">Database Migration Studio</span></span>
             </a>
             <button class="btn btn-ghost nav-toggle" type="button" aria-expanded="false" aria-controls="main-nav" aria-label="Toggle navigation">☰</button>
             <nav class="nav-links" id="main-nav">
@@ -476,7 +481,7 @@
     </main>
 
     <footer class="footer">
-        SQL Conversion Engine — MSSQL ⇄ PostgreSQL
+        DialectBridge — MSSQL ⇄ PostgreSQL
     </footer>
     <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
         <div class="confirm-card">

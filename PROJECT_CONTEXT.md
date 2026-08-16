@@ -1,4 +1,4 @@
-# SQL Conversion Engine — Full Project Context
+# DialectBridge — Full Project Context
 
 A Django application that converts/migrates a full SQL database between **SQL Server (MSSQL)** and **PostgreSQL** in **both directions**.
 

@@ -1,4 +1,6 @@
-# SQL Conversion Engine
+# DialectBridge
+
+**Database Migration Studio for SQL Server and PostgreSQL**
 
 Convert and migrate full databases between **SQL Server (MSSQL)** and **PostgreSQL** — in both directions.
 
