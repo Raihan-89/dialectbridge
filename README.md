@@ -18,11 +18,16 @@ Two capabilities in one Django app:
 - Synonyms → PostgreSQL view wrappers
 - Database roles, users, role memberships and object GRANTs both directions
 - DDL triggers ↔ PostgreSQL event triggers
-- Data migration: batched keyset-paginated row copy, identity preservation, sequence re-seeding
+- Data migration: complete streaming for keyless tables, lexicographic keyset pagination for simple/composite primary keys, identity preservation and sequence re-seeding
+- Microsecond-safe PostgreSQL → SQL Server timestamp transfer through native `DATETIME2` parameter binding
 - Object conversion: views, stored procedures, user-defined functions, triggers
 - Data type mapping with warning flags for types that have no clean equivalent (never silently converted)
 - Manual-review warnings for anything the engine can't translate safely
 - Per-object migration report with source vs target row-count verification
+- Live schema verification center covering tables, columns, views, routines, triggers, indexes, constraints, types, security and row counts
+- Row-level Data explorer with primary-key alignment, changed-value highlighting, pagination and full-table canonical SHA-256 fingerprint verification
+- Downloadable whole-table verification reports
+- Read-only pre-migration assessment with compatibility blockers, warnings and generated target-DDL preview
 - Background web migrations with persisted phase/percentage progress and live polling
 - Complete migration history: each migration serial links back to its saved full report
 - Captured migration errors on a dedicated **Errors** page (`/errors/`), filterable by object kind / job / keyword
@@ -108,9 +113,11 @@ Supported statement types (text mode): `ddl`, `dml`.
 ### Full database migration
 
 1. Save your connections under **Connections** (`/connections/`) — source and target.
-2. Go to **Migrate** (`/migrate/`), pick source + target, optionally copy data and reset the target.
-3. Click **Run Migration**. The portal immediately opens the persisted job page and updates its phase and percentage while the migration runs in a background thread.
-4. Inspect the saved report: schema results, data results, row-count verification, warnings and captured errors. You can reopen it later by clicking its migration serial number.
+2. Go to **Migrate** (`/migrate/`) and pick the source and target.
+3. Click **Assess & preview first** to run a read-only compatibility assessment and inspect the generated target DDL. This does not modify the target.
+4. Optionally enable data copy and target reset, then click **Run Migration**. The portal immediately opens the persisted job page and updates its phase and percentage while the migration runs in a background thread.
+5. Inspect the saved report: schema results, data results, row-count verification, warnings and captured errors. You can reopen it later by clicking its migration serial number.
+6. Open **Verify** (`/verify/`) for live object/catalog comparison and **Data** (`/data/`) for side-by-side row inspection or exhaustive whole-table fingerprint verification.
 
 Only one web-started migration may run at a time. The REST create endpoint remains synchronous and returns the finished report.
 
@@ -134,6 +141,12 @@ POST /api/migrations/             {source: <id>, target: <id>, copy_data: true, 
 | Run migration | `/migrate/` |
 | Migration report | `/migrate/{id}/` |
 | Migration progress JSON | `/migrate/{id}/status/` |
+| Live schema verification | `/verify/` |
+| Verification section JSON | `/verify/{id}/{section}/` |
+| Table data explorer | `/data/` |
+| Live table discovery JSON | `/data/{id}/tables/` |
+| Paginated row comparison JSON | `/data/{id}/rows/` |
+| Exhaustive table fingerprint/report | `/data/{id}/checksum/` |
 | Migration errors | `/errors/` |
 
 ## API Endpoints
@@ -181,6 +194,8 @@ Routine kinds are preserved by the live migration engine: functions remain funct
 
 - `PROJECT_CONTEXT.md` — detailed, module-by-module breakdown of the entire codebase (architecture, responsibilities, data flow).
 
+The current automated suite contains **140 tests**. Run `python manage.py check` and `python manage.py test` before committing migration-engine changes.
+
 ---
 
 ## Known Limitations
@@ -197,5 +212,9 @@ Routine kinds are preserved by the live migration engine: functions remain funct
 - PostgreSQL routines cannot execute SQL Server transaction-control statements internally. `BEGIN/COMMIT/ROLLBACK TRANSACTION` is removed with a warning because the PostgreSQL call already runs within the caller's transaction.
 - SQL Server procedure result sets are represented as PostgreSQL `refcursor` outputs. Call PostgreSQL procedures inside a transaction and fetch the returned cursors.
 - Web migrations use an in-process background thread. This is suitable for the current single-process portal; production multi-worker/restart-safe deployments should move jobs to a durable queue such as Celery/RQ.
+- Pre-migration assessment is read-only and generates DDL, but it does not currently estimate transfer duration/storage or reserve target capacity.
+- Exhaustive verification reads every shared value from both live tables and can be expensive on large production databases. It verifies a canonical multiset fingerprint; the paginated browser is intended for locating visible differences.
+- Incremental/CDC synchronization, pause/resume after process restart and automated cutover/rollback orchestration are not implemented.
+- Saved connection passwords are signed/obfuscated with Django signing, not encrypted by an external key-management service. Production deployments should use a proper secrets manager.
 - The REST migration-create endpoint is synchronous.
 - `db.sqlite3` stores portal users, saved connections, job history and reports. Deleting it deletes that portal data; run `python manage.py migrate` to recreate empty tables.
