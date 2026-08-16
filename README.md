@@ -12,7 +12,12 @@ Two capabilities in one Django app:
 ## Features
 
 - Bidirectional: MSSQL → PostgreSQL **and** PostgreSQL → MSSQL
-- Schema conversion: tables, primary/foreign keys, unique/check constraints, indexes (incl. filtered/partial), computed columns, identities, sequences, defaults, collations
+- Schema conversion: tables, primary/foreign keys, unique/check constraints, indexes (incl. filtered/partial, `INCLUDE` columns), computed columns, identities, sequences, defaults, collations
+- Table partitioning (range/list parents + child partitions), temporal and graph flags
+- User-defined types: alias types ↔ domains, with enums/composites flagged for review
+- Synonyms → PostgreSQL view wrappers
+- Database roles, users, role memberships and object GRANTs both directions
+- DDL triggers ↔ PostgreSQL event triggers
 - Data migration: batched keyset-paginated row copy, identity preservation, sequence re-seeding
 - Object conversion: views, stored procedures, user-defined functions, triggers
 - Data type mapping with warning flags for types that have no clean equivalent (never silently converted)
@@ -164,8 +169,8 @@ apps/converter/    Django app (models, API, web UI)
 The conversion pipeline is:
 
 ```
-extract schema -> convert to target DDL -> apply structural DDL -> copy data
-  -> apply FKs/checks/views/procs/triggers -> verify row counts -> report
+extract schema -> convert to target DDL -> create schemas/types/sequences/tables
+  -> copy data -> apply FKs/checks/views/procs/triggers/security -> verify row counts -> report
 ```
 
 Routine kinds are preserved by the live migration engine: functions remain functions and stored procedures remain stored procedures in both directions. PostgreSQL procedures cannot directly stream SQL Server-style result sets, so migrated procedures expose those result sets through `INOUT refcursor` parameters; reverse migration removes the cursor plumbing and restores ordinary SQL Server result `SELECT`s.
@@ -181,8 +186,14 @@ Routine kinds are preserved by the live migration engine: functions remain funct
 ## Known Limitations
 
 - Text conversion mode supports `ddl`/`dml` only; stored procedure and trigger statement types are available through the **migration engine**, not yet through the paste-SQL converter.
-- Types with no clean equivalent (e.g. `GEOGRAPHY`, `SQL_VARIANT`, `HIERARCHYID`, PG `ARRAY`/`HSTORE`/range types) are flagged for manual review rather than converted.
+- Types with no clean equivalent (e.g. `GEOGRAPHY`, `SQL_VARIANT`, `HIERARCHYID`, `ROWVERSION`, `CURSOR`, PG `ARRAY`/`HSTORE`/range types/`INET`/`CIDR`/`MACADDR`) are flagged for manual review rather than converted.
 - Trigger translation is best-effort — statement-level vs row-level semantics are surfaced as warnings.
+- DDL trigger ↔ event trigger conversion is best-effort: `EVENTDATA()` maps to `TG_TAG`, and PG event triggers are recreated with a conservative event set that must be reviewed.
+- Synonyms only become PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings.
+- PostgreSQL enums/composites/table-types/CLR types have no SQL Server equivalent and are flagged (enums/composites map to `NVARCHAR(MAX)` with a warning when used as column types).
+- Only `GRANT` permissions are ported; `DENY`/`REVOKE` are surfaced as warnings.
+- Partitioned tables: PostgreSQL requires the partition key to be part of the primary key (warned when violated); SQL Server partition functions migrate as non-partitioned tables with a warning.
+- Collation mapping is best-effort; unknown collations fall back to the target database collation with a warning.
 - PostgreSQL routines cannot execute SQL Server transaction-control statements internally. `BEGIN/COMMIT/ROLLBACK TRANSACTION` is removed with a warning because the PostgreSQL call already runs within the caller's transaction.
 - SQL Server procedure result sets are represented as PostgreSQL `refcursor` outputs. Call PostgreSQL procedures inside a transaction and fetch the returned cursors.
 - Web migrations use an in-process background thread. This is suitable for the current single-process portal; production multi-worker/restart-safe deployments should move jobs to a durable queue such as Celery/RQ.
