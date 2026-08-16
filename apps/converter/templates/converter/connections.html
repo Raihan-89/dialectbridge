@@ -2,8 +2,9 @@
 {% block title %}Database Connections — SQL Conversion Engine{% endblock %}
 {% block nav_connections %}active{% endblock %}
 {% block content %}
-<h1 class="page-title">Database Connections</h1>
-<p class="subtitle">Saved live connections used by the migration engine. Passwords are stored obfuscated and never displayed.</p>
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">⌁</div><div class="page-hero-copy"><p class="page-hero-kicker">Database workspace</p><h1 class="page-title">Database Connections</h1><p class="subtitle">Saved live connections used by the migration engine. Passwords are stored obfuscated and never displayed.</p></div></div>
+</div>
 
 {% if messages %}
     {% for message in messages %}
@@ -13,7 +14,7 @@
 
 <div class="grid-2 connection-layout">
     <div class="card">
-        <h2>Add Connection</h2>
+        <h2 class="panel-title">Add Connection</h2>
         <form method="post" class="form-grid">
             {% csrf_token %}
             <div class="field">
@@ -58,7 +59,7 @@
     </div>
 
     <div class="card">
-        <h2>Saved Connections</h2>
+        <h2 class="panel-title">Saved Connections</h2>
         {% if connections %}
         <div class="table-wrap connection-list-wrap">
             <table class="connection-list">

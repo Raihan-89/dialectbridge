@@ -2,10 +2,9 @@
 {% block title %}Migration Report — SQL Conversion Engine{% endblock %}
 {% block nav_migrate %}active{% endblock %}
 {% block content %}
-<h1 class="page-title">{{ job.name }}</h1>
-<p class="subtitle">
-    {{ job.source.name }} ({{ job.source.get_engine_display }}) → {{ job.target.name }} ({{ job.target.get_engine_display }})
-</p>
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">▤</div><div class="page-hero-copy"><p class="page-hero-kicker">Migration report</p><h1 class="page-title">{{ job.name }}</h1><p class="subtitle">{{ job.source.name }} ({{ job.source.get_engine_display }}) → {{ job.target.name }} ({{ job.target.get_engine_display }})</p></div></div>
+</div>
 
 {% if messages %}{% for message in messages %}
 <div class="alert {% if message.tags == 'success' %}alert-success{% elif message.tags == 'error' %}alert-error{% else %}alert-warning{% endif %}">{{ message }}</div>

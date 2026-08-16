@@ -2,8 +2,9 @@
 {% block title %}Database Migration — SQL Conversion Engine{% endblock %}
 {% block nav_migrate %}active{% endblock %}
 {% block content %}
-<h1 class="page-title">Database Migration</h1>
-<p class="subtitle">Pick a source and a target connection and run the full migration: schema, data, views, functions, procedures and triggers — with row-count verification at the end.</p>
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">→</div><div class="page-hero-copy"><p class="page-hero-kicker">Migration workspace</p><h1 class="page-title">Database Migration</h1><p class="subtitle">Pick a source and a target connection and run the full migration: schema, data, views, functions, procedures and triggers — with row-count verification at the end.</p></div></div>
+</div>
 
 {% if messages %}
     {% for message in messages %}
@@ -13,7 +14,7 @@
 
 <div class="grid-2 migration-layout">
     <div class="card">
-        <h2>Run Migration</h2>
+        <h2 class="panel-title">Run Migration</h2>
         {% if running_job %}
         <div class="alert alert-warning">
             Migration <a href="{% url 'migrate-detail' running_job.pk %}"><strong>#{{ running_job.pk }} — {{ running_job.name }}</strong></a> is currently running.
@@ -55,7 +56,7 @@
     </div>
 
     <div class="card">
-        <h2>Migration History</h2>
+        <h2 class="panel-title">Migration History</h2>
         {% if undo_deletion %}
         <div class="undo-banner" id="migration-undo" data-deadline="{{ undo_deletion.deadline_ms }}">
             <div>

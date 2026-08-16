@@ -2,8 +2,9 @@
 {% block title %}Migration Errors — SQL Conversion Engine{% endblock %}
 {% block nav_errors %}active{% endblock %}
 {% block content %}
-<h1 class="page-title">Migration Errors</h1>
-<p class="subtitle">Failures captured from migration runs, stored per object for analysis.</p>
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">!</div><div class="page-hero-copy"><p class="page-hero-kicker">Diagnostics center</p><h1 class="page-title">Migration Errors</h1><p class="subtitle">Failures captured from migration runs, stored per object for analysis.</p></div></div>
+</div>
 
 <div class="card">
     <form method="get" class="form-grid filter-grid">
@@ -37,7 +38,7 @@
 
 <div class="card">
     <div class="section-head">
-        <h2>Errors</h2>
+        <h2 class="panel-title">Errors</h2>
         <span class="badge badge-fail">{{ errors|length }} shown</span>
     </div>
 

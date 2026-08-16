@@ -2,8 +2,9 @@
 {% block title %}Conversion History — SQL Conversion Engine{% endblock %}
 {% block nav_history %}active{% endblock %}
 {% block content %}
-<h1 class="page-title">Conversion History</h1>
-<p class="subtitle">Audit trail of every SQL conversion run through the converter.</p>
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">↺</div><div class="page-hero-copy"><p class="page-hero-kicker">Activity archive</p><h1 class="page-title">Conversion History</h1><p class="subtitle">Audit trail of every SQL conversion run through the converter.</p></div></div>
+</div>
 
 {% if messages %}{% for message in messages %}
 <div class="alert {% if message.tags == 'success' %}alert-success{% elif message.tags == 'error' %}alert-error{% else %}alert-warning{% endif %}">{{ message }}</div>

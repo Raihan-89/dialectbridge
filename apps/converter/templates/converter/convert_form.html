@@ -2,12 +2,13 @@
 {% block title %}Convert SQL — SQL Conversion Engine{% endblock %}
 {% block nav_convert %}active{% endblock %}
 {% block content %}
-<h1 class="page-title">SQL Conversion</h1>
-<p class="subtitle">Paste SQL in, pick a direction, and get dialect-converted SQL back — along with any manual-review warnings.</p>
+<div class="card page-hero">
+    <div class="page-hero-content"><div class="page-hero-icon">&lt;/&gt;</div><div class="page-hero-copy"><p class="page-hero-kicker">Dialect translator</p><h1 class="page-title">SQL Conversion</h1><p class="subtitle">Paste SQL in, pick a direction, and get dialect-converted SQL back — along with any manual-review warnings.</p></div></div>
+</div>
 
 <div class="grid-2">
     <div class="card">
-        <h2>Input</h2>
+        <h2 class="panel-title">Input</h2>
         <form method="post">
             {% csrf_token %}
             <div class="form-grid">
@@ -45,7 +46,7 @@
     </div>
 
     <div class="card">
-        <h2>Result</h2>
+        <h2 class="panel-title">Result</h2>
         {% if job %}
             {% if job.succeeded %}
                 <div class="btn-row" style="margin-bottom: 12px;">

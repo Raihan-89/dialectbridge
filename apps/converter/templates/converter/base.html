@@ -119,6 +119,46 @@
         }
         .card:hover { box-shadow: 0 8px 28px rgba(15,23,42,.08); border-color: #d7ddeb; }
         .card h2 { margin-top: 0; }
+        .page-hero {
+            padding: 30px;
+            color: #fff;
+            border: 0;
+            overflow: hidden;
+            position: relative;
+            background: linear-gradient(120deg,#111827 0%,#312e81 58%,#2563eb 100%);
+            box-shadow: 0 18px 42px rgba(49,46,129,.18);
+        }
+        .page-hero::after {
+            content: "";
+            position: absolute;
+            width: 260px;
+            height: 260px;
+            right: -55px;
+            top: -110px;
+            border: 1px solid rgba(255,255,255,.16);
+            border-radius: 50%;
+            box-shadow: 0 0 0 38px rgba(255,255,255,.035),0 0 0 76px rgba(255,255,255,.025);
+            pointer-events: none;
+        }
+        .page-hero-content { position: relative; z-index: 1; display: flex; align-items: flex-start; gap: 18px; }
+        .page-hero-icon {
+            width: 48px;
+            height: 48px;
+            flex: 0 0 48px;
+            display: grid;
+            place-items: center;
+            border: 1px solid rgba(255,255,255,.18);
+            border-radius: 14px;
+            background: rgba(255,255,255,.1);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,.12);
+            font-size: 22px;
+        }
+        .page-hero-copy { min-width: 0; }
+        .page-hero-kicker { margin: 0 0 4px; color: #a5b4fc; font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+        .page-hero h1 { position: relative; z-index: 1; color: #fff; }
+        .page-hero .subtitle { position: relative; z-index: 1; color: #c7d2fe; margin: 8px 0 0; max-width: 760px; }
+        .panel-title { display: flex; align-items: center; gap: 10px; }
+        .panel-title::before { content: ""; width: 4px; height: 20px; border-radius: 999px; background: linear-gradient(#6366f1,#2563eb); }
         .grid-2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 24px; }
         .grid-2 > * { min-width: 0; }
         .migration-layout { grid-template-columns: minmax(300px,.55fr) minmax(0,1.85fr); }
@@ -217,7 +257,7 @@
         .alert-warning { background: var(--warning-soft); color: #92400e; border-color: #fde68a; }
 
         /* ---- tables ---- */
-        .table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; -webkit-overflow-scrolling: touch; }
+        .table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; -webkit-overflow-scrolling: touch; box-shadow: inset 0 1px 0 rgba(255,255,255,.7); }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -232,7 +272,7 @@
             letter-spacing: .04em;
             color: var(--muted);
             border-bottom: 1px solid var(--border);
-            background: #f8fafc;
+            background: linear-gradient(180deg,#fbfcff,#f5f7fc);
             white-space: nowrap;
         }
         td { padding: 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -241,7 +281,8 @@
         .table-actions .btn-row { flex-wrap: nowrap; }
         .table-actions form { margin: 0; }
         tr:last-child td { border-bottom: none; }
-        tbody tr:hover { background: #f8fafc; }
+        tbody tr { transition: background .15s ease; }
+        tbody tr:hover { background: #f5f7ff; }
 
         /* ---- badges ---- */
         .badge {
@@ -355,6 +396,10 @@
             .topbar-inner { padding: 0 14px; gap: 10px; }
             .container { padding: 18px 12px; }
             .card { padding: 16px; margin-bottom: 14px; border-radius: 11px; }
+            .page-hero { padding: 22px 18px; }
+            .page-hero::after { display: none; }
+            .page-hero-content { gap: 12px; }
+            .page-hero-icon { width: 40px; height: 40px; flex-basis: 40px; border-radius: 11px; font-size: 18px; }
             .brand { font-size: 13px; gap: 8px; white-space: nowrap; }
             .brand-logo { width: 29px; height: 29px; font-size: 13px; }
             h1 { font-size: 23px; line-height: 1.2; }
