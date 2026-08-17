@@ -329,6 +329,7 @@ def translate_functions(text: str, source: str, target: str) -> str:
             "CONVERT": _convert_to_cast,
             "GETUTCDATE2": lambda a: "CURRENT_TIMESTAMP",
             "STR": _str_to_pg,
+            "SPACE": lambda a: f"REPEAT(' ', {a})",
         })
         # operator-level fixes
         text = re.sub(r"\bLEN\s*\(", "LENGTH(", text, flags=re.I)

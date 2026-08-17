@@ -325,7 +325,10 @@ def _build_column(col: Column, target: str, source: str,
                 parts[0] += f" DEFAULT {default}"
 
         if not col.nullable:
-            parts[0] += " NOT NULL"
+            # Downgraded computed columns must be nullable: the source data
+            # excludes computed columns, so target rows will have NULLs.
+            if not (col.is_computed and downgrade_computed):
+                parts[0] += " NOT NULL"
 
     return parts[0], warn
 
@@ -652,9 +655,12 @@ def build_sequence_ddl(seq: Sequence, target: str, source: str) -> tuple[list[st
             warnings.append(f"Sequence '{seq.name}': {warn}")
         else:
             warnings.append(f"Sequence '{seq.name}': {warn}")
+    start = seq.start_value
+    if target == "postgres" and start < 1:
+        start = 1
     stmt = (
         f"CREATE SEQUENCE {_qident(seq.name, target)}"
-        f"{type_clause} START WITH {seq.start_value} INCREMENT BY {seq.increment}"
+        f"{type_clause} START WITH {start} INCREMENT BY {seq.increment}"
     )
     if seq.is_cycling:
         stmt += " CYCLE"
