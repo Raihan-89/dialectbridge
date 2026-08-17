@@ -4,12 +4,21 @@ PostgreSQL connector built on psycopg2.
 from __future__ import annotations
 
 from typing import Iterator
+from uuid import UUID
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.extensions
 
 from engine.connectors.base import ConnectorError, DatabaseConnector, to_int
 from engine.extractors.postgres import extract_schema
+
+
+def _adapt_uuid(uuid_obj: UUID) -> psycopg2.extensions.AsIs:
+    return psycopg2.extensions.AsIs("'%s'::uuid" % (str(uuid_obj),))
+
+
+psycopg2.extensions.register_adapter(UUID, _adapt_uuid)
 
 
 class PostgresConnector(DatabaseConnector):
