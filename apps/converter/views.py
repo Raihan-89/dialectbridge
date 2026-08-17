@@ -1,4 +1,5 @@
 from django.utils import timezone
+import logging
 from rest_framework import status, viewsets, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -14,6 +15,8 @@ from .serializers import (
     DatabaseConnectionSerializer,
     MigrationJobSerializer,
 )
+
+logger = logging.getLogger("dialectbridge.api")
 
 
 class ConvertSQLView(APIView):
@@ -51,9 +54,11 @@ class ConvertSQLView(APIView):
             unsupported = True
             job.succeeded = False
             job.error_message = str(exc)
+            logger.warning("SQL conversion rejected direction=%s statement_type=%s error=%s", direction, statement_type, exc)
         except Exception as exc:
             job.succeeded = False
             job.error_message = str(exc)
+            logger.exception("SQL conversion failed direction=%s statement_type=%s", direction, statement_type)
         finally:
             job.save()
 
@@ -99,6 +104,7 @@ class DatabaseConnectionViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin
         try:
             result = migration_service.test_connection(connection)
         except ConnectorError as exc:
+            logger.warning("Database connection test failed connection_id=%s error=%s", connection.pk, exc)
             return Response({"ok": False, "error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(result)
 
@@ -144,6 +150,7 @@ class MigrationJobViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
                 else MigrationJob.Status.PARTIAL
             )
         except Exception as exc:
+            logger.exception("API migration job failed job_id=%s", job.pk)
             job.status = MigrationJob.Status.FAILED
             job.error_message = str(exc)
         finally:

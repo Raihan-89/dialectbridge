@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
+from time import monotonic
 
 from engine.connectors.base import ConnectorError
 from engine.migration.data_mover import DataMigration
@@ -28,6 +30,7 @@ _PRE_DATA_PREFIXES = ("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX",
                       "ALTER TABLE")
 _FK_PREFIXES = ("ALTER TABLE",)
 _PRE_TABLE_PREFIXES = ("CREATE DOMAIN", "CREATE TYPE", "CREATE SEQUENCE")
+logger = logging.getLogger("dialectbridge.migration")
 
 
 @dataclass
@@ -112,6 +115,11 @@ class MigrationOrchestrator:
             self.progress_callback(percent, stage)
 
     def run(self) -> MigrationReport:
+        started = monotonic()
+        logger.info(
+            "Migration started source=%s target=%s copy_data=%s reset_target=%s",
+            self.source.database, self.target.database, self.copy_data, self.reset_target,
+        )
         self._progress(5, "Connecting and extracting source schema")
         report = MigrationReport(
             source_db=self.source.database, target_db=self.target.database,
@@ -122,6 +130,7 @@ class MigrationOrchestrator:
         try:
             schema = self.source.extract_schema()
         except ConnectorError as exc:
+            logger.error("Schema extraction failed source=%s error=%s", self.source.database, exc)
             report.success = False
             report.warnings.append(f"Schema extraction failed: {exc}")
             report.finished_at = _now()
@@ -129,11 +138,15 @@ class MigrationOrchestrator:
             return report
 
         report.warnings.extend(schema.warnings)
+        if schema.warnings:
+            logger.warning("Schema extraction completed with %d warning(s)", len(schema.warnings))
 
         # ---- 2. convert -----------------------------------------------------
         self._progress(20, "Converting schema and database objects")
         ddl, conv_warnings = build_database_ddl(schema, self.target.dialect)
         report.warnings.extend(conv_warnings)
+        if conv_warnings:
+            logger.warning("Schema conversion completed with %d warning(s)", len(conv_warnings))
 
         # ---- 3. apply structural DDL -----------------------------------------
         self._progress(35, "Creating schemas, tables, and indexes")
@@ -212,6 +225,11 @@ class MigrationOrchestrator:
             "data_failed": sum(1 for r in report.data_results if r.status == "failed"),
             "warnings": len(report.warnings),
         }
+        logger.info(
+            "Migration finished status=%s rows_copied=%d rows_failed=%d warnings=%d duration_seconds=%.1f",
+            report.summary["status"], report.summary["rows_copied"],
+            report.summary["rows_failed"], report.summary["warnings"], monotonic() - started,
+        )
         self._progress(98, "Saving migration report")
         return report
 
@@ -314,6 +332,7 @@ class MigrationOrchestrator:
             self._apply(report, "table", stmt, object_name=table.name)
 
     def _copy_table(self, report: MigrationReport, table) -> None:
+        started = monotonic()
         mover = DataMigration(self.source, self.target, table)
         result = mover.run()
         obj = ObjectResult(
@@ -323,6 +342,16 @@ class MigrationOrchestrator:
             detail="; ".join(result["errors"][:3]),
         )
         report.data_results.append(obj)
+        if obj.status == "failed":
+            logger.error(
+                "Table copy failed table=%s rows_copied=%d rows_failed=%d error=%s",
+                table.name, obj.rows_copied, obj.rows_failed, obj.detail,
+            )
+        else:
+            logger.info(
+                "Table copied table=%s rows=%d duration_seconds=%.1f",
+                table.name, obj.rows_copied, monotonic() - started,
+            )
 
     def _apply(self, report: MigrationReport, kind: str, stmt: str, object_name: str | None = None) -> None:
         name = object_name or _name_from_stmt(stmt)
@@ -330,6 +359,7 @@ class MigrationOrchestrator:
             self.target.execute(stmt)
             report.schema_results.append(ObjectResult(kind=kind, name=name))
         except ConnectorError as exc:
+            logger.error("Schema object creation failed kind=%s name=%s error=%s", kind, name, exc)
             report.schema_results.append(
                 ObjectResult(
                     kind=kind, name=name, status="failed",
@@ -343,11 +373,13 @@ class MigrationOrchestrator:
         for table in schema.tables:
             try:
                 src_count = self.source.count_rows(table.name)
-            except ConnectorError:
+            except ConnectorError as exc:
+                logger.warning("Source row-count verification failed table=%s error=%s", table.name, exc)
                 src_count = None
             try:
                 tgt_count = self.target.count_rows(table.name)
-            except ConnectorError:
+            except ConnectorError as exc:
+                logger.warning("Target row-count verification failed table=%s error=%s", table.name, exc)
                 tgt_count = None
             results.append({
                 "table": table.name,

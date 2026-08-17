@@ -1,4 +1,5 @@
 import threading
+import logging
 import uuid
 from datetime import timedelta
 
@@ -8,6 +9,8 @@ from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
+
+logger = logging.getLogger("dialectbridge.web")
 from django.views.decorators.http import require_GET, require_POST
 
 from engine.connectors.base import ConnectorError
@@ -305,6 +308,7 @@ def _run_migration_job(job_id: int) -> None:
     close_old_connections()
     try:
         job = MigrationJob.objects.select_related("source", "target").get(pk=job_id)
+        logger.info("Background migration job started job_id=%s", job_id)
 
         def progress(percent, stage):
             MigrationJob.objects.filter(pk=job_id).update(
@@ -322,6 +326,7 @@ def _run_migration_job(job_id: int) -> None:
         job.progress_stage = "Migration completed" if report.get("success") else "Completed with errors"
         migration_service.record_migration_errors(job, report)
     except Exception as exc:
+        logger.exception("Background migration job failed job_id=%s", job_id)
         job = MigrationJob.objects.get(pk=job_id)
         job.status = MigrationJob.Status.FAILED
         job.error_message = str(exc)
@@ -329,6 +334,7 @@ def _run_migration_job(job_id: int) -> None:
     finally:
         job.finished_at = timezone.now()
         job.save()
+        logger.info("Background migration job finished job_id=%s status=%s", job_id, job.status)
         close_old_connections()
 
 
