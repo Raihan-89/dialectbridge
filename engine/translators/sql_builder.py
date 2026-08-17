@@ -216,11 +216,13 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
 
 
 def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
-                    database: Database | None = None) -> tuple[list[str], list[str]]:
+                    database: Database | None = None,
+                    downgrade_computed: bool = False) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
     col_lines = []
     for col in table.columns:
-        line, warn = _build_column(col, target_dialect, source_dialect, database)
+        line, warn = _build_column(col, target_dialect, source_dialect, database,
+                                   downgrade_computed=downgrade_computed)
         if line is None:
             warnings.append(f"Table '{table.name}' column '{col.name}': {warn}")
             continue
@@ -269,7 +271,8 @@ def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
 
 
 def _build_column(col: Column, target: str, source: str,
-                  database: Database | None = None) -> tuple[str | None, str | None]:
+                  database: Database | None = None,
+                  downgrade_computed: bool = False) -> tuple[str | None, str | None]:
     target_type, warn = _resolve_column_type(col.data_type, source, target, database)
     if target_type is None:
         return None, warn
@@ -282,7 +285,7 @@ def _build_column(col: Column, target: str, source: str,
 
     parts = [f"{_qident(col.name, target)} {target_type}"]
 
-    if col.is_computed:
+    if col.is_computed and not downgrade_computed:
         # T-SQL computed columns must NOT declare a type — it is inferred
         # from the expression. A PG-generated column's default_expr IS its
         # generation expression; never emit computed columns as DEFAULT
@@ -422,6 +425,7 @@ def build_index_ddl(table: Table, index: Index, target: str, source: str) -> tup
     elif index.where:
         # PostgreSQL keeps filtered indexes as partial indexes.
         where = _translate_expr(index.where, source, target)
+        where = _normalize_index_where_columns(where, table)
         where = fix_boolean_predicates(where, [table], source)
         stmt += f" WHERE {where}"
     return [stmt], warnings
@@ -966,6 +970,27 @@ def _boolean_column_names(tables: list, source: str) -> set[str]:
             if base in ("BIT", "BOOLEAN"):
                 bool_cols.add(col.name.lower())
     return bool_cols
+
+
+def _normalize_index_where_columns(where: str, table: Table) -> str:
+    """Normalize quoted column references in an index WHERE clause to match
+    the actual column names from the table schema.
+
+    MSSQL filter_definition may use different casing than sys.columns,
+    causing case mismatches when the expression is quoted for PostgreSQL.
+    """
+    col_casing: dict[str, str] = {}
+    for col in table.columns:
+        col_casing[col.name.lower()] = col.name
+
+    def _replace_col(match):
+        name = match.group(1)
+        canon = col_casing.get(name.lower())
+        if canon and canon != name:
+            return f'"{canon}"'
+        return match.group(0)
+
+    return re.sub(r'"([\w]+)"', _replace_col, where)
 
 
 def fix_boolean_predicates(expr: str, tables: list, source: str) -> str:

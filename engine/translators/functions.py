@@ -328,6 +328,7 @@ def translate_functions(text: str, source: str, target: str) -> str:
             "STUFF": _stuff_to_overlay,
             "CONVERT": _convert_to_cast,
             "GETUTCDATE2": lambda a: "CURRENT_TIMESTAMP",
+            "STR": _str_to_pg,
         })
         # operator-level fixes
         text = re.sub(r"\bLEN\s*\(", "LENGTH(", text, flags=re.I)
@@ -352,6 +353,20 @@ def translate_functions(text: str, source: str, target: str) -> str:
         text = re.sub(r"\bCAST\s*\(([^)]+)\s+AS\s+timestamp without time zone\)", r"CAST(\1 AS DATETIME2)", text, flags=re.I)
         return text
     return text
+
+
+def _str_to_pg(args: str) -> str | None:
+    parts = _split_args(args)
+    if not parts:
+        return None
+    expr = parts[0]
+    if len(parts) == 1:
+        return f"CAST({expr} AS TEXT)"
+    length = parts[1].strip()
+    if len(parts) == 2:
+        return f"RPAD(CAST({expr} AS TEXT), {length}, ' ')"
+    decimal = parts[2].strip()
+    return f"RPAD(TO_CHAR({expr}, 'FM' || RPAD('', GREATEST({length} - {decimal} - 1, 1), '9') || '.' || RPAD('', {decimal}, '9')), {length}, ' ')"
 
 
 def _patindex_to_position2(args: str) -> str:

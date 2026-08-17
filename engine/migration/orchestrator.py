@@ -330,6 +330,22 @@ class MigrationOrchestrator:
         report.warnings.extend(warnings)
         for stmt in stmts:
             self._apply(report, "table", stmt, object_name=table.name)
+            last_result = report.schema_results[-1] if report.schema_results else None
+            if (last_result and last_result.status == "failed"
+                    and last_result.kind == "table"
+                    and "generation expression is not immutable" in last_result.detail):
+                retry_stmts, retry_warnings = build_table_ddl(
+                    table, self.target.dialect, schema.dialect,
+                    downgrade_computed=True,
+                )
+                report.warnings.extend(retry_warnings)
+                report.warnings.append(
+                    f"Table '{table.name}' has non-immutable computed columns — "
+                    f"recreated with computed columns as regular columns"
+                )
+                report.schema_results.pop()
+                for retry_stmt in retry_stmts:
+                    self._apply(report, "table", retry_stmt, object_name=table.name)
 
     def _copy_table(self, report: MigrationReport, table) -> None:
         started = monotonic()
