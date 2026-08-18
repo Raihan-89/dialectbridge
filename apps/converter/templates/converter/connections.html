@@ -51,7 +51,10 @@
             </div>
             <div class="field">
                 <label for="password">Password</label>
-                <input type="password" name="password" id="password">
+                <div class="pw-wrap">
+                    <input type="password" name="password" id="password">
+                    <button type="button" class="pw-toggle" onclick="togglePw('password',this)" aria-label="Show password">👁</button>
+                </div>
             </div>
             <input type="hidden" name="action" value="create">
             <button type="submit" class="btn">Save Connection</button>
@@ -154,14 +157,24 @@
             </div>
             <div class="field">
                 <label for="edit-password">Password <span class="hint">— leave blank to keep current</span></label>
-                <input type="password" name="password" id="edit-password" placeholder="Leave blank to keep current">
+                <div class="pw-wrap">
+                    <input type="password" name="password" id="edit-password" placeholder="Leave blank to keep current">
+                    <button type="button" class="pw-toggle" onclick="togglePw('edit-password',this)" aria-label="Show password">👁</button>
+                </div>
             </div>
             <button type="submit" class="btn">Update Connection</button>
         </form>
     </div>
 </div>
 
+<style>
+.pw-wrap{position:relative}
+.pw-wrap input{padding-right:40px}
+.pw-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:16px;padding:4px;line-height:1;opacity:.55;transition:opacity .15s}
+.pw-toggle:hover{opacity:1}
+</style>
 <script>
+function togglePw(id,btn){var inp=document.getElementById(id);if(inp.type==='password'){inp.type='text';btn.textContent='\uD83D\uDD12'}else{inp.type='password';btn.textContent='\uD83D\uDC41'}}
 function openEditModal(pk, name, engine, role, host, port, database, username) {
     document.getElementById('edit-connection-id').value = pk;
     document.getElementById('edit-name').value = name;
@@ -172,6 +185,9 @@ function openEditModal(pk, name, engine, role, host, port, database, username) {
     document.getElementById('edit-database').value = database;
     document.getElementById('edit-username').value = username;
     document.getElementById('edit-password').value = '';
+    document.getElementById('edit-password').type = 'password';
+    var toggleBtn = document.querySelector('#editModal .pw-toggle');
+    if (toggleBtn) toggleBtn.textContent = '\uD83D\uDC41';
     document.getElementById('editModal').style.display = 'flex';
 }
 function closeEditModal() {
