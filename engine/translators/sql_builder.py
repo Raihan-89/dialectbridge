@@ -885,6 +885,10 @@ def _translate_expr(expr: str, source: str, target: str) -> str:
         out = re.sub(r'"\[([\w\s\d_]+)\]"', r'"\1"', out)
         # MSSQL N-prefixed string literals have no PG equivalent
         out = re.sub(r"\bN'", "'", out, flags=re.IGNORECASE)
+        # MSSQL '+' string concatenation -> PostgreSQL '||'
+        if "'" in out:
+            from engine.translators.procedure_translator import _replace_concat
+            out = _replace_concat(out)
         out = _translate_top(out)
     else:
         # PG quoted identifiers -> MSSQL brackets
