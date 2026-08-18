@@ -104,7 +104,7 @@ class DatabaseConnectionViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin
         try:
             result = migration_service.test_connection(connection)
         except ConnectorError as exc:
-            logger.exception("Connection test failed for '%s' (%s:%s/%s)", connection.name, connection.host, connection.effective_port, connection.database)
+            logger.exception("Connection test failed for '%s' (%s:%s/%s)", connection.name, connection.host, connection.effective_port(), connection.database)
             return Response({"ok": False, "error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(result)
 

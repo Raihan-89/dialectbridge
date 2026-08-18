@@ -182,7 +182,7 @@ def connections_view(request):
                 result = migration_service.test_connection(conn)
                 messages.success(request, f"Connected: {result['server']}")
             except ConnectorError as exc:
-                logger.exception("Connection test failed for '%s' (%s:%s/%s)", conn.name, conn.host, conn.effective_port, conn.database)
+                logger.exception("Connection test failed for '%s' (%s:%s/%s)", conn.name, conn.host, conn.effective_port(), conn.database)
                 messages.error(request, f"Connection failed: {exc}")
             return redirect("connections")
 
