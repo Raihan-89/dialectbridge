@@ -245,9 +245,10 @@ def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
                     f"fail until the key is added"
                 )
 
+    col_separator = ",\n  "
     create = (
         f"CREATE TABLE {_qident(table.name, target_dialect)} (\n"
-        f"  {',\n  '.join(col_lines)}{pk_line}\n)"
+        f"  {col_separator.join(col_lines)}{pk_line}\n)"
     )
 
     statements = [create]
