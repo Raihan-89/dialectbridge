@@ -156,6 +156,21 @@ def connections_view(request):
             conn.save()
             messages.success(request, f"Connection '{conn.name}' saved.")
             return redirect("connections")
+        if action == "update":
+            conn = get_object_or_404(DatabaseConnection, pk=request.POST.get("connection_id"))
+            conn.name = request.POST.get("name", conn.name).strip()
+            conn.engine = request.POST.get("engine", conn.engine)
+            conn.role = request.POST.get("role", conn.role)
+            conn.host = request.POST.get("host", conn.host).strip()
+            conn.port = int(request.POST.get("port") or 0)
+            conn.database = request.POST.get("database", conn.database).strip()
+            conn.username = request.POST.get("username", conn.username).strip()
+            new_password = request.POST.get("password", "")
+            if new_password:
+                conn.set_password(new_password)
+            conn.save()
+            messages.success(request, f"Connection '{conn.name}' updated.")
+            return redirect("connections")
         if action == "delete":
             conn = get_object_or_404(DatabaseConnection, pk=request.POST.get("connection_id"))
             conn.delete()

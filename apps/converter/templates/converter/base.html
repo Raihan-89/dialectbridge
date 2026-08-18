@@ -351,6 +351,18 @@
         .confirm-card h2 { margin:0 0 8px; font-size:21px; }
         .confirm-card p { margin:0; color:var(--muted); font-size:14px; line-height:1.6; overflow-wrap:anywhere; }
         .confirm-actions { display:flex; justify-content:flex-end; gap:10px; padding:16px 26px; border-top:1px solid var(--border); background:#f8fafc; }
+
+        /* ---- edit modal ---- */
+        .modal-overlay {
+            position: fixed; inset: 0; z-index: 200;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(15,23,42,.55); backdrop-filter: blur(4px);
+            padding: 20px;
+        }
+        .modal-card {
+            max-height: calc(100vh - 40px); overflow-y: auto;
+            box-shadow: 0 24px 70px rgba(15,23,42,.28);
+        }
         .bulk-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; margin-bottom:10px; border:1px solid var(--border); border-radius:10px; background:#f8fafc; }
         .bulk-toolbar[hidden] { display:none; }
         .bulk-count { color:var(--muted); font-size:13px; font-weight:600; }

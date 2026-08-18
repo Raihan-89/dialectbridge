@@ -88,6 +88,7 @@
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
                                     <button type="submit" class="btn btn-sm btn-outline history-action-btn">Test</button>
                                 </form>
+                                <button type="button" class="btn btn-sm btn-outline history-action-btn" onclick="openEditModal({{ conn.pk }}, '{{ conn.name|escapejs }}', '{{ conn.engine }}', '{{ conn.role }}', '{{ conn.host|escapejs }}', {{ conn.port }}, '{{ conn.database|escapejs }}', '{{ conn.username|escapejs }}')">Edit</button>
                                 <form method="post" data-confirm data-confirm-title="Delete connection?" data-confirm-message="{{ conn.name }} will be removed. Saved migrations using this connection may also be deleted.">{% csrf_token %}
                                     <input type="hidden" name="action" value="delete">
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
@@ -108,4 +109,73 @@
         {% endif %}
     </div>
 </div>
+
+<div id="editModal" class="modal-overlay" style="display:none;" onclick="if(event.target===this)closeEditModal()">
+    <div class="card modal-card" style="max-width:560px;width:100%;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+            <h2 class="panel-title" style="margin:0;">Edit Connection</h2>
+            <button type="button" class="btn btn-sm btn-outline" onclick="closeEditModal()">✕</button>
+        </div>
+        <form method="post" class="form-grid">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="update">
+            <input type="hidden" name="connection_id" id="edit-connection-id">
+            <div class="field">
+                <label for="edit-name">Name</label>
+                <input type="text" name="name" id="edit-name" required>
+            </div>
+            <div class="field">
+                <label for="edit-engine">Engine</label>
+                <select name="engine" id="edit-engine" required>
+                    {% for value, label in engine_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="field">
+                <label for="edit-role">Role</label>
+                <select name="role" id="edit-role">
+                    {% for value, label in role_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="field">
+                <label for="edit-host">Host</label>
+                <input type="text" name="host" id="edit-host" required>
+            </div>
+            <div class="field">
+                <label for="edit-port">Port <span class="hint">— 0 uses the driver default</span></label>
+                <input type="number" name="port" id="edit-port" placeholder="0">
+            </div>
+            <div class="field">
+                <label for="edit-database">Database</label>
+                <input type="text" name="database" id="edit-database" required>
+            </div>
+            <div class="field">
+                <label for="edit-username">Username</label>
+                <input type="text" name="username" id="edit-username" required>
+            </div>
+            <div class="field">
+                <label for="edit-password">Password <span class="hint">— leave blank to keep current</span></label>
+                <input type="password" name="password" id="edit-password" placeholder="Leave blank to keep current">
+            </div>
+            <button type="submit" class="btn">Update Connection</button>
+        </form>
+    </div>
+</div>
+
+<script>
+function openEditModal(pk, name, engine, role, host, port, database, username) {
+    document.getElementById('edit-connection-id').value = pk;
+    document.getElementById('edit-name').value = name;
+    document.getElementById('edit-engine').value = engine;
+    document.getElementById('edit-role').value = role;
+    document.getElementById('edit-host').value = host;
+    document.getElementById('edit-port').value = port || '';
+    document.getElementById('edit-database').value = database;
+    document.getElementById('edit-username').value = username;
+    document.getElementById('edit-password').value = '';
+    document.getElementById('editModal').style.display = 'flex';
+}
+function closeEditModal() {
+    document.getElementById('editModal').style.display = 'none';
+}
+</script>
 {% endblock %}
