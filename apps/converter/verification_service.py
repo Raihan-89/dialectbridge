@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import threading
 from datetime import date, datetime, time
 from decimal import Decimal
 from itertools import zip_longest
@@ -11,6 +12,39 @@ from typing import Callable
 from uuid import UUID
 
 from .migration_service import connector_for
+
+
+# ---------------------------------------------------------------------------
+# Schema cache – avoids re-extracting the full schema on every section click.
+# Keyed by (connection_pk, updated_at) so the cache auto-invalidates when the
+# connection is edited.
+# ---------------------------------------------------------------------------
+_SCHEMA_CACHE: dict[tuple, object] = {}
+_SCHEMA_CACHE_LOCK = threading.Lock()
+_SCHEMA_CACHE_MAX = 20  # max entries before oldest-evict
+
+
+def _cache_key(connection) -> tuple:
+    return (connection.pk, connection.updated_at.timestamp())
+
+
+def _get_schema(connection):
+    key = _cache_key(connection)
+    with _SCHEMA_CACHE_LOCK:
+        cached = _SCHEMA_CACHE.get(key)
+        if cached is not None:
+            return cached
+    # Connect outside the lock so slow I/O doesn't block other threads.
+    connector = connector_for(connection)
+    try:
+        schema = connector.extract_schema()
+    finally:
+        connector.close()
+    with _SCHEMA_CACHE_LOCK:
+        if len(_SCHEMA_CACHE) >= _SCHEMA_CACHE_MAX:
+            _SCHEMA_CACHE.clear()
+        _SCHEMA_CACHE[key] = schema
+    return schema
 
 
 SECTION_LABELS = {
@@ -143,13 +177,13 @@ def compare_live(source_connection, target_connection, section: str) -> dict:
     """Connect to both databases and return one JSON-safe comparison section."""
     if section not in SECTION_LABELS:
         raise ValueError(f"Unknown verification section: {section}")
-    source = connector_for(source_connection)
-    target = connector_for(target_connection)
-    try:
-        source_db = source.extract_schema()
-        target_db = target.extract_schema()
+    source_db = _get_schema(source_connection)
+    target_db = _get_schema(target_connection)
 
-        if section == "rows":
+    if section == "rows":
+        source = connector_for(source_connection)
+        target = connector_for(target_connection)
+        try:
             source_items = {
                 _key(t.name): {"name": t.name, "rows": source.count_rows(t.name)}
                 for t in source_db.tables
@@ -158,28 +192,28 @@ def compare_live(source_connection, target_connection, section: str) -> dict:
                 _key(t.name): {"name": t.name, "rows": target.count_rows(t.name)}
                 for t in target_db.tables
             }
-        elif section == "overview":
-            names = ("tables", "views", "functions", "procedures", "triggers", "sequences", "types", "synonyms")
-            source_items = {n: {"name": n.title(), "count": len(getattr(source_db, n))} for n in names}
-            target_items = {n: {"name": n.title(), "count": len(getattr(target_db, n))} for n in names}
-        else:
-            source_items = _objects(source_db, section)
-            target_items = _objects(target_db, section)
+        finally:
+            source.close()
+            target.close()
+    elif section == "overview":
+        names = ("tables", "views", "functions", "procedures", "triggers", "sequences", "types", "synonyms")
+        source_items = {n: {"name": n.title(), "count": len(getattr(source_db, n))} for n in names}
+        target_items = {n: {"name": n.title(), "count": len(getattr(target_db, n))} for n in names}
+    else:
+        source_items = _objects(source_db, section)
+        target_items = _objects(target_db, section)
 
-        rows = _pair(source_items, target_items)
-        counts = {status: sum(r["status"] == status for r in rows)
-                  for status in ("match", "different", "source_only", "target_only")}
-        return {
-            "section": section,
-            "label": SECTION_LABELS[section],
-            "rows": rows,
-            "counts": counts,
-            "total": len(rows),
-            "all_match": counts["different"] == counts["source_only"] == counts["target_only"] == 0,
-        }
-    finally:
-        source.close()
-        target.close()
+    rows = _pair(source_items, target_items)
+    counts = {status: sum(r["status"] == status for r in rows)
+              for status in ("match", "different", "source_only", "target_only")}
+    return {
+        "section": section,
+        "label": SECTION_LABELS[section],
+        "rows": rows,
+        "counts": counts,
+        "total": len(rows),
+        "all_match": counts["different"] == counts["source_only"] == counts["target_only"] == 0,
+    }
 
 
 def _table_map(database) -> dict:
@@ -188,26 +222,20 @@ def _table_map(database) -> dict:
 
 def list_live_data_tables(source_connection, target_connection) -> dict:
     """List live tables on both ends without reading application data."""
-    source = connector_for(source_connection)
-    target = connector_for(target_connection)
-    try:
-        source_tables = _table_map(source.extract_schema())
-        target_tables = _table_map(target.extract_schema())
-        tables = []
-        for key in sorted(set(source_tables) | set(target_tables)):
-            left, right = source_tables.get(key), target_tables.get(key)
-            tables.append({
-                "key": key,
-                "source_name": left.name if left else None,
-                "target_name": right.name if right else None,
-                "source_columns": len(left.columns) if left else 0,
-                "target_columns": len(right.columns) if right else 0,
-                "status": "both" if left and right else ("source_only" if left else "target_only"),
-            })
-        return {"tables": tables}
-    finally:
-        source.close()
-        target.close()
+    source_tables = _table_map(_get_schema(source_connection))
+    target_tables = _table_map(_get_schema(target_connection))
+    tables = []
+    for key in sorted(set(source_tables) | set(target_tables)):
+        left, right = source_tables.get(key), target_tables.get(key)
+        tables.append({
+            "key": key,
+            "source_name": left.name if left else None,
+            "target_name": right.name if right else None,
+            "source_columns": len(left.columns) if left else 0,
+            "target_columns": len(right.columns) if right else 0,
+            "status": "both" if left and right else ("source_only" if left else "target_only"),
+        })
+    return {"tables": tables}
 
 
 def _json_value(value):
@@ -246,14 +274,15 @@ def compare_live_table_data(source_connection, target_connection, table_key: str
     """Read and compare one bounded page of source/target table data."""
     page = max(1, int(page))
     page_size = min(100, max(1, int(page_size)))
+    source_tables = _table_map(_get_schema(source_connection))
+    target_tables = _table_map(_get_schema(target_connection))
+    source_table, target_table = source_tables.get(table_key), target_tables.get(table_key)
+    if not source_table or not target_table:
+        raise ValueError("This table is not present in both databases.")
+
     source = connector_for(source_connection)
     target = connector_for(target_connection)
     try:
-        source_tables = _table_map(source.extract_schema())
-        target_tables = _table_map(target.extract_schema())
-        source_table, target_table = source_tables.get(table_key), target_tables.get(table_key)
-        if not source_table or not target_table:
-            raise ValueError("This table is not present in both databases.")
 
         source_columns = {_key(c.name): c.name for c in source_table.columns}
         target_columns = {_key(c.name): c.name for c in target_table.columns}
@@ -345,25 +374,25 @@ def _table_fingerprint(connector, table, columns, order_columns) -> dict:
 
 def verify_live_table_checksum(source_connection, target_connection, table_key: str) -> dict:
     """Exhaustively stream and fingerprint every shared value in a table."""
+    source_tables = _table_map(_get_schema(source_connection))
+    target_tables = _table_map(_get_schema(target_connection))
+    source_table, target_table = source_tables.get(table_key), target_tables.get(table_key)
+    if not source_table or not target_table:
+        raise ValueError("This table is not present in both databases.")
+    source_columns = {_key(c.name): c.name for c in source_table.columns}
+    target_columns = {_key(c.name): c.name for c in target_table.columns}
+    common = [key for key in source_columns if key in target_columns]
+    if not common:
+        raise ValueError("This table has no comparable columns.")
+    source_only = [c.name for c in source_table.columns if _key(c.name) not in target_columns]
+    target_only = [c.name for c in target_table.columns if _key(c.name) not in source_columns]
+    source_pk = [_key(c) for c in (source_table.primary_key.columns if source_table.primary_key else [])]
+    target_pk = {_key(c) for c in (target_table.primary_key.columns if target_table.primary_key else [])}
+    key_columns = [key for key in source_pk if key in target_pk and key in common]
+    shared_pk = bool(key_columns) and len(key_columns) == len(source_pk)
     source = connector_for(source_connection)
     target = connector_for(target_connection)
     try:
-        source_tables = _table_map(source.extract_schema())
-        target_tables = _table_map(target.extract_schema())
-        source_table, target_table = source_tables.get(table_key), target_tables.get(table_key)
-        if not source_table or not target_table:
-            raise ValueError("This table is not present in both databases.")
-        source_columns = {_key(c.name): c.name for c in source_table.columns}
-        target_columns = {_key(c.name): c.name for c in target_table.columns}
-        common = [key for key in source_columns if key in target_columns]
-        if not common:
-            raise ValueError("This table has no comparable columns.")
-        source_only = [c.name for c in source_table.columns if _key(c.name) not in target_columns]
-        target_only = [c.name for c in target_table.columns if _key(c.name) not in source_columns]
-        source_pk = [_key(c) for c in (source_table.primary_key.columns if source_table.primary_key else [])]
-        target_pk = {_key(c) for c in (target_table.primary_key.columns if target_table.primary_key else [])}
-        key_columns = [key for key in source_pk if key in target_pk and key in common]
-        shared_pk = bool(key_columns) and len(key_columns) == len(source_pk)
         left = _table_fingerprint(
             source, source_table, [source_columns[key] for key in common],
             [source_columns[key] for key in key_columns] if shared_pk else [],
@@ -372,13 +401,13 @@ def verify_live_table_checksum(source_connection, target_connection, table_key: 
             target, target_table, [target_columns[key] for key in common],
             [target_columns[key] for key in key_columns] if shared_pk else [],
         )
-        exact = not source_only and not target_only and left == right
-        return {
-            "table": table_key, "source_name": source_table.name, "target_name": target_table.name,
-            "columns_checked": len(common), "source_only_columns": source_only,
-            "target_only_columns": target_only, "source": left, "target": right,
-            "exact_match": exact, "algorithm": "canonical-row-multiset-sha256-v1",
-        }
     finally:
         source.close()
         target.close()
+    exact = not source_only and not target_only and left == right
+    return {
+        "table": table_key, "source_name": source_table.name, "target_name": target_table.name,
+        "columns_checked": len(common), "source_only_columns": source_only,
+        "target_only_columns": target_only, "source": left, "target": right,
+        "exact_match": exact, "algorithm": "canonical-row-multiset-sha256-v1",
+    }
