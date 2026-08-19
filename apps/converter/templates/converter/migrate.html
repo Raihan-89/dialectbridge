@@ -55,10 +55,16 @@
             </div>
             <label class="checkbox-line"><input type="checkbox" name="copy_data" checked> Copy table data</label>
             <label class="checkbox-line"><input type="checkbox" name="reset_target"> <span>Drop target schemas before migrating <span class="badge badge-warn">destructive</span></span></label>
-            <button type="submit" name="action" value="run" class="btn" id="run-migration" {% if running_job %}disabled{% endif %}>
+            <button type="submit" name="action" value="run" class="btn" id="run-migration" {% if running_job %}disabled{% endif %}
+                data-loading-text="Running migration…"
+                data-loading-steps='["Connecting to source database…","Extracting schema objects…","Converting to target dialect…","Creating target schemas & tables…","Copying table data…","Applying views, functions & triggers…","Verifying row counts…"]'>
                 {% if running_job %}Migration in progress…{% else %}Run Migration{% endif %}
             </button>
-            <button type="submit" name="action" value="assess" class="btn btn-outline">Assess &amp; preview first</button>
+            <button type="submit" name="action" value="assess" class="btn btn-outline"
+                data-loading-text="Assessing compatibility…"
+                data-loading-steps='["Connecting to source database…","Extracting schema objects…","Connecting to target database…","Generating target DDL…","Analyzing compatibility findings…"]'>
+                Assess &amp; preview first
+            </button>
         </form>
         {% else %}
         <div class="empty-state">

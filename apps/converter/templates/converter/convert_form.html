@@ -37,7 +37,10 @@
                     <textarea name="source_sql" id="source_sql" rows="12" placeholder="CREATE TABLE ...">{{ source_sql|default:"" }}</textarea>
                 </div>
                 <div class="btn-row">
-                    <button type="submit" class="btn">Convert</button>
+                    <button type="submit" class="btn"
+                        data-loading-text="Converting SQL…" data-loading-sub="Transpiling between dialects.">
+                        Convert
+                    </button>
                     <button type="button" class="btn btn-ghost" data-sample="ddl">Load sample DDL</button>
                     <button type="button" class="btn btn-ghost" data-sample="dml">Load sample DML</button>
                 </div>

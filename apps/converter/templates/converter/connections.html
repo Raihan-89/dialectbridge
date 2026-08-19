@@ -57,7 +57,10 @@
                 </div>
             </div>
             <input type="hidden" name="action" value="create">
-            <button type="submit" class="btn">Save Connection</button>
+            <button type="submit" class="btn"
+                data-loading-text="Saving connection…" data-loading-sub="Validating and storing credentials.">
+                Save Connection
+            </button>
         </form>
     </div>
 
@@ -89,7 +92,8 @@
                                 <form method="post">{% csrf_token %}
                                     <input type="hidden" name="action" value="test">
                                     <input type="hidden" name="connection_id" value="{{ conn.pk }}">
-                                    <button type="submit" class="btn btn-sm btn-outline history-action-btn">Test</button>
+                                    <button type="submit" class="btn btn-sm btn-outline history-action-btn"
+                                        data-loading-text="Testing connection…" data-loading-sub="Attempting to connect to the database server.">Test</button>
                                 </form>
                                 <button type="button" class="btn btn-sm btn-outline history-action-btn" onclick="openEditModal({{ conn.pk }}, '{{ conn.name|escapejs }}', '{{ conn.engine }}', '{{ conn.role }}', '{{ conn.host|escapejs }}', {{ conn.port }}, '{{ conn.database|escapejs }}', '{{ conn.username|escapejs }}')">Edit</button>
                                 <form method="post" data-confirm data-confirm-title="Delete connection?" data-confirm-message="{{ conn.name }} will be removed. Saved migrations using this connection may also be deleted.">{% csrf_token %}
@@ -162,7 +166,10 @@
                     <button type="button" class="pw-toggle" onclick="togglePw('edit-password',this)" aria-label="Show password">👁</button>
                 </div>
             </div>
-            <button type="submit" class="btn">Update Connection</button>
+            <button type="submit" class="btn"
+                data-loading-text="Updating connection…" data-loading-sub="Saving changes to the database connection.">
+                Update Connection
+            </button>
         </form>
     </div>
 </div>

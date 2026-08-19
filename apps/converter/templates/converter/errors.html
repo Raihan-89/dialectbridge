@@ -32,7 +32,10 @@
             <label for="q">Search object / message</label>
             <input type="text" name="q" id="q" value="{{ q }}" placeholder="e.g. Inventory, RAISERROR...">
         </div>
-        <button type="submit" class="btn">Filter</button>
+        <button type="submit" class="btn"
+            data-loading-text="Filtering errors…" data-loading-sub="Searching migration error records.">
+            Filter
+        </button>
     </form>
 </div>
 

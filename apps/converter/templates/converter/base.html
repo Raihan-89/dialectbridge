@@ -466,6 +466,64 @@
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
         }
+
+        /* ---- full-page loading overlay ---- */
+        .loading-overlay {
+            position: fixed; inset: 0; z-index: 9999;
+            display: none; align-items: center; justify-content: center;
+            background: rgba(245,247,252,.88);
+            backdrop-filter: blur(6px);
+            -webkit-backdrop-filter: blur(6px);
+            opacity: 0; transition: opacity .2s ease;
+        }
+        .loading-overlay.active { display: flex; opacity: 1; }
+        .loading-overlay-inner { text-align: center; max-width: 420px; padding: 0 20px; }
+        .loading-overlay-spinner {
+            width: 44px; height: 44px; margin: 0 auto 18px;
+            border: 4px solid #e0e7ff; border-top-color: var(--primary);
+            border-radius: 50%; animation: loading-spin .7s linear infinite;
+        }
+        @keyframes loading-spin { to { transform: rotate(360deg); } }
+        .loading-overlay-text {
+            font-size: 15px; font-weight: 600; color: var(--text);
+            line-height: 1.5;
+        }
+        .loading-overlay-sub {
+            font-size: 13px; color: var(--muted); margin-top: 6px;
+        }
+        /* step progress list */
+        .loading-steps {
+            margin-top: 22px; text-align: left; display: inline-block;
+            min-width: 260px;
+        }
+        .loading-step {
+            display: flex; align-items: center; gap: 10px;
+            padding: 6px 0; font-size: 13px; color: var(--muted);
+            transition: color .25s;
+        }
+        .loading-step.done { color: var(--success); }
+        .loading-step.active { color: var(--text); font-weight: 600; }
+        .loading-step-icon {
+            width: 20px; height: 20px; flex: 0 0 20px;
+            display: grid; place-items: center; font-size: 12px;
+        }
+        .loading-step .step-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #cbd5e1; transition: background .25s;
+        }
+        .loading-step.active .step-dot {
+            background: var(--primary);
+            animation: step-pulse 1s ease-in-out infinite;
+        }
+        .loading-step.done .step-dot { background: var(--success); }
+        .loading-step.done .step-dot::after { content: "✓"; font-size: 11px; font-weight: 800; color: #fff; }
+        @keyframes step-pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.35); opacity: .7; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .loading-step.active .step-dot { animation: none; }
+        }
     </style>
 </head>
 <body>
@@ -506,6 +564,14 @@
             <button type="button" class="btn btn-delete-soft confirm-action-btn" id="confirm-delete">Yes, delete</button>
         </div>
     </dialog>
+    <div class="loading-overlay" id="loading-overlay" aria-live="polite" aria-atomic="true">
+        <div class="loading-overlay-inner">
+            <div class="loading-overlay-spinner"></div>
+            <div class="loading-overlay-text" id="loading-text">Working…</div>
+            <div class="loading-overlay-sub" id="loading-sub">Please wait, this may take a moment.</div>
+            <div class="loading-steps" id="loading-steps"></div>
+        </div>
+    </div>
     <script>
         (() => {
             const toggle = document.querySelector('.nav-toggle');
@@ -583,6 +649,84 @@
                 pendingForm = null;
                 approve.disabled = false;
                 approve.textContent = 'Yes, delete';
+            });
+        })();
+    </script>
+    <script>
+        (() => {
+            const overlay = document.getElementById('loading-overlay');
+            const textEl = document.getElementById('loading-text');
+            const subEl = document.getElementById('loading-sub');
+            const stepsEl = document.getElementById('loading-steps');
+            let stepTimer = null;
+
+            function renderSteps(steps, current) {
+                if (!stepsEl || !steps || !steps.length) { if (stepsEl) stepsEl.innerHTML = ''; return; }
+                stepsEl.innerHTML = steps.map((s, i) => {
+                    const cls = i < current ? 'done' : i === current ? 'active' : '';
+                    return `<div class="loading-step ${cls}"><span class="loading-step-icon"><span class="step-dot"></span></span><span>${s}</span></div>`;
+                }).join('');
+            }
+
+            window.showLoading = function(text, sub) {
+                textEl.textContent = text || 'Working…';
+                subEl.textContent = sub || 'Please wait, this may take a moment.';
+                if (stepsEl) stepsEl.innerHTML = '';
+                if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+                overlay.classList.add('active');
+            };
+
+            window.showLoadingSteps = function(text, steps, interval) {
+                textEl.textContent = text || 'Working…';
+                subEl.textContent = '';
+                if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+                overlay.classList.add('active');
+                if (!steps || !steps.length) { if (stepsEl) stepsEl.innerHTML = ''; return; }
+                let idx = 0;
+                renderSteps(steps, idx);
+                const ms = interval || 1800;
+                stepTimer = setInterval(() => {
+                    idx++;
+                    if (idx >= steps.length) { clearInterval(stepTimer); stepTimer = null; return; }
+                    renderSteps(steps, idx);
+                }, ms);
+            };
+
+            window.hideLoading = function() {
+                overlay.classList.remove('active');
+                if (stepTimer) { clearInterval(stepTimer); stepTimer = null; }
+                if (stepsEl) stepsEl.innerHTML = '';
+            };
+
+            document.addEventListener('submit', function(e) {
+                const form = e.target;
+                if (form.getAttribute('method') === 'get') return;
+                if (form.dataset.noLoading === 'true') return;
+                const submitter = e.submitter;
+                if (submitter && submitter.dataset.loadingSteps) {
+                    try {
+                        const steps = JSON.parse(submitter.dataset.loadingSteps);
+                        const text = submitter.dataset.loadingText || submitter.textContent.trim() || 'Working…';
+                        const interval = parseInt(submitter.dataset.loadingInterval || '1800', 10);
+                        showLoadingSteps(text, steps, interval);
+                    } catch (_) {
+                        let text = submitter.dataset.loadingText || submitter.textContent.trim() || 'Working…';
+                        let sub = submitter.dataset.loadingSub || 'Please wait…';
+                        showLoading(text, sub);
+                    }
+                } else {
+                    let text = 'Working…';
+                    let sub = 'Please wait, this may take a moment.';
+                    if (submitter) {
+                        text = submitter.dataset.loadingText || submitter.textContent.trim() || 'Working…';
+                        sub = submitter.dataset.loadingSub || 'Please wait, this may take a moment.';
+                    }
+                    showLoading(text, sub);
+                }
+            });
+
+            window.addEventListener('pageshow', function() {
+                hideLoading();
             });
         })();
     </script>
