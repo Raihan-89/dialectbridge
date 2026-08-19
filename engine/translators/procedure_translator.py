@@ -24,11 +24,25 @@ _TSQL_TYPE_RE = r"\[?[A-Za-z_][A-Za-z0-9_]*\]?(?:\s*\.\s*\[?[A-Za-z_][A-Za-z0-9_
 
 PARAM_RE = re.compile(
     rf"@([A-Za-z_][A-Za-z0-9_]*)\s+"
+    rf"(?:AS\s+|IS\s+)?"
     rf"({_TSQL_TYPE_RE})"
     r"\s*(OUTPUT|OUT)?"
     r"(?:\s*=\s*[^,]+)?",
     re.IGNORECASE,
 )
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove block comments (/* ... */) and line comments (-- ...) from SQL."""
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql
+
+
+def _routine_error_context(sql: str, max_len: int = 80) -> str:
+    """Return a truncated first line of the definition for error messages."""
+    first = sql.strip().split("\n")[0].strip()[:max_len]
+    return first + ("..." if len(sql.strip().split("\n")[0].strip()) > max_len else "")
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +52,11 @@ PARAM_RE = re.compile(
 def _tsql_to_plpgsql(sql: str, tables: list | None = None,
                      user_types: list | None = None) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
+
+    sql = _strip_sql_comments(sql)
+
+    if not sql.strip():
+        return None, ["Routine definition is empty — object may be encrypted or inaccessible"]
 
     # ---- header -----------------------------------------------------------
     header_match = re.search(
@@ -51,7 +70,8 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
         sql, re.IGNORECASE | re.DOTALL,
     )
     if not header_match:
-        return None, ["Could not parse routine header"]
+        ctx = _routine_error_context(sql)
+        return None, [f"Could not parse routine header — starts with: {ctx}"]
 
     kind = header_match.group(1).upper()
     name = header_match.group(2)
@@ -67,7 +87,8 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     # ---- body -------------------------------------------------------------
     body = _extract_tsql_body(sql)
     if body is None:
-        return None, ["Could not extract routine body (expected AS BEGIN ... END)"]
+        ctx = _routine_error_context(sql[header_match.end():])
+        return None, [f"Could not extract routine body — found: {ctx}"]
 
     params, param_warns = _parse_params(param_text, "tsql")
     warnings.extend(param_warns)

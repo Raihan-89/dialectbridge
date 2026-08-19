@@ -86,7 +86,9 @@ def _tsql_ddl_trigger_to_pg(trigger: Trigger) -> tuple[str | None, list[str]]:
 
     body = _extract_tsql_ddl_body(trigger.definition)
     if body is None:
-        return None, ["Could not extract DDL trigger body (expected AS BEGIN ... END)"]
+        from engine.translators.procedure_translator import _routine_error_context
+        ctx = _routine_error_context(trigger.definition or "")
+        return None, [f"Could not extract DDL trigger body — starts with: {ctx}"]
 
     def statement_fn(line, declared, warns, returns_set):
         return _ddl_statement(line, declared, warns, returns_set, warnings)
@@ -110,14 +112,24 @@ def _tsql_ddl_trigger_to_pg(trigger: Trigger) -> tuple[str | None, list[str]]:
 
 
 def _extract_tsql_ddl_body(definition: str) -> str | None:
+    from engine.translators.procedure_translator import _strip_sql_comments
+    definition = _strip_sql_comments(definition or "")
+    if not definition.strip():
+        return None
     m = re.search(r"\bAS\s+BEGIN\b", definition, re.IGNORECASE)
-    if not m:
-        return None
-    tail = definition[m.end():]
-    ends = list(re.finditer(r"\bEND\b", tail, re.IGNORECASE))
-    if not ends:
-        return None
-    return tail[: ends[-1].start()]
+    if m:
+        tail = definition[m.end():]
+        ends = list(re.finditer(r"\bEND\b", tail, re.IGNORECASE))
+        if not ends:
+            return None
+        return tail[: ends[-1].start()]
+    # Fallback: body without BEGIN/END (single-statement body)
+    m2 = re.search(r"\bAS\b\s+", definition, re.IGNORECASE)
+    if m2:
+        tail = definition[m2.end():].strip()
+        if tail:
+            return tail.rstrip(";")
+    return None
 
 
 def _ddl_statement(line: str, declared: dict[str, str], warns: list[str],
@@ -169,7 +181,9 @@ def _pg_ddl_trigger_to_tsql(trigger: Trigger) -> tuple[str | None, list[str]]:
 
     body = _extract_plpgsql_body(trigger.definition)
     if body is None:
-        return None, ["Could not extract event trigger function body"]
+        from engine.translators.procedure_translator import _routine_error_context
+        ctx = _routine_error_context(trigger.definition or "")
+        return None, [f"Could not extract event trigger function body — starts with: {ctx}"]
     parts, body_warnings, declared = _transform_plpgsql_body(body)
     warnings.extend(body_warnings)
     lines: list[str] = []
