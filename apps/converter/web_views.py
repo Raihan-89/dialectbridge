@@ -341,6 +341,11 @@ def migration_undo_delete_view(request):
 
 def migrate_status_view(request, pk):
     job = get_object_or_404(MigrationJob, pk=pk)
+    # A tab left open across a server restart polls this endpoint forever if
+    # the old worker thread died. Reap the stale job so the poll sees a
+    # finished status and stops.
+    _reap_stale_migration_jobs()
+    job.refresh_from_db()
     # Extract structured progress data from the stage JSON if available
     progress_stage = job.progress_stage
     tables_copied = 0
