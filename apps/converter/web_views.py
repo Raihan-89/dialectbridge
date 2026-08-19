@@ -262,6 +262,7 @@ def migrate_view(request):
                 status=MigrationJob.Status.RUNNING,
                 started_at=timezone.now(),
                 created_by=request.user if request.user.is_authenticated else None,
+                worker_pid=os.getpid(),
             )
             job.save()
             threading.Thread(target=_run_migration_job, args=(job.pk,), daemon=True).start()

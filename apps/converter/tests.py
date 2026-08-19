@@ -1072,6 +1072,16 @@ class MigrationProgressViewTests(TestCase):
         self.assertEqual(stale.status, MigrationJob.Status.FAILED)
         self.assertIn("stopped by server restart", stale.error_message)
 
+    def test_stale_running_job_with_dead_pid_is_reaped(self):
+        dead = MigrationJob.objects.create(
+            name="dead", source=self.source, target=self.target,
+            status=MigrationJob.Status.RUNNING, worker_pid=999999999,
+            started_at=timezone.now(),
+        )
+        self.client.get(reverse("migrate"))
+        dead.refresh_from_db()
+        self.assertEqual(dead.status, MigrationJob.Status.FAILED)
+
     def test_live_running_job_is_not_reaped(self):
         import os
         live = MigrationJob.objects.create(
