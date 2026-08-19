@@ -1,5 +1,6 @@
 import threading
 import logging
+import os
 import uuid
 from datetime import timedelta
 
@@ -14,6 +15,7 @@ logger = logging.getLogger("dialectbridge.web")
 from django.views.decorators.http import require_GET, require_POST
 
 from engine.connectors.base import ConnectorError
+from engine.migration.orchestrator import MigrationCancelledError
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from . import migration_service
 from .verification_service import (
@@ -21,6 +23,7 @@ from .verification_service import (
     verify_live_table_checksum,
 )
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
+from .apps import _pid_is_alive
 
 # Statement types the current engine can actually handle — others are shown
 # disabled in the form until their translators land.
@@ -194,11 +197,40 @@ def connections_view(request):
     return render(request, "converter/connections.html", context)
 
 
+def _reap_stale_migration_jobs() -> None:
+    """Fail RUNNING/PENDING jobs whose worker process is no longer alive.
+
+    A migration runs in a daemon thread that dies with its process. After the
+    server is stopped (Ctrl+C) or restarted, those jobs can never finish, yet
+    their RUNNING status blocks new migrations. Mark them failed to release
+    the lock.
+    """
+    stale = MigrationJob.objects.filter(
+        status__in=[MigrationJob.Status.RUNNING, MigrationJob.Status.PENDING]
+    )
+    for job in stale:
+        if _pid_is_alive(job.worker_pid):
+            continue
+        job.status = MigrationJob.Status.FAILED
+        job.error_message = "Migration stopped by server restart (process exited)"
+        job.progress_stage = "Migration stopped by server restart"
+        if not job.finished_at:
+            job.finished_at = timezone.now()
+        job.save(update_fields=["status", "error_message", "progress_stage", "finished_at"])
+        logger.warning(
+            "Marked stale migration job %s as failed (worker pid %s no longer alive)",
+            job.pk, job.worker_pid,
+        )
+
+
 def migrate_view(request):
     """Run a migration between two saved connections and show the report."""
     # Clean up expired batches after a process restart, when the original
     # in-memory finalizer timer no longer exists.
     MigrationJob.objects.filter(pending_deletion_at__lte=timezone.now()).delete()
+    # Release any lock held by a migration whose worker thread died with an
+    # older server process (Ctrl+C or autoreload restart).
+    _reap_stale_migration_jobs()
     assessment = None
     if request.method == "POST":
         action = request.POST.get("action", "run")
@@ -251,6 +283,8 @@ def migrate_view(request):
 
 def migrate_detail_view(request, pk):
     job = get_object_or_404(MigrationJob, pk=pk, pending_deletion_token__isnull=True)
+    _reap_stale_migration_jobs()
+    job.refresh_from_db()
     return render(request, "converter/migrate_detail.html", {"job": job})
 
 
@@ -353,15 +387,33 @@ def migrate_status_view(request, pk):
     })
 
 
+@require_POST
+def migration_cancel_view(request, pk):
+    """Ask a running migration to stop; the worker thread checks the flag."""
+    job = get_object_or_404(MigrationJob, pk=pk)
+    if job.status in {MigrationJob.Status.RUNNING, MigrationJob.Status.PENDING}:
+        MigrationJob.objects.filter(pk=job.pk).update(cancel_requested=True)
+        messages.success(request, "Migration stop requested. It will halt at the next checkpoint.")
+    else:
+        messages.info(request, "This migration has already finished.")
+    return redirect("migrate-detail", pk=job.pk)
+
+
 def _run_migration_job(job_id: int) -> None:
     """Run a web-started migration outside the request and persist progress."""
     close_old_connections()
     try:
         job = MigrationJob.objects.select_related("source", "target").get(pk=job_id)
+        MigrationJob.objects.filter(pk=job_id).update(worker_pid=os.getpid())
         logger.info("Background migration job started job_id=%s", job_id)
+
+        def cancel_check() -> bool:
+            return MigrationJob.objects.filter(pk=job_id, cancel_requested=True).exists()
 
         def progress(percent, stage, **kwargs):
             import json
+            if cancel_check():
+                raise MigrationCancelledError("Migration cancelled by user")
             data = kwargs.get("data") or {}
             if data:
                 MigrationJob.objects.filter(pk=job_id).update(
@@ -376,6 +428,7 @@ def _run_migration_job(job_id: int) -> None:
         report = migration_service.run_migration(
             job.source, job.target, copy_data=job.copy_data,
             reset_target=job.reset_target, progress_callback=progress,
+            cancel_check=cancel_check,
         )
         job.report = report
         job.warnings = report.get("warnings", [])
@@ -383,6 +436,13 @@ def _run_migration_job(job_id: int) -> None:
         job.progress_percent = 100
         job.progress_stage = "Migration completed" if report.get("success") else "Completed with errors"
         migration_service.record_migration_errors(job, report)
+    except MigrationCancelledError as exc:
+        logger.warning("Background migration job cancelled job_id=%s", job_id)
+        job = MigrationJob.objects.get(pk=job_id)
+        job.status = MigrationJob.Status.FAILED
+        job.error_message = str(exc)
+        job.progress_stage = "Migration stopped by user"
+        job.progress_percent = job.progress_percent  # keep last reported progress
     except Exception as exc:
         logger.exception("Background migration job failed job_id=%s", job_id)
         job = MigrationJob.objects.get(pk=job_id)

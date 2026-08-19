@@ -1,10 +1,13 @@
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 from unittest.mock import patch
 from datetime import timedelta
+import threading
 
+from engine.connectors.base import ConnectorError
+from engine.migration.orchestrator import MigrationCancelledError
 from engine.schema import (
     CheckConstraint, Column, Constraint, Database, Index, PartitionChild, Permission,
     Principal, Routine, Sequence, Synonym, Table, Trigger, UserType, View,
@@ -15,6 +18,7 @@ from engine.translators.procedure_translator import translate_routine
 from engine.translators.sql_builder import build_database_ddl, build_security_ddl, convert_type
 from engine.translators.trigger_translator import translate_trigger
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
+from . import web_views
 
 
 class EngineDDLTests(TestCase):
@@ -1011,6 +1015,7 @@ class ConvertAPITests(TestCase):
 
 class MigrationProgressViewTests(TestCase):
     def setUp(self):
+        import os
         self.source = DatabaseConnection.objects.create(
             name="Source", engine="postgres", role="source", host="localhost",
             port=5432, database="source", username="user",
@@ -1023,6 +1028,7 @@ class MigrationProgressViewTests(TestCase):
             name="Saved migration", source=self.source, target=self.target,
             status=MigrationJob.Status.RUNNING, progress_percent=55,
             progress_stage="Copying table data", started_at=timezone.now(),
+            worker_pid=os.getpid(),
         )
 
     def test_status_endpoint_returns_persisted_progress(self):
@@ -1043,6 +1049,64 @@ class MigrationProgressViewTests(TestCase):
         detail = self.client.get(reverse("migrate-detail", args=[self.job.pk]))
         self.assertContains(detail, "Saved migration")
         self.assertContains(detail, "Tables")
+
+    def test_cancel_endpoint_sets_cancel_requested_flag(self):
+        response = self.client.post(reverse("migration-cancel", args=[self.job.pk]))
+        self.assertRedirects(response, reverse("migrate-detail", args=[self.job.pk]))
+        self.job.refresh_from_db()
+        self.assertTrue(self.job.cancel_requested)
+        self.assertEqual(self.job.status, MigrationJob.Status.RUNNING)
+
+    def test_cancel_requires_post(self):
+        response = self.client.get(reverse("migration-cancel", args=[self.job.pk]))
+        self.assertEqual(response.status_code, 405)
+
+    def test_stale_running_job_without_live_worker_is_reaped(self):
+        stale = MigrationJob.objects.create(
+            name="stale", source=self.source, target=self.target,
+            status=MigrationJob.Status.RUNNING, worker_pid=None,
+            started_at=timezone.now(),
+        )
+        self.client.get(reverse("migrate"))
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, MigrationJob.Status.FAILED)
+        self.assertIn("stopped by server restart", stale.error_message)
+
+    def test_live_running_job_is_not_reaped(self):
+        import os
+        live = MigrationJob.objects.create(
+            name="live", source=self.source, target=self.target,
+            status=MigrationJob.Status.RUNNING, worker_pid=os.getpid(),
+            started_at=timezone.now(),
+        )
+        self.client.get(reverse("migrate"))
+        live.refresh_from_db()
+        self.assertEqual(live.status, MigrationJob.Status.RUNNING)
+
+
+class MigrationWorkerCancellationTests(TransactionTestCase):
+    def test_worker_marks_job_failed_when_cancelled(self):
+        source = DatabaseConnection.objects.create(
+            name="source", engine="postgres", role="source", host="localhost",
+            port=5432, database="source_db", username="user",
+        )
+        target = DatabaseConnection.objects.create(
+            name="target", engine="mssql", role="target", host="localhost",
+            port=1433, database="target_db", username="user",
+        )
+        job = MigrationJob.objects.create(
+            name="job", source=source, target=target,
+            status=MigrationJob.Status.RUNNING,
+        )
+        with patch("apps.converter.web_views.migration_service.run_migration",
+                   side_effect=MigrationCancelledError("Migration cancelled by user")):
+            hop = threading.Thread(target=web_views._run_migration_job, args=(job.pk,))
+            hop.start()
+            hop.join()
+        job.refresh_from_db()
+        self.assertEqual(job.status, MigrationJob.Status.FAILED)
+        self.assertIn("cancelled", job.error_message)
+        self.assertIsNotNone(job.finished_at)
 
 
 class PortalNavigationTests(TestCase):

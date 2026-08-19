@@ -33,6 +33,10 @@ _PRE_TABLE_PREFIXES = ("CREATE DOMAIN", "CREATE TYPE", "CREATE SEQUENCE")
 logger = logging.getLogger("dialectbridge.migration")
 
 
+class MigrationCancelledError(Exception):
+    """Raised when a cancellation was requested while the migration runs."""
+
+
 @dataclass
 class ObjectResult:
     kind: str
@@ -103,13 +107,18 @@ def _is_fk_or_check(stmt: str) -> bool:
 
 class MigrationOrchestrator:
     def __init__(self, source, target, copy_data: bool = True, reset_target: bool = False,
-                 progress_callback=None):
+                 progress_callback=None, cancel_check=None):
         self.source = source
         self.target = target
         self.copy_data = copy_data
         self.reset_target = reset_target
         self.progress_callback = progress_callback
+        self.cancel_check = cancel_check
         self._table_progress: dict = {}
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_check is not None and self.cancel_check():
+            raise MigrationCancelledError("Migration cancelled by user")
 
     # --- relative progress helpers -------------------------------------------
 
@@ -162,6 +171,7 @@ class MigrationOrchestrator:
         total_types = len(schema.types)
 
         # ---- 2. convert -----------------------------------------------------
+        self._check_cancelled()
         self._progress_phase(10, 10, "Converting schema and database objects",
                              total_tables=total_tables, total_views=total_views)
         ddl, conv_warnings = build_database_ddl(schema, self.target.dialect)
@@ -203,6 +213,7 @@ class MigrationOrchestrator:
                 self._apply(report, _object_kind(stmt), stmt)
 
         for idx, table in enumerate(schema.all_tables_in_dependency_order(), 1):
+            self._check_cancelled()
             self._progress_phase(20, 10 + (idx / max(total_tables, 1)) * 15,
                                  f"Creating table {idx}/{total_tables}: {table.name}",
                                  tables_created=idx, total_tables=total_tables)
@@ -220,6 +231,7 @@ class MigrationOrchestrator:
             total_to_copy = len(tables_to_copy)
 
             def _on_table_batch(table_name: str, rows_so_far: int, batch_rows: int, total_expected: int | None) -> None:
+                self._check_cancelled()
                 tp = self._table_progress.get(table_name, {})
                 tp["rows_copied"] = rows_so_far
                 tp["current_batch"] = batch_rows
@@ -238,6 +250,7 @@ class MigrationOrchestrator:
                                      table_progress=self._table_progress)
 
             for idx, table in enumerate(tables_to_copy, 1):
+                self._check_cancelled()
                 self._table_progress[table.name] = {"index": idx, "rows_copied": 0, "done": False, "table_started": monotonic()}
                 try:
                     row_count = self.source.count_rows(table.name)
@@ -278,6 +291,7 @@ class MigrationOrchestrator:
 
         remaining_stmts = [s for s in ddl if not _is_structural(s) and not _is_pre_table(s)]
         for idx, stmt in enumerate(remaining_stmts, 1):
+            self._check_cancelled()
             kind = "constraint" if _is_fk_or_check(stmt) else _object_kind(stmt)
             self._apply(report, kind, stmt)
             if idx % 10 == 0 or idx == len(remaining_stmts):
@@ -288,6 +302,7 @@ class MigrationOrchestrator:
         # ---- 6. verify ----------------------------------------------------------
         total_verify = len(schema.tables)
         for idx, table in enumerate(schema.tables, 1):
+            self._check_cancelled()
             self._progress_phase(90, (idx / max(total_verify, 1)) * 8,
                                  f"Verifying {idx}/{total_verify}: {table.name}",
                                  verify_index=idx, verify_total=total_verify)

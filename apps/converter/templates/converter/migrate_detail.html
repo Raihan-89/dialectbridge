@@ -33,6 +33,15 @@
                 </div>
             </div>
 
+            <div class="btn-row" style="margin-bottom: 16px;">
+                {% if not job.cancel_requested %}
+                <button type="button" class="btn btn-danger" id="stop-migration" data-stop-url="{% url 'migration-cancel' job.pk %}">
+                    Stop migration
+                </button>
+                {% endif %}
+                <p class="progress-stop-note" id="stop-note" {% if not job.cancel_requested %}style="display:none;"{% endif %}>Stop requested — migration is halting at the next checkpoint…</p>
+            </div>
+
             <div class="progress-bar-wrapper">
                 <div class="progress-bar-track">
                     <div class="progress-bar-fill" id="progress-bar-fill" style="width:0%"></div>
@@ -532,6 +541,28 @@
             }
             tableList.innerHTML = html;
         }
+    }
+
+    // --- stop button ---
+    const stopBtn = document.getElementById('stop-migration');
+    if (stopBtn) {
+        const csrfCookie = () => document.cookie.split('; ')
+            .find(r => r.startsWith('csrftoken='))?.split('=')[1] || '';
+        stopBtn.addEventListener('click', async () => {
+            stopBtn.disabled = true;
+            const note = document.getElementById('stop-note');
+            if (note) note.style.display = '';
+            try {
+                await fetch(stopBtn.dataset.stopUrl, {
+                    method: 'POST',
+                    headers: {
+                        'X-CSRFToken': csrfCookie(),
+                        'X-Requested-With': 'XMLHttpRequest',
+                    },
+                    credentials: 'same-origin',
+                });
+            } catch (_) {}
+        });
     }
 
     const poll = async () => {

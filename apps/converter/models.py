@@ -88,6 +88,8 @@ class MigrationJob(models.Model):
     )
 
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    cancel_requested = models.BooleanField(default=False, help_text="User asked to stop this migration.")
+    worker_pid = models.PositiveIntegerField(null=True, blank=True, help_text="OS pid of the thread running this job.")
     report = models.JSONField(default=dict, blank=True)
     warnings = models.JSONField(default=list, blank=True)
     error_message = models.TextField(blank=True)

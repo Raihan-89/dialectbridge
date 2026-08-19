@@ -36,14 +36,18 @@ def test_connection(connection: DatabaseConnection) -> dict:
 
 def run_migration(source: DatabaseConnection, target: DatabaseConnection,
                   copy_data: bool = True, reset_target: bool = False,
-                  progress_callback=None) -> dict:
-    """Run a full migration and return the serialized report dict."""
+                  progress_callback=None, cancel_check=None) -> dict:
+    """Run a full migration and return the serialized report dict.
+
+    ``cancel_check`` is a zero-arg callable returning True when the user
+    wants the migration to stop as soon as possible.
+    """
     source_conn = connector_for(source)
     target_conn = connector_for(target)
     try:
         report = MigrationOrchestrator(
             source_conn, target_conn, copy_data=copy_data, reset_target=reset_target,
-            progress_callback=progress_callback,
+            progress_callback=progress_callback, cancel_check=cancel_check,
         ).run()
         return report.to_dict()
     finally:
