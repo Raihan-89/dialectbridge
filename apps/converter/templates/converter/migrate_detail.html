@@ -21,15 +21,42 @@
 
     {% if job.status == 'running' or job.status == 'pending' %}
     <div id="migration-progress" data-status-url="{% url 'migrate-status' job.pk %}" style="margin-bottom:24px;">
-        <h3>Migration progress</h3>
-        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ job.progress_percent }}">
-            <div class="progress-bar" style="width:{{ job.progress_percent }}%"></div>
+        <div class="progress-card">
+            <div class="progress-card-header">
+                <h3 class="progress-card-title">
+                    <span class="progress-spinner"></span>
+                    Migration in progress
+                </h3>
+                <span class="progress-pct" id="progress-pct-display">0%</span>
+            </div>
+
+            <div class="progress-bar-wrapper">
+                <div class="progress-bar-track">
+                    <div class="progress-bar-fill" id="progress-bar-fill" style="width:0%"></div>
+                </div>
+            </div>
+
+            <div class="progress-phase" id="progress-phase">Starting migration…</div>
+
+            <div class="progress-stats" id="progress-stats">
+                <div class="progress-stat" id="stat-tables">
+                    <span class="progress-stat-value" id="stat-tables-value">0</span>
+                    <span class="progress-stat-label">of <span id="stat-tables-total">0</span> tables</span>
+                </div>
+                <div class="progress-stat" id="stat-current" style="display:none;">
+                    <span class="progress-stat-label">Current</span>
+                    <span class="progress-stat-value progress-stat-table" id="stat-current-table">—</span>
+                </div>
+                <div class="progress-stat" id="stat-rows" style="display:none;">
+                    <span class="progress-stat-value" id="stat-rows-value">0</span>
+                    <span class="progress-stat-label">rows copied</span>
+                </div>
+            </div>
+
+            <div class="progress-table-list" id="progress-table-list"></div>
+
+            <p class="progress-note">You may leave this page. Migration #{{ job.pk }} and its report are saved in history.</p>
         </div>
-        <div class="progress-meta">
-            <span id="progress-stage">{{ job.progress_stage|default:'Starting migration' }}</span>
-            <strong id="progress-percent">{{ job.progress_percent }}%</strong>
-        </div>
-        <p class="subtitle" style="margin:10px 0 0;">You may leave this page. Migration #{{ job.pk }} and its complete report are saved in history.</p>
     </div>
     {% endif %}
 
@@ -190,26 +217,259 @@
         {% endif %}
     </div>
 </div>
+<style>
+    /* ---- Migration Progress Card ---- */
+    .progress-card {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+        background: var(--surface);
+    }
+    .progress-card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 18px;
+    }
+    .progress-card-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0;
+        font-size: 17px;
+        font-weight: 700;
+    }
+    .progress-spinner {
+        width: 20px;
+        height: 20px;
+        border: 3px solid #e0e7ff;
+        border-top-color: var(--primary);
+        border-radius: 50%;
+        animation: progress-spin .7s linear infinite;
+        flex-shrink: 0;
+    }
+    @keyframes progress-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+        .progress-spinner { animation: none; border-color: var(--primary); }
+    }
+    .progress-pct {
+        font-size: 28px;
+        font-weight: 800;
+        color: var(--primary);
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+    }
+    .progress-bar-wrapper { margin-bottom: 12px; }
+    .progress-bar-track {
+        width: 100%;
+        height: 10px;
+        border-radius: 999px;
+        background: #eef2ff;
+        overflow: hidden;
+    }
+    .progress-bar-fill {
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #4f46e5, #7c3aed);
+        transition: width .4s cubic-bezier(.4,0,.2,1);
+        position: relative;
+    }
+    .progress-bar-fill::after {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.3) 50%, transparent 100%);
+        animation: progress-shimmer 1.5s ease-in-out infinite;
+    }
+    @keyframes progress-shimmer {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(100%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .progress-bar-fill { transition: none; }
+        .progress-bar-fill::after { animation: none; }
+    }
+    .progress-phase {
+        font-size: 14px;
+        color: var(--muted);
+        margin-bottom: 18px;
+        font-weight: 500;
+    }
+    .progress-stats {
+        display: flex;
+        gap: 24px;
+        flex-wrap: wrap;
+        margin-bottom: 16px;
+    }
+    .progress-stat {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .progress-stat-value {
+        font-size: 20px;
+        font-weight: 700;
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+    }
+    .progress-stat-label {
+        font-size: 12px;
+        color: var(--muted);
+        font-weight: 500;
+    }
+    .progress-stat-table {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--primary);
+        font-family: var(--font-mono);
+    }
+    .progress-table-list {
+        max-height: 200px;
+        overflow-y: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        display: none;
+    }
+    .progress-table-list:empty { display: none; }
+    .progress-table-list:not(:empty) { display: block; }
+    .progress-table-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        border-bottom: 1px solid #f1f5f9;
+        font-size: 13px;
+    }
+    .progress-table-row:last-child { border-bottom: none; }
+    .progress-table-row.current {
+        background: #eef2ff;
+        font-weight: 600;
+    }
+    .progress-table-row .table-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: var(--font-mono);
+        font-size: 12px;
+    }
+    .progress-table-row .table-rows {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+    }
+    .progress-table-row .table-status {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+    .progress-table-row .table-status.done { background: var(--success); }
+    .progress-table-row .table-status.active {
+        background: var(--primary);
+        animation: status-pulse 1s ease-in-out infinite;
+    }
+    @keyframes status-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: .4; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .progress-table-row .table-status.active { animation: none; }
+    }
+    .progress-note {
+        margin: 16px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+    }
+    @media (max-width: 600px) {
+        .progress-card { padding: 16px; }
+        .progress-card-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+        .progress-pct { font-size: 22px; }
+        .progress-stats { gap: 16px; }
+        .progress-stat-value { font-size: 17px; }
+    }
+</style>
 {% if job.status == 'running' or job.status == 'pending' %}
 <script>
 (() => {
     const panel = document.getElementById('migration-progress');
+    if (!panel) return;
+    const barFill = document.getElementById('progress-bar-fill');
+    const pctDisplay = document.getElementById('progress-pct-display');
+    const phaseEl = document.getElementById('progress-phase');
+    const tablesValue = document.getElementById('stat-tables-value');
+    const tablesTotal = document.getElementById('stat-tables-total');
+    const currentTable = document.getElementById('stat-current-table');
+    const currentStat = document.getElementById('stat-current');
+    const rowsValue = document.getElementById('stat-rows-value');
+    const rowsStat = document.getElementById('stat-rows');
+    const tableList = document.getElementById('progress-table-list');
+
+    function formatRows(n) {
+        if (n == null) return '—';
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+        if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+        return String(n);
+    }
+
+    function updateUI(data) {
+        const pct = data.progress_percent || 0;
+        barFill.style.width = pct + '%';
+        barFill.parentElement.setAttribute('aria-valuenow', pct);
+        pctDisplay.textContent = pct + '%';
+        phaseEl.textContent = data.progress_stage || 'Working…';
+
+        if (data.total_tables > 0) {
+            tablesValue.textContent = data.tables_copied || 0;
+            tablesTotal.textContent = data.total_tables;
+        }
+        if (data.current_table) {
+            currentStat.style.display = '';
+            currentTable.textContent = data.current_table;
+        }
+        if (data.current_table_rows > 0) {
+            rowsStat.style.display = '';
+            rowsValue.textContent = formatRows(data.current_table_rows);
+        }
+
+        // Build table progress list
+        const tp = data.table_progress || {};
+        const keys = Object.keys(tp);
+        if (keys.length > 0) {
+            let html = '';
+            for (const name of keys) {
+                const t = tp[name];
+                const isDone = t.done;
+                const isCurrent = name === data.current_table && !isDone;
+                const rowCls = isCurrent ? ' current' : '';
+                const statusCls = isDone ? ' done' : (isCurrent ? ' active' : '');
+                const rows = t.rows_copied != null ? formatRows(t.rows_copied) : '…';
+                html += '<div class="progress-table-row' + rowCls + '">'
+                    + '<span class="table-status' + statusCls + '"></span>'
+                    + '<span class="table-name">' + name + '</span>'
+                    + '<span class="table-rows">' + rows + '</span>'
+                    + '</div>';
+            }
+            tableList.innerHTML = html;
+        }
+    }
+
     const poll = async () => {
         try {
             const response = await fetch(panel.dataset.statusUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}});
             const data = await response.json();
-            const bar = panel.querySelector('.progress-bar');
-            bar.style.width = `${data.progress_percent}%`;
-            bar.parentElement.setAttribute('aria-valuenow', data.progress_percent);
-            document.getElementById('progress-stage').textContent = data.progress_stage;
-            document.getElementById('progress-percent').textContent = `${data.progress_percent}%`;
+            updateUI(data);
             if (data.finished) window.location.reload();
-            else window.setTimeout(poll, 1200);
+            else window.setTimeout(poll, 800);
         } catch (_) {
             window.setTimeout(poll, 2500);
         }
     };
-    window.setTimeout(poll, 600);
+    window.setTimeout(poll, 400);
 })();
 </script>
 {% endif %}

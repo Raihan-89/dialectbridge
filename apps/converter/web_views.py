@@ -307,15 +307,48 @@ def migration_undo_delete_view(request):
 
 def migrate_status_view(request, pk):
     job = get_object_or_404(MigrationJob, pk=pk)
+    # Extract structured progress data from the stage JSON if available
+    progress_stage = job.progress_stage
+    tables_copied = 0
+    total_tables = 0
+    current_table = ""
+    current_table_rows = 0
+    current_table_total = 0
+    table_progress = {}
+
+    if progress_stage and progress_stage.startswith("{"):
+        try:
+            import json
+            pdata = json.loads(progress_stage)
+            progress_stage = pdata.get("stage", progress_stage)
+            tables_copied = pdata.get("tables_copied", 0)
+            total_tables = pdata.get("total_tables", 0)
+            current_table = pdata.get("current_table", "")
+            current_table_rows = pdata.get("current_table_rows", 0)
+            current_table_total = pdata.get("current_table_total") or 0
+            # Filter table_progress to only done + current table for display
+            raw_tp = pdata.get("table_progress", {})
+            for tname, tdata in raw_tp.items():
+                if tdata.get("done") or tname == current_table:
+                    table_progress[tname] = tdata
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return JsonResponse({
         "id": job.pk,
         "status": job.status,
         "status_label": job.get_status_display(),
         "progress_percent": job.progress_percent,
-        "progress_stage": job.progress_stage,
+        "progress_stage": progress_stage,
         "finished": job.status in {
             MigrationJob.Status.COMPLETED, MigrationJob.Status.PARTIAL, MigrationJob.Status.FAILED,
         },
+        "tables_copied": tables_copied,
+        "total_tables": total_tables,
+        "current_table": current_table,
+        "current_table_rows": current_table_rows,
+        "current_table_total": current_table_total,
+        "table_progress": table_progress,
     })
 
 
@@ -326,10 +359,18 @@ def _run_migration_job(job_id: int) -> None:
         job = MigrationJob.objects.select_related("source", "target").get(pk=job_id)
         logger.info("Background migration job started job_id=%s", job_id)
 
-        def progress(percent, stage):
-            MigrationJob.objects.filter(pk=job_id).update(
-                progress_percent=percent, progress_stage=stage,
-            )
+        def progress(percent, stage, **kwargs):
+            import json
+            data = kwargs.get("data") or {}
+            if data:
+                MigrationJob.objects.filter(pk=job_id).update(
+                    progress_percent=percent,
+                    progress_stage=json.dumps(data, default=str),
+                )
+            else:
+                MigrationJob.objects.filter(pk=job_id).update(
+                    progress_percent=percent, progress_stage=stage,
+                )
 
         report = migration_service.run_migration(
             job.source, job.target, copy_data=job.copy_data,

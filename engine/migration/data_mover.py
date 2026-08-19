@@ -9,7 +9,7 @@ Design:
   - Builds target INSERTs with the target's quoted identifier and parameter
     placeholders, executed with the target driver's parameter binding so
     values round-trip exactly (no string interpolation of user data).
-  - PostgreSQL targets use COPY for bulk loading (10-50× faster than INSERT
+  - PostgreSQL targets use COPY for bulk loading (10-50x faster than INSERT
     for large tables); non-PG targets fall back to batched INSERTs.
   - Non-unique indexes on the target are dropped before loading and recreated
     after, cutting index-maintenance overhead during bulk inserts.
@@ -27,11 +27,13 @@ _INT_TYPES = {"BIGINT", "INT", "SMALLINT", "TINYINT"}
 
 
 class DataMigration:
-    def __init__(self, source, target, table: Table, batch_size: int = 5000):
+    def __init__(self, source, target, table: Table, batch_size: int = 5000,
+                 progress_callback=None):
         self.source = source
         self.target = target
         self.table = table
         self.batch_size = batch_size
+        self.progress_callback = progress_callback
         self.rows_copied = 0
         self.rows_skipped = 0
         self.rows_failed = 0
@@ -45,6 +47,10 @@ class DataMigration:
 
         order_cols = self._order_columns()
         target_cols = ", ".join(self.target.quote_ident(c) for c in cols)
+
+        # Notify: starting this table
+        if self.progress_callback:
+            self.progress_callback(self.table.name, 0, 0, None)
 
         dropped_indexes = self._drop_indexes()
 
@@ -69,16 +75,22 @@ class DataMigration:
     # ------------------------------------------------------------------
     def _run_copy(self, cols: list[str], order_cols: list[str]) -> None:
         """Bulk-load via PostgreSQL COPY (much faster for large tables)."""
+        running_count = 0
 
-        def _iter():
+        def _progress_iter():
+            """Yield batches and report progress after each one."""
+            nonlocal running_count
             for batch in self.source.iter_table_rows(
                 self.table.name, cols, order_cols,
                 batch_size=self.batch_size, int_columns=self._int_columns(),
             ):
                 if batch:
                     yield batch
+                    running_count += len(batch)
+                    if self.progress_callback:
+                        self.progress_callback(self.table.name, running_count, len(batch), None)
 
-        self.rows_copied = self.target.copy_to_table(self.table.name, cols, _iter())
+        self.rows_copied = self.target.copy_to_table(self.table.name, cols, _progress_iter())
 
     # ------------------------------------------------------------------
     def _run_insert(self, cols: list[str], order_cols: list[str], target_cols: str) -> None:
@@ -90,6 +102,9 @@ class DataMigration:
             if not batch:
                 continue
             self._insert_batch(target_cols, cols, batch)
+            # Notify progress after each batch
+            if self.progress_callback:
+                self.progress_callback(self.table.name, self.rows_copied, len(batch), None)
 
     # ------------------------------------------------------------------
     def _column_names(self) -> list[str]:

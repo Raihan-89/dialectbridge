@@ -109,24 +109,36 @@ class MigrationOrchestrator:
         self.copy_data = copy_data
         self.reset_target = reset_target
         self.progress_callback = progress_callback
+        self._table_progress: dict = {}
+
+    # --- relative progress helpers -------------------------------------------
 
     def _progress(self, percent: int, stage: str) -> None:
         if self.progress_callback:
             self.progress_callback(percent, stage)
 
+    def _progress_phase(self, base: float, weight: float, stage: str, **extra) -> None:
+        """Emit progress as a weighted mix across the overall pipeline."""
+        pct = min(100, max(0, int(base + weight)))
+        if self.progress_callback:
+            data = {"percent": pct, "stage": stage, **extra}
+            self.progress_callback(pct, stage, data=data)
+
+    # --------------------------------------------------------------------------
     def run(self) -> MigrationReport:
         started = monotonic()
         logger.info(
             "Migration started source=%s target=%s copy_data=%s reset_target=%s",
             self.source.database, self.target.database, self.copy_data, self.reset_target,
         )
-        self._progress(5, "Connecting and extracting source schema")
+        self._progress(2, "Connecting to source database")
         report = MigrationReport(
             source_db=self.source.database, target_db=self.target.database,
             started_at=_now(),
         )
 
         # ---- 1. extract ----------------------------------------------------
+        self._progress(5, "Extracting source schema")
         try:
             schema = self.source.extract_schema()
         except ConnectorError as exc:
@@ -139,22 +151,34 @@ class MigrationOrchestrator:
 
         report.warnings.extend(schema.warnings)
         if schema.warnings:
-            logger.warning("Schema extraction completed with %d warning(s)", len(schema.warnings))
+            logger.warning("Schema conversion completed with %d warning(s)", len(schema.warnings))
+
+        total_tables = len(schema.tables)
+        total_views = len(schema.views)
+        total_funcs = len(schema.functions)
+        total_procs = len(schema.procedures)
+        total_triggers = len(schema.triggers)
+        total_sequences = len(schema.sequences)
+        total_types = len(schema.types)
 
         # ---- 2. convert -----------------------------------------------------
-        self._progress(20, "Converting schema and database objects")
+        self._progress_phase(10, 10, "Converting schema and database objects",
+                             total_tables=total_tables, total_views=total_views)
         ddl, conv_warnings = build_database_ddl(schema, self.target.dialect)
         report.warnings.extend(conv_warnings)
         if conv_warnings:
             logger.warning("Schema conversion completed with %d warning(s)", len(conv_warnings))
 
         # ---- 3. apply structural DDL -----------------------------------------
-        self._progress(35, "Creating schemas, tables, and indexes")
+        self._progress_phase(20, 10, "Creating schemas, tables, and indexes",
+                             total_tables=total_tables)
         schemas = sorted({name.split(".")[0] for t in schema.tables for name in (t.name,)})
 
         # Optional destructive reset: drop the target objects we are about to
         # recreate so a previous run does not collide. The user opts in.
         if self.reset_target and schemas:
+            self._progress_phase(20, 10, "Dropping existing target objects",
+                                 total_tables=total_tables)
             if self.target.dialect == "postgres":
                 for s in schemas:
                     self.target.execute(f"DROP SCHEMA IF EXISTS {self.target.quote_ident(s)} CASCADE")
@@ -178,7 +202,10 @@ class MigrationOrchestrator:
             if _is_pre_table(stmt):
                 self._apply(report, _object_kind(stmt), stmt)
 
-        for table in schema.all_tables_in_dependency_order():
+        for idx, table in enumerate(schema.all_tables_in_dependency_order(), 1):
+            self._progress_phase(20, 10 + (idx / max(total_tables, 1)) * 15,
+                                 f"Creating table {idx}/{total_tables}: {table.name}",
+                                 tables_created=idx, total_tables=total_tables)
             self._apply_table(report, schema, table)
 
         structural = [s for s in ddl if _is_structural(s)]
@@ -187,28 +214,98 @@ class MigrationOrchestrator:
                 self._apply(report, "index", stmt)
 
         # ---- 4. copy data -----------------------------------------------------
-        self._progress(55, "Copying table data")
+        self._table_progress = {}
         if self.copy_data:
-            for table in schema.all_tables_in_dependency_order():
-                self._copy_table(report, table)
+            tables_to_copy = schema.all_tables_in_dependency_order()
+            total_to_copy = len(tables_to_copy)
+
+            def _on_table_batch(table_name: str, rows_so_far: int, batch_rows: int, total_expected: int | None) -> None:
+                tp = self._table_progress.get(table_name, {})
+                tp["rows_copied"] = rows_so_far
+                tp["current_batch"] = batch_rows
+                if total_expected is not None:
+                    tp["total_rows"] = total_expected
+                self._table_progress[table_name] = tp
+
+                copied_tables = sum(1 for v in self._table_progress.values() if v.get("done"))
+                base = 35
+                weight = (copied_tables / max(total_to_copy, 1)) * 40
+                self._progress_phase(base, weight,
+                                     f"Copying data: {table_name} ({rows_so_far} rows)",
+                                     tables_copied=copied_tables, total_tables=total_to_copy,
+                                     current_table=table_name, current_table_rows=rows_so_far,
+                                     current_table_total=total_expected,
+                                     table_progress=self._table_progress)
+
+            for idx, table in enumerate(tables_to_copy, 1):
+                self._table_progress[table.name] = {"index": idx, "rows_copied": 0, "done": False}
+                try:
+                    row_count = self.source.count_rows(table.name)
+                    self._table_progress[table.name]["total_rows"] = row_count
+                except Exception:
+                    self._table_progress[table.name]["total_rows"] = None
+
+                self._progress_phase(35, ((idx - 1) / max(total_to_copy, 1)) * 40,
+                                     f"Copying data: {table.name} (0 rows)",
+                                     tables_copied=idx - 1, total_tables=total_to_copy,
+                                     current_table=table.name, current_table_rows=0,
+                                     current_table_total=self._table_progress[table.name].get("total_rows"),
+                                     table_progress=self._table_progress)
+
+                self._copy_table(report, table, on_batch=_on_table_batch)
+
+                self._table_progress[table.name]["done"] = True
+                self._table_progress[table.name]["rows_copied"] = (
+                    report.data_results[-1].rows_copied if report.data_results else 0
+                )
+
+                self._progress_phase(35, (idx / max(total_to_copy, 1)) * 40,
+                                     f"Copied {idx}/{total_to_copy} tables",
+                                     tables_copied=idx, total_tables=total_to_copy,
+                                     current_table=table.name,
+                                     current_table_rows=self._table_progress[table.name]["rows_copied"],
+                                     table_progress=self._table_progress)
 
         # ---- 5. referential + object DDL ---------------------------------------
-        self._progress(75, "Creating constraints, views, routines, and triggers")
+        self._progress_phase(75, 8, "Creating constraints, views, routines, and triggers",
+                             total_tables=total_tables)
         # Views and routines may reference tables by bare name (T-SQL defaults
         # to the dbo schema); point PostgreSQL's search_path at the migrated
         # schemas so those references resolve.
         if self.target.dialect == "postgres" and schemas:
             self.target.execute("SET search_path = " + ", ".join(self.target.quote_ident(s) for s in schemas))
 
-        for stmt in ddl:
-            if _is_structural(stmt) or _is_pre_table(stmt):
-                continue
+        remaining_stmts = [s for s in ddl if not _is_structural(s) and not _is_pre_table(s)]
+        for idx, stmt in enumerate(remaining_stmts, 1):
             kind = "constraint" if _is_fk_or_check(stmt) else _object_kind(stmt)
             self._apply(report, kind, stmt)
+            if idx % 10 == 0 or idx == len(remaining_stmts):
+                self._progress_phase(75, 8 + (idx / max(len(remaining_stmts), 1)) * 7,
+                                     f"Applying objects {idx}/{len(remaining_stmts)}",
+                                     objects_applied=idx, total_objects=len(remaining_stmts))
 
         # ---- 6. verify ----------------------------------------------------------
-        self._progress(90, "Verifying migrated row counts")
-        report.verification = self._verify(schema)
+        total_verify = len(schema.tables)
+        for idx, table in enumerate(schema.tables, 1):
+            self._progress_phase(90, (idx / max(total_verify, 1)) * 8,
+                                 f"Verifying {idx}/{total_verify}: {table.name}",
+                                 verify_index=idx, verify_total=total_verify)
+            try:
+                src_count = self.source.count_rows(table.name)
+            except ConnectorError as exc:
+                logger.warning("Source row-count verification failed table=%s error=%s", table.name, exc)
+                src_count = None
+            try:
+                tgt_count = self.target.count_rows(table.name)
+            except ConnectorError as exc:
+                logger.warning("Target row-count verification failed table=%s error=%s", table.name, exc)
+                tgt_count = None
+            report.verification.append({
+                "table": table.name,
+                "source_rows": src_count,
+                "target_rows": tgt_count,
+                "match": src_count == tgt_count,
+            })
 
         report.finished_at = _now()
         report.success = not any(r.status == "failed" for r in report.schema_results + report.data_results)
@@ -316,9 +413,8 @@ class MigrationOrchestrator:
             WHERE type = 'R'
                 AND name NOT IN ('public', 'db_owner', 'db_accessadmin',
                                  'db_securityadmin', 'db_ddladmin',
-                                 'db_backupoperator', 'db_datareader',
-                                 'db_datawriter', 'db_denydatareader',
-                                 'db_denydatawriter')
+                                 'db_backupoperator', 'db_datareader', 'db_datawriter',
+                                 'db_denydatareader', 'db_denydatawriter')
             """
         )
         for (obj_name,) in rows:
@@ -347,9 +443,9 @@ class MigrationOrchestrator:
                 for retry_stmt in retry_stmts:
                     self._apply(report, "table", retry_stmt, object_name=table.name)
 
-    def _copy_table(self, report: MigrationReport, table) -> None:
+    def _copy_table(self, report: MigrationReport, table, on_batch=None) -> None:
         started = monotonic()
-        mover = DataMigration(self.source, self.target, table)
+        mover = DataMigration(self.source, self.target, table, progress_callback=on_batch)
         result = mover.run()
         obj = ObjectResult(
             kind="data", name=table.name,
@@ -383,28 +479,6 @@ class MigrationOrchestrator:
                 )
             )
 
-    # ------------------------------------------------------------------
-    def _verify(self, schema) -> list[dict]:
-        results = []
-        for table in schema.tables:
-            try:
-                src_count = self.source.count_rows(table.name)
-            except ConnectorError as exc:
-                logger.warning("Source row-count verification failed table=%s error=%s", table.name, exc)
-                src_count = None
-            try:
-                tgt_count = self.target.count_rows(table.name)
-            except ConnectorError as exc:
-                logger.warning("Target row-count verification failed table=%s error=%s", table.name, exc)
-                tgt_count = None
-            results.append({
-                "table": table.name,
-                "source_rows": src_count,
-                "target_rows": tgt_count,
-                "match": src_count == tgt_count,
-            })
-        return results
-
 
 def _object_kind(stmt: str) -> str:
     upper = stmt.lstrip().upper()
@@ -436,7 +510,8 @@ def _name_from_stmt(stmt: str) -> str:
     m = __import__("re").match(
         r"^\s*CREATE(?:\s+OR\s+(?:ALTER|REPLACE))?\s+"
         r"(?:VIEW|FUNCTION|PROCEDURE|TRIGGER)\s+"
-        r"(?:\"?\[?\w+\]?\"?\.)?\"?\[?([\w\d_]+)", stmt,
+        r"(?:\"?\[?\w+\]?\"?\.)?\"?\[?([\w\d_]+)",
+        stmt,
         flags=__import__("re").IGNORECASE,
     )
     return m.group(1) if m else stmt[:40]
