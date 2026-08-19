@@ -480,12 +480,17 @@ _STMT_START_RE = re.compile(
     re.IGNORECASE,
 )
 _SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
-_SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT)\b", re.IGNORECASE)
+_SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT|UNION|INTERSECT|EXCEPT)\b", re.IGNORECASE)
+
+
+def _ends_with_set_op(text: str) -> bool:
+    """True if text ends with UNION/INTERSECT/EXCEPT (+ optional ALL)."""
+    return bool(re.search(r"\b(?:UNION|INTERSECT|EXCEPT)\s*(?:ALL\s*)?$", text, re.IGNORECASE))
 # Keywords that continue a previous statement (never start a new one)
 _CONTINUATION_KEYWORDS = re.compile(
     r"^(?:FROM|WHERE|AND|OR|ON|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|JOIN|GROUP|ORDER|HAVING|"
-    r"UNION|INTERSECT|EXCEPT|FETCH|OFFSET|LIMIT|VALUES|SET|INTO|OVER|PARTITION|CASE|WHEN|"
-    r"THEN|ELSE|END|BETWEEN|LIKE|IN|EXISTS|NOT|AS|ASC|DESC|BETWEEN|LIKE|TOP|DISTINCT|ALL|"
+    r"FETCH|OFFSET|LIMIT|INTO|OVER|PARTITION|CASE|WHEN|"
+    r"THEN|BETWEEN|LIKE|IN|EXISTS|NOT|AS|ASC|DESC|TOP|DISTINCT|ALL|"
     r"OPTION|RECOMPILE|FOR|OPEN|CLOSE|DEALLOCATE|NEXT|PREVIOUS|FIRST|LAST|ABSOLUTE|RELATIVE)\b",
     re.IGNORECASE,
 )
@@ -926,7 +931,9 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             elif first_word == "SET" and not _SET_START_EXCEPT.match(buf[0].lstrip()):
                 flush()
             elif first_word == "SELECT" and not _SELECT_START_EXCEPT.match(buf[0].lstrip()):
-                flush()
+                # A SELECT after UNION/INTERSECT/EXCEPT continues the set operation
+                if not _ends_with_set_op(" ".join(buf)):
+                    flush()
 
         is_control = (
             upper in ("BEGIN", "END", "ELSE")
@@ -999,6 +1006,11 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             stack.append("try")
             out.append("BEGIN")
             continue
+        # Standalone TRY without BEGIN (T-SQL shorthand)
+        if upper == "TRY":
+            stack.append("try")
+            out.append("BEGIN")
+            continue
         if upper == "BEGIN CATCH" or upper.startswith("BEGIN CATCH"):
             continue  # handled by END TRY
         if upper.startswith("END TRY"):
@@ -1033,8 +1045,16 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
 
         # ---- statements ------------------------------------------------------
         buf.append(line)
-        if line.endswith(";") or upper.startswith("DECLARE "):
+        if upper.startswith("DECLARE "):
             flush()
+        elif line.endswith(";"):
+            # Don't flush if the statement ends with UNION/INTERSECT/EXCEPT
+            # — the next SELECT is part of the same set operation.
+            stripped = line.rstrip(";").strip()
+            if re.match(r".*\b(UNION|INTERSECT|EXCEPT)\s+(ALL\s+)?$", stripped, re.IGNORECASE):
+                pass  # keep accumulating
+            else:
+                flush()
 
     if buf:
         flush()
@@ -1077,6 +1097,20 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
     # Generic SET <option> ON/OFF that wasn't caught above
     if re.match(r"^SET\s+\w+\s+(ON|OFF)\s*$", line, re.IGNORECASE):
         return None
+    # Handle multiple concatenated SET statements on one line
+    # e.g. "set nocount on SET XACT_ABORT ON" or "set nocount on set ansi_nulls on"
+    if re.match(r"^SET\s+\w+", line, re.IGNORECASE):
+        # Split on "SET " boundaries and check if ALL parts are skippable
+        parts = re.split(r"(?<=\s)(?=(?:SET)\s)", line, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            all_skipped = True
+            for part in parts:
+                p = part.strip().upper()
+                if p and p not in _SET_SKIP and not re.match(r"^SET\s+\w+\s+(ON|OFF)\s*$", p, re.IGNORECASE):
+                    all_skipped = False
+                    break
+            if all_skipped:
+                return None
 
     # BEGIN/COMMIT/ROLLBACK TRANSACTION -> plain PL/pgSQL transaction control
     if re.match(r"^BEGIN\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
@@ -1099,10 +1133,11 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
         return None  # declaration collected into the header DECLARE block
 
     # DECLARE name AS type / DECLARE name type (without @ prefix)
-    # T-SQL allows variable declarations without the @ prefix and with optional AS keyword.
-    m = re.match(rf"^DECLARE\s+([\w]+)\s+(?:AS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$", line, re.IGNORECASE)
+    # Also handles multi-variable: DECLARE a int, b varchar(100)
+    # And quoted names: DECLARE "name" as varchar(100)
+    m = re.match(rf"^DECLARE\s+([\w\"]+)\s+(?:AS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$", line, re.IGNORECASE)
     if m:
-        name, dtype, init = m.group(1), m.group(2), m.group(3)
+        name, dtype, init = m.group(1).strip('"'), m.group(2), m.group(3)
         target_type, warn = convert_type(dtype, "tsql", "postgres")
         if warn:
             warnings.append(f"DECLARE {name}: {warn}")
@@ -1112,6 +1147,51 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
         else:
             declared[name] = target_type
         return None  # declaration collected into the header DECLARE block
+
+    # Multi-variable DECLARE: DECLARE a int, b varchar(100), c datetime
+    # or DECLARE a as int, b as varchar(100)
+    m = re.match(r"^DECLARE\s+(.+)$", line, re.IGNORECASE)
+    if m:
+        var_list = m.group(1)
+        # Split by comma, but not inside parentheses
+        parts = []
+        depth = 0
+        current = []
+        for ch in var_list:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == ',' and depth == 0:
+                parts.append(''.join(current).strip())
+                current = []
+                continue
+            current.append(ch)
+        if current:
+            parts.append(''.join(current).strip())
+
+        all_handled = True
+        for part in parts:
+            # Try: name type, name AS type, name type = expr, name AS type = expr
+            vm = re.match(
+                rf"""(?:"([\w]+)"|([\w]+))\s+(?:AS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$""",
+                part.strip(), re.IGNORECASE,
+            )
+            if vm:
+                name = vm.group(1) or vm.group(2)
+                dtype, init = vm.group(3), vm.group(4)
+                target_type, warn = convert_type(dtype, "tsql", "postgres")
+                if warn:
+                    warnings.append(f"DECLARE {name}: {warn}")
+                target_type = target_type or "TEXT"
+                if init is not None:
+                    declared[name] = f"{target_type} := {_expr(init.strip())}"
+                else:
+                    declared[name] = target_type
+            else:
+                all_handled = False
+        if all_handled:
+            return None
 
     # DECLARE @x TABLE (...) — table variable declaration (skip, must be converted to temp table)
     if re.match(r"^DECLARE\s+@[\w]+\s+TABLE\s*\(", line, re.IGNORECASE):
@@ -1199,6 +1279,19 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
             warnings.append(f"Temp table '{tmp.group(1).lower()}' — ensure CREATE TEMP TABLE precedes it")
         return _expr(line) + ";"
 
+    # EXEC(SQL) or EXECUTE(SQL) — dynamic SQL execution
+    m = re.match(r"^(?:EXEC|EXECUTE)\s*\((.+)\)\s*$", line, re.IGNORECASE)
+    if m:
+        sql_expr = _expr(m.group(1).strip())
+        return f"EXECUTE {sql_expr};"
+    # EXEC sp_name @args — stored procedure call
+    m = re.match(r"^(?:EXEC|EXECUTE)\s+([\w.]+)\s*(.*)$", line, re.IGNORECASE)
+    if m:
+        sp_name = m.group(1)
+        args_str = m.group(2).strip().rstrip(";").strip()
+        args = _expr(args_str) if args_str else ""
+        return f"CALL {sp_name}({args});" if args else f"CALL {sp_name}();"
+
     # plain DML / control — translate T-SQL specific syntax before emitting.
     line = _translate_tsql_body_syntax(line)
     return _expr(line) + ";"
@@ -1213,7 +1306,7 @@ def _translate_tsql_body_syntax(line: str) -> str:
     # Strip WITH (NOLOCK), WITH (UPDLOCK), WITH (TABLOCK), etc.
     line = re.sub(r"\bWITH\s*\(\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|NOLOCK|INDEX\s*\([^)]*\))(?:\s*,\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|INDEX\s*\([^)]*\)))*\s*\)", "", line, flags=re.IGNORECASE)
     # CREATE TABLE #temp; or CREATE TABLE temp; (no columns) -> CREATE TEMP TABLE temp ();
-    line = re.sub(r"(?i)\bCREATE\s+TABLE\s+(?:#([\w]+)|([\w]+))\s*;", lambda m: f"CREATE TEMP TABLE {m.group(1) or m.group(2)} ();", line)
+    line = re.sub(r"(?i)\bCREATE\s+TABLE\s+(?:#([\w]+)|([\w]+))\s*;?\s*$", lambda m: f"CREATE TEMP TABLE {m.group(1) or m.group(2)} ();", line)
     # OPEN cursor FOR select -> cursor_name FOR select  (PG refcursor syntax)
     m = re.match(r"^OPEN\s+([\w]+)\s+FOR\s+(.+)$", line, re.IGNORECASE)
     if m:

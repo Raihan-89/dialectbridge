@@ -224,7 +224,7 @@ def _convert_to_cast(args: str) -> str | None:
         tok = re.sub(r"^\[([A-Za-z_][A-Za-z0-9_]*)\](\s*\([^)]*\))$", r"\1\2", tok)
         if tok.startswith("[") and tok.endswith("]"):
             tok = tok[1:-1].strip()
-        if tok.upper() in _TYPE_KEYWORDS or re.match(r"^[A-Z]+(\(\d+(,\d+)?\))?$", tok, re.I):
+        if tok.upper() in _TYPE_KEYWORDS or re.match(r"^[A-Z]+(\s*\(\s*\d+(\s*,\s*\d+)?\s*\))?$", tok, re.I):
             return tok
         return None
 

@@ -900,10 +900,17 @@ def _translate_expr(expr: str, source: str, target: str) -> str:
         out = re.sub(r'"\[([\w\s\d_]+)\]"', r'"\1"', out)
         # MSSQL N-prefixed string literals have no PG equivalent
         out = re.sub(r"\bN'", "'", out, flags=re.IGNORECASE)
+        # Strip WITH (NOLOCK), WITH (UPDLOCK), etc.
+        out = re.sub(
+            r"\bWITH\s*\(\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|INDEX\s*\([^)]*\))(?:\s*,\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|INDEX\s*\([^)]*\)))*\s*\)",
+            "", out, flags=re.IGNORECASE,
+        )
         # MSSQL '+' string concatenation -> PostgreSQL '||'
         if "'" in out:
             from engine.translators.procedure_translator import _replace_concat
             out = _replace_concat(out)
+        # T-SQL single-quoted aliases (AS 'Name') -> PG double-quoted identifiers
+        out = re.sub(r"\bAS\s+'([^']+)'", lambda m: f'AS "{m.group(1)}"', out, flags=re.IGNORECASE)
         out = _translate_top(out)
     else:
         # PG quoted identifiers -> MSSQL brackets
@@ -1124,6 +1131,20 @@ def _qualify_table_refs(text: str, table_names: list[str], target: str) -> str:
             text,
             flags=re.IGNORECASE,
         )
+    # Handle unquoted dbo-prefixed refs (e.g. dbo.tr_BenWagesPayment) whose full
+    # qualified name isn't an exact table name. Only the dbo schema is rewritten
+    # so alias.column references are never touched.
+    if target == "postgres":
+        for tname in sorted(table_names, key=len, reverse=True):
+            bare = tname.split(".")[-1]
+            if not bare:
+                continue
+            text = re.sub(
+                rf"\bdbo\.{re.escape(bare)}\b",
+                _qident(tname, target),
+                text,
+                flags=re.IGNORECASE,
+            )
     return text
 
 
@@ -1168,6 +1189,25 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
     for table in tables:
         for col in table.columns:
             col_casing.setdefault(col.name.lower(), col.name)
+
+    # Fix casing of already-quoted column identifiers.
+    # e.g. "dbo"."Age" where the actual column is "age" -> "dbo"."age"
+    def _fix_quoted_col_casing(m):
+        prefix = m.group(1) or ""
+        col_name = m.group(2)
+        canon = col_casing.get(col_name.lower())
+        if canon and canon != col_name:
+            return f'{prefix}"{canon}"'
+        return m.group(0)
+    masked = re.sub(r'(?:(\w+)\.)"([A-Za-z_]\w*)"', _fix_quoted_col_casing, masked)
+    # Also handle standalone quoted columns: "Age" -> "age"
+    def _fix_standalone_quoted_casing(m):
+        col_name = m.group(1)
+        canon = col_casing.get(col_name.lower())
+        if canon and canon != col_name:
+            return f'"{canon}"'
+        return m.group(0)
+    masked = re.sub(r'(?<![\w.])"([A-Za-z_]\w*)"(?![.\w(])', _fix_standalone_quoted_casing, masked)
 
     # Bare references to a function's own parameters must stay unquoted so
     # PL/pgSQL resolves them as variables rather than ambiguous columns.
