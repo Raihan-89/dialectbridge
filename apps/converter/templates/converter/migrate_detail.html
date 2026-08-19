@@ -27,7 +27,10 @@
                     <span class="progress-spinner"></span>
                     Migration in progress
                 </h3>
-                <span class="progress-pct" id="progress-pct-display">0%</span>
+                <div class="progress-header-right">
+                    <span class="progress-pct" id="progress-pct-display">0%</span>
+                    <span class="progress-elapsed" id="progress-elapsed">00:00</span>
+                </div>
             </div>
 
             <div class="progress-bar-wrapper">
@@ -231,6 +234,22 @@
         justify-content: space-between;
         margin-bottom: 18px;
     }
+    .progress-header-right {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+    }
+    .progress-elapsed {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        font-family: var(--font-mono);
+        background: var(--bg);
+        padding: 3px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+    }
     .progress-card-title {
         display: flex;
         align-items: center;
@@ -362,6 +381,18 @@
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
     }
+    .progress-table-row .table-duration {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        font-size: 11px;
+        min-width: 50px;
+        text-align: right;
+    }
+    .progress-table-row.done .table-duration {
+        color: var(--success);
+        font-weight: 600;
+    }
     .progress-table-row .table-status {
         width: 8px;
         height: 8px;
@@ -408,6 +439,41 @@
     const rowsValue = document.getElementById('stat-rows-value');
     const rowsStat = document.getElementById('stat-rows');
     const tableList = document.getElementById('progress-table-list');
+    const elapsedEl = document.getElementById('progress-elapsed');
+
+    // --- elapsed timer ---
+    let startedAt = null;
+    let timerInterval = null;
+
+    function fmtDuration(ms) {
+        const totalSec = Math.floor(ms / 1000);
+        const h = Math.floor(totalSec / 3600);
+        const m = Math.floor((totalSec % 3600) / 60);
+        const s = totalSec % 60;
+        if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+        return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+    }
+
+    function fmtTableDuration(ms) {
+        if (ms == null) return '';
+        const totalSec = Math.floor(ms / 1000);
+        const m = Math.floor(totalSec / 60);
+        const s = totalSec % 60;
+        if (m > 0) return m + 'm ' + s + 's';
+        return s + 's';
+    }
+
+    function tickElapsed() {
+        if (!startedAt) return;
+        elapsedEl.textContent = fmtDuration(Date.now() - startedAt);
+    }
+
+    function startTimer(isoStr) {
+        if (!isoStr || timerInterval) return;
+        startedAt = new Date(isoStr).getTime();
+        tickElapsed();
+        timerInterval = setInterval(tickElapsed, 250);
+    }
 
     function formatRows(n) {
         if (n == null) return '—';
@@ -423,6 +489,9 @@
         pctDisplay.textContent = pct + '%';
         phaseEl.textContent = data.progress_stage || 'Working…';
 
+        // Start elapsed timer from server timestamp
+        if (data.started_at) startTimer(data.started_at);
+
         if (data.total_tables > 0) {
             tablesValue.textContent = data.tables_copied || 0;
             tablesTotal.textContent = data.total_tables;
@@ -436,7 +505,7 @@
             rowsValue.textContent = formatRows(data.current_table_rows);
         }
 
-        // Build table progress list
+        // Build table progress list with durations
         const tp = data.table_progress || {};
         const keys = Object.keys(tp);
         if (keys.length > 0) {
@@ -448,10 +517,17 @@
                 const rowCls = isCurrent ? ' current' : '';
                 const statusCls = isDone ? ' done' : (isCurrent ? ' active' : '');
                 const rows = t.rows_copied != null ? formatRows(t.rows_copied) : '…';
-                html += '<div class="progress-table-row' + rowCls + '">'
+                let dur = '';
+                if (isDone && t.table_started != null && t.table_finished != null) {
+                    dur = fmtTableDuration((t.table_finished - t.table_started) * 1000);
+                } else if (isCurrent && t.table_started != null) {
+                    dur = fmtTableDuration((Date.now() / 1000 - t.table_started) * 1000);
+                }
+                html += '<div class="progress-table-row' + rowCls + '">' 
                     + '<span class="table-status' + statusCls + '"></span>'
                     + '<span class="table-name">' + name + '</span>'
                     + '<span class="table-rows">' + rows + '</span>'
+                    + '<span class="table-duration">' + dur + '</span>'
                     + '</div>';
             }
             tableList.innerHTML = html;
@@ -463,7 +539,7 @@
             const response = await fetch(panel.dataset.statusUrl, {headers: {'X-Requested-With': 'XMLHttpRequest'}});
             const data = await response.json();
             updateUI(data);
-            if (data.finished) window.location.reload();
+            if (data.finished) { clearInterval(timerInterval); window.location.reload(); }
             else window.setTimeout(poll, 800);
         } catch (_) {
             window.setTimeout(poll, 2500);

@@ -349,6 +349,7 @@ def migrate_status_view(request, pk):
         "current_table_rows": current_table_rows,
         "current_table_total": current_table_total,
         "table_progress": table_progress,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
     })
 
 

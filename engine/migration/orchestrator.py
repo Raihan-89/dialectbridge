@@ -238,7 +238,7 @@ class MigrationOrchestrator:
                                      table_progress=self._table_progress)
 
             for idx, table in enumerate(tables_to_copy, 1):
-                self._table_progress[table.name] = {"index": idx, "rows_copied": 0, "done": False}
+                self._table_progress[table.name] = {"index": idx, "rows_copied": 0, "done": False, "table_started": monotonic()}
                 try:
                     row_count = self.source.count_rows(table.name)
                     self._table_progress[table.name]["total_rows"] = row_count
@@ -258,6 +258,7 @@ class MigrationOrchestrator:
                 self._table_progress[table.name]["rows_copied"] = (
                     report.data_results[-1].rows_copied if report.data_results else 0
                 )
+                self._table_progress[table.name]["table_finished"] = monotonic()
 
                 self._progress_phase(35, (idx / max(total_to_copy, 1)) * 40,
                                      f"Copied {idx}/{total_to_copy} tables",
