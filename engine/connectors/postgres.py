@@ -4,6 +4,7 @@ PostgreSQL connector built on psycopg2.
 from __future__ import annotations
 
 from typing import Iterator
+import io
 from uuid import UUID
 
 import psycopg2
@@ -166,15 +167,23 @@ class PostgresConnector(DatabaseConnector):
         self._ensure_conn()
         tbl = self.quote_ident(table_name)
         col_list = ", ".join(f'"{c}"' for c in columns)
-        sql = f"COPY {tbl} ({col_list}) FROM STDIN WITH (FORMAT text)"
         total = 0
         try:
             with self._conn.cursor() as cur:
-                with cur.copy_expert(sql) as copy:
-                    for batch in rows:
-                        for row in batch:
-                            copy.write_row(row)
-                            total += 1
+                buf = io.StringIO()
+                for batch in rows:
+                    for row in batch:
+                        line = "\t".join(
+                            "\\N" if v is None else str(v).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+                            for v in row
+                        )
+                        buf.write(line + "\n")
+                        total += 1
+                buf.seek(0)
+                cur.copy_expert(
+                    f"COPY {tbl} ({col_list}) FROM STDIN",
+                    buf,
+                )
         except psycopg2.Error as exc:
             raise ConnectorError(f"PostgreSQL COPY failed: {exc}") from exc
         return total

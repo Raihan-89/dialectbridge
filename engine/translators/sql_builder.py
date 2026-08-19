@@ -388,10 +388,11 @@ def _append_collation(collation: str | None, target_type: str,
         return "", None
     key = collation.strip().lower()
     if target == "postgres":
-        mapped = MSSQL_TO_PG_COLLATIONS.get(key)
-        if not mapped:
-            return "", (f"Collation '{collation}' has no PostgreSQL equivalent — column created with the database collation")
-        return f' COLLATE "{mapped}"', None
+        # PostgreSQL collations are locale-based and may not exist on the
+        # target server.  Omit COLLATE and let the target database default
+        # apply; warn so the user can add it manually if needed.
+        return "", (f"Collation '{collation}' was omitted — target PostgreSQL "
+                    "database will use its default collation")
     mapped = PG_TO_MSSQL_COLLATIONS.get(key)
     if not mapped:
         return "", (f"Collation '{collation}' has no SQL Server equivalent — column created with the database collation")

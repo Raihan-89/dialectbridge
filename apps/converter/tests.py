@@ -1699,9 +1699,8 @@ END""",
             Column("Age", "INT", collation="SQL_Latin1_General_CP1_CI_AS"),
         ])]
         stmts, warnings = build_database_ddl(db, "postgres")
-        self.assertIn('COLLATE "en_US"', stmts[0])
-        self.assertEqual(stmts[0].count("COLLATE"), 1)  # only the char column
-        self.assertEqual(warnings, [])
+        self.assertNotIn("COLLATE", stmts[0])
+        self.assertTrue(any("was omitted" in w for w in warnings))
 
     def test_collation_reverse_emitted(self):
         db = self._base_postgres()
@@ -1719,7 +1718,7 @@ END""",
         ])]
         stmts, warnings = build_database_ddl(db, "postgres")
         self.assertNotIn("COLLATE", stmts[0])
-        self.assertTrue(any("has no PostgreSQL equivalent" in w for w in warnings))
+        self.assertTrue(any("was omitted" in w for w in warnings))
 
     def test_collation_placed_before_not_null(self):
         # COLLATE must immediately follow the data type in both dialects;
