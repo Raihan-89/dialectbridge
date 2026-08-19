@@ -134,7 +134,7 @@ def convert_type(data_type: str, source_dialect: str, target_dialect: str) -> tu
 
 def _split_type(data_type: str) -> tuple[str, str | None]:
     cleaned = re.sub(r"[\[\]]", "", data_type.strip())
-    match = re.match(r"^(\w+)(?:\(([^)]*)\))?$", cleaned)
+    match = re.match(r"^(\w+)\s*(?:\(([^)]*)\))?$", cleaned)
     if not match:
         return cleaned, None
     return match.group(1), match.group(2)

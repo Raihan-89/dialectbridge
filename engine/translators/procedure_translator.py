@@ -60,7 +60,7 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     # ---- header -----------------------------------------------------------
     header_match = re.search(
-        r"CREATE\s+(?:OR\s+ALTER\s+)?(PROCEDURE|PROC|FUNCTION)\s+"
+        r"CREATE\s+(?:OR\s+ALTER\s+)?(PROCEDURE|PROC|FUNCTION)\s*"
         r"(?:\[?[\w\d_]+\]?\.)?\[?([\w\d_]+)\]?"
         # Parenthesized parameter lists may themselves contain parentheses
         # (DECIMAL(18,2)); require the closing paren to be followed by a
@@ -1129,11 +1129,16 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
 
     # SELECT ... INTO #temp / INSERT INTO #temp
     if re.match(r"^SELECT\s+.*\s+INTO\s+(\[?#[\w\d_]+\]?)", line, re.IGNORECASE | re.DOTALL):
+        tmp = re.search(r"\bINTO\s+\[?#([\w\d_]+)\]?", line, re.IGNORECASE)
         line = re.sub(r"\bINTO\s+\[?#([\w\d_]+)\]?", r"INTO \1", line, flags=re.IGNORECASE)
+        if tmp and f"Temp table '{tmp.group(1).lower()}'" not in warnings:
+            warnings.append(f"Temp table '{tmp.group(1).lower()}' — ensure CREATE TEMP TABLE precedes it")
         return _expr(line) + ";"
     if re.match(r"^INSERT\s+INTO\s+\[?#[\w\d_]+\]?", line, re.IGNORECASE):
+        tmp = re.search(r"\[?#([\w\d_]+)\]?", line)
         line = re.sub(r"\[?#([\w\d_]+)\]?", r"\1", line)
-        warnings.append("Temp table referenced - ensure CREATE TEMP TABLE precedes it")
+        if tmp and f"Temp table '{tmp.group(1).lower()}'" not in warnings:
+            warnings.append(f"Temp table '{tmp.group(1).lower()}' — ensure CREATE TEMP TABLE precedes it")
         return _expr(line) + ";"
 
     # plain DML / control
