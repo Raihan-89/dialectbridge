@@ -304,10 +304,22 @@ def _build_column(col: Column, target: str, source: str,
         # generation expression; never emit computed columns as DEFAULT
         # (SQL Server rejects column references in DEFAULT).
         expr = _translate_expr(col.computed_definition or col.default, source, target)
-        if target == "postgres":
+        if target == "postgres" and _expr_is_immutable(expr):
             col_type = f" {target_type}" if target_type else ""
             parts = [f"{_qident(col.name, target)}{col_type}"]
             parts[0] += f" GENERATED ALWAYS AS ({expr}) STORED"
+        elif target == "postgres" and not downgrade_computed:
+            # PostgreSQL generated columns require IMMUTABLE expressions.
+            # Volatile functions (GETDATE, NEWID, ...) can't be used, so the
+            # column is downgraded to a plain, nullable column.
+            if warn is None:
+                warn = f"Computed column '{col.name}' uses a non-immutable expression — "
+            else:
+                warn += " "
+            warn += "converted to a plain nullable column instead of a generated column"
+            parts = [f"{_qident(col.name, target)} {target_type}"]
+            parts[0] += " DEFAULT NULL"
+            col.is_computed = False
         else:
             parts = [f"{_qident(col.name, target)}"]
             parts[0] += f" AS ({expr}) PERSISTED"
@@ -973,6 +985,28 @@ def _select_end(after: str) -> int:
             return i
         i += 1
     return len(after)
+
+
+# Functions that are not IMMUTABLE in PostgreSQL and therefore cannot appear
+# in a generated column's generation expression.
+_NON_IMMUTABLE_FUNC_RE = re.compile(
+    r"\b(?:GETDATE|GETUTCDATE|SYSDATETIME|SYSUTCDATETIME|SYSDATETIMEOFFSET|"
+    r"CURRENT_TIMESTAMP|NOW|CURRENT_TIME|CURRENT_DATE|LOCALTIME|LOCALTIMESTAMP|"
+    r"NEWID|NEWSEQUENTIALID|RAND|RANDOM|CRYPT_GEN_RANDOM|GEN_RANDOM_UUID|"
+    r"IDENT_CURRENT|TODATETIMEOFFSET|DATENAME|GUID)(?:\s*\(\))?\b",
+    re.IGNORECASE,
+)
+
+
+def _expr_is_immutable(expr: str) -> bool:
+    """Heuristic: True if an expression contains no known non-immutable calls.
+
+    PostgreSQL generated columns require IMMUTABLE expressions; T-SQL computed
+    columns routinely use GETDATE()/NEWID(), which would abort the whole table
+    DDL with ``generation expression is not immutable``. Column references,
+    literals, arithmetic, CASE, and deterministic functions are unaffected.
+    """
+    return not _NON_IMMUTABLE_FUNC_RE.search(expr)
 
 
 def _translate_top(text: str) -> str:
