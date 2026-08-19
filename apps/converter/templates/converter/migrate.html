@@ -16,7 +16,7 @@
 <div class="card">
     <div class="section-head"><h2 class="panel-title">Pre-migration assessment</h2><span class="badge {% if assessment.readiness == 'ready' %}badge-ok{% elif assessment.readiness == 'blocked' %}badge-fail{% else %}badge-warn{% endif %}">{{ assessment.readiness|title }}</span></div>
     <div class="meta-list">
-        <div><span class="label">Tables</span>{{ assessment.counts.tables }}</div><div><span class="label">Views</span>{{ assessment.counts.views }}</div><div><span class="label">Routines</span>{{ assessment.counts.functions|add:assessment.counts.procedures }}</div><div><span class="label">Generated statements</span>{{ assessment.statement_count }}</div>
+        <div><span class="label">Tables</span>{{ assessment.counts.tables }}</div><div><span class="label">Views</span>{{ assessment.counts.views }}</div><div><span class="label">Sequences</span>{{ assessment.counts.sequences }}</div><div><span class="label">Routines</span>{{ assessment.counts.functions|add:assessment.counts.procedures }}</div><div><span class="label">Generated statements</span>{{ assessment.statement_count }}</div>
     </div>
     {% if assessment.blockers %}<h3>Blocking compatibility findings</h3>{% for item in assessment.blockers %}<div class="alert alert-error">{{ item }}</div>{% endfor %}{% endif %}
     {% if assessment.warnings %}<details><summary style="cursor:pointer;font-weight:700">All warnings ({{ assessment.warnings|length }})</summary><div style="margin-top:12px">{% for item in assessment.warnings %}<div class="alert alert-warning">{{ item }}</div>{% endfor %}</div></details>{% endif %}
