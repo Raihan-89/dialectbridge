@@ -212,7 +212,16 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
     table_names = [t.name for t in database.tables]
     statements = [_qualify_body_refs(s, database.tables, target_dialect) for s in statements]
 
-    return statements, warnings
+    # Deduplicate warnings globally — the same temp-table or EVENTDATA()
+    # warning can be emitted by many routines; keep each unique message once.
+    seen: set[str] = set()
+    unique_warnings: list[str] = []
+    for w in warnings:
+        if w not in seen:
+            seen.add(w)
+            unique_warnings.append(w)
+
+    return statements, unique_warnings
 
 
 def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,

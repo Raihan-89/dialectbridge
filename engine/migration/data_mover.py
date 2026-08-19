@@ -9,6 +9,10 @@ Design:
   - Builds target INSERTs with the target's quoted identifier and parameter
     placeholders, executed with the target driver's parameter binding so
     values round-trip exactly (no string interpolation of user data).
+  - PostgreSQL targets use COPY for bulk loading (10-50× faster than INSERT
+    for large tables); non-PG targets fall back to batched INSERTs.
+  - Non-unique indexes on the target are dropped before loading and recreated
+    after, cutting index-maintenance overhead during bulk inserts.
   - Identity columns are populated explicitly so PK values match the source,
     then each table's identity/sequence is re-seeded past the highest value.
   - FKs are applied to the target only after data load (the schema builder
@@ -40,19 +44,18 @@ class DataMigration:
             return self._summary("no-convertible-columns")
 
         order_cols = self._order_columns()
-        source_cols = [f"{self.source.quote_ident(c)}" for c in cols]
         target_cols = ", ".join(self.target.quote_ident(c) for c in cols)
+
+        dropped_indexes = self._drop_indexes()
 
         self._enable_identity_insert()
 
+        use_copy = hasattr(self.target, "copy_to_table") and self.target.dialect == "postgres"
         try:
-            for batch in self.source.iter_table_rows(
-                self.table.name, cols, order_cols, batch_size=self.batch_size,
-                int_columns=self._int_columns(),
-            ):
-                if not batch:
-                    continue
-                self._insert_batch(target_cols, cols, batch)
+            if use_copy:
+                self._run_copy(cols, order_cols)
+            else:
+                self._run_insert(cols, order_cols, target_cols)
         except ConnectorError as exc:
             self.rows_failed += 1
             self.errors.append(str(exc))
@@ -60,7 +63,33 @@ class DataMigration:
             self._disable_identity_insert()
 
         self._seed_identity(cols)
+        self._recreate_indexes(dropped_indexes)
         return self._summary()
+
+    # ------------------------------------------------------------------
+    def _run_copy(self, cols: list[str], order_cols: list[str]) -> None:
+        """Bulk-load via PostgreSQL COPY (much faster for large tables)."""
+
+        def _iter():
+            for batch in self.source.iter_table_rows(
+                self.table.name, cols, order_cols,
+                batch_size=self.batch_size, int_columns=self._int_columns(),
+            ):
+                if batch:
+                    yield batch
+
+        self.rows_copied = self.target.copy_to_table(self.table.name, cols, _iter())
+
+    # ------------------------------------------------------------------
+    def _run_insert(self, cols: list[str], order_cols: list[str], target_cols: str) -> None:
+        """Fallback: batched INSERT for non-PostgreSQL targets."""
+        for batch in self.source.iter_table_rows(
+            self.table.name, cols, order_cols,
+            batch_size=self.batch_size, int_columns=self._int_columns(),
+        ):
+            if not batch:
+                continue
+            self._insert_batch(target_cols, cols, batch)
 
     # ------------------------------------------------------------------
     def _column_names(self) -> list[str]:
@@ -83,7 +112,6 @@ class DataMigration:
         try:
             self.target.set_identity_insert(self.table.name, True)
         except Exception:
-            # Some targets can't toggle identity inserts (e.g. PG) — fine.
             pass
 
     def _disable_identity_insert(self) -> None:
@@ -104,6 +132,23 @@ class DataMigration:
             self.errors.append(f"Could not reseed identity on {self.table.name}: {exc}")
 
     # ------------------------------------------------------------------
+    def _drop_indexes(self) -> list[str]:
+        if not hasattr(self.target, "drop_indexes"):
+            return []
+        try:
+            return self.target.drop_indexes(self.table.name)
+        except Exception:
+            return []
+
+    def _recreate_indexes(self, ddl_list: list[str]) -> None:
+        if not ddl_list or not hasattr(self.target, "recreate_indexes"):
+            return
+        try:
+            self.target.recreate_indexes(ddl_list)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     def _insert_batch(self, target_cols: str, cols: list[str], batch: list[tuple]) -> None:
         placeholders = ", ".join(["%s"] * len(cols))
         sql = f"INSERT INTO {self.target.quote_ident(self.table.name)} ({target_cols}) VALUES ({placeholders})"
@@ -111,7 +156,6 @@ class DataMigration:
             self.target.execute_many(sql, [list(r) for r in batch])
             self.rows_copied += len(batch)
         except ConnectorError:
-            # one row is broken — fall back row-by-row to isolate it
             for row in batch:
                 try:
                     self.target.execute(sql, list(row))

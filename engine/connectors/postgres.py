@@ -160,3 +160,47 @@ class PostgresConnector(DatabaseConnector):
         if "." in name:
             return ".".join(f'"{part}"' for part in name.split("."))
         return f'"{name}"'
+
+    def copy_to_table(self, table_name: str, columns: list[str], rows: Iterator) -> int:
+        """Bulk-load rows via COPY ... FROM STDIN.  Returns rows copied."""
+        self._ensure_conn()
+        tbl = self.quote_ident(table_name)
+        col_list = ", ".join(f'"{c}"' for c in columns)
+        sql = f"COPY {tbl} ({col_list}) FROM STDIN WITH (FORMAT text)"
+        total = 0
+        try:
+            with self._conn.cursor() as cur:
+                with cur.copy_expert(sql) as copy:
+                    for batch in rows:
+                        for row in batch:
+                            copy.write_row(row)
+                            total += 1
+        except psycopg2.Error as exc:
+            raise ConnectorError(f"PostgreSQL COPY failed: {exc}") from exc
+        return total
+
+    def drop_indexes(self, table_name: str) -> list[str]:
+        """Drop non-unique, non-PK indexes on *table_name*.  Returns DDL to recreate them."""
+        self._ensure_conn()
+        tbl = table_name.split(".")[-1]
+        rows = self.fetch(
+            "SELECT indexdef, schemaname, indexname "
+            "FROM pg_indexes "
+            "WHERE tablename = %s "
+            "AND indexdef NOT LIKE '%%UNIQUE%%' "
+            "AND indexdef NOT LIKE '%%PRIMARY%%'",
+            (tbl,),
+        )
+        recreate: list[str] = []
+        for indexdef, _schema, indexname in rows:
+            self.execute(f"DROP INDEX IF EXISTS {self.quote_ident(indexname)}")
+            recreate.append(indexdef.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS"))
+        return recreate
+
+    def recreate_indexes(self, ddl_list: list[str]) -> None:
+        """Recreate previously dropped indexes."""
+        for ddl in ddl_list:
+            try:
+                self.execute(ddl)
+            except Exception:
+                pass
