@@ -5,12 +5,15 @@ from django.test import SimpleTestCase
 
 from engine.schema import Column, Constraint, Database, Table, View
 from .verification_service import (
-    _objects, _pair, compare_live, compare_live_table_data, list_live_data_tables,
-    verify_live_table_checksum,
+    _SCHEMA_CACHE, _objects, _pair, compare_live, compare_live_table_data,
+    list_live_data_tables, verify_live_table_checksum,
 )
 
 
 class VerificationServiceTests(SimpleTestCase):
+    def setUp(self):
+        _SCHEMA_CACHE.clear()
+
     def test_pairs_names_case_insensitively_and_ignores_schema_mapping(self):
         source = {"orders": {"name": "dbo.Orders", "detail": "4 columns"}}
         target = {"orders": {"name": "public.orders", "detail": "4 columns"}}
@@ -32,7 +35,9 @@ class VerificationServiceTests(SimpleTestCase):
         target_connector = SimpleNamespace(extract_schema=lambda: target_db, close=lambda: None)
         connector_for.side_effect = [source_connector, target_connector]
 
-        result = compare_live(object(), object(), "overview")
+        source_conn = SimpleNamespace(pk=1, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        target_conn = SimpleNamespace(pk=2, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        result = compare_live(source_conn, target_conn, "overview")
 
         self.assertTrue(result["all_match"])
         self.assertEqual(result["counts"]["match"], 8)
@@ -46,7 +51,9 @@ class VerificationServiceTests(SimpleTestCase):
             SimpleNamespace(extract_schema=lambda: target_db, close=lambda: None),
         ]
 
-        result = list_live_data_tables(object(), object())
+        source_conn = SimpleNamespace(pk=1, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        target_conn = SimpleNamespace(pk=2, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        result = list_live_data_tables(source_conn, target_conn)
 
         self.assertEqual([table["key"] for table in result["tables"]], ["legacy", "products"])
         self.assertEqual(result["tables"][0]["status"], "source_only")
@@ -66,12 +73,18 @@ class VerificationServiceTests(SimpleTestCase):
                 quote_ident=lambda name: ".".join(f'[{part}]' for part in name.split(".")) if dialect == "tsql" else ".".join(f'"{part}"' for part in name.split(".")),
             )
 
+        schema_extractor_source = SimpleNamespace(extract_schema=lambda: source_db, close=lambda: None)
+        schema_extractor_target = SimpleNamespace(extract_schema=lambda: target_db, close=lambda: None)
         connector_for.side_effect = [
+            schema_extractor_source,
+            schema_extractor_target,
             fake(source_db, "postgres", [(1, "Pen"), (2, "Book")]),
             fake(target_db, "tsql", [(1, "Pen"), (2, "Notebook")]),
         ]
 
-        result = compare_live_table_data(object(), object(), "products")
+        source_conn = SimpleNamespace(pk=1, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        target_conn = SimpleNamespace(pk=2, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        result = compare_live_table_data(source_conn, target_conn, "products")
 
         self.assertTrue(result["has_shared_pk"])
         self.assertEqual(result["counts"]["match"], 1)
@@ -89,10 +102,22 @@ class VerificationServiceTests(SimpleTestCase):
                 iter_table_rows=lambda *args, **kwargs: iter([rows]),
             )
 
-        connector_for.side_effect = [fake([(1, "Pen"), (2, "Book")]), fake([(2, "Book"), (1, "Pen")])]
-        matching = verify_live_table_checksum(object(), object(), "products")
+        schema_ext = SimpleNamespace(extract_schema=lambda: database, close=lambda: None)
+        connector_for.side_effect = [
+            schema_ext, schema_ext,
+            fake([(1, "Pen"), (2, "Book")]), fake([(2, "Book"), (1, "Pen")]),
+        ]
+        src = SimpleNamespace(pk=1, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        tgt = SimpleNamespace(pk=2, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        matching = verify_live_table_checksum(src, tgt, "products")
         self.assertTrue(matching["exact_match"])
 
-        connector_for.side_effect = [fake([(1, "Pen")]), fake([(1, "Pencil")])]
-        changed = verify_live_table_checksum(object(), object(), "products")
+        schema_ext2 = SimpleNamespace(extract_schema=lambda: database, close=lambda: None)
+        connector_for.side_effect = [
+            schema_ext2, schema_ext2,
+            fake([(1, "Pen")]), fake([(1, "Pencil")]),
+        ]
+        src2 = SimpleNamespace(pk=3, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        tgt2 = SimpleNamespace(pk=4, updated_at=SimpleNamespace(timestamp=lambda: 0))
+        changed = verify_live_table_checksum(src2, tgt2, "products")
         self.assertFalse(changed["exact_match"])
