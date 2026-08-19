@@ -481,6 +481,14 @@ _STMT_START_RE = re.compile(
 )
 _SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
 _SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT)\b", re.IGNORECASE)
+# Keywords that continue a previous statement (never start a new one)
+_CONTINUATION_KEYWORDS = re.compile(
+    r"^(?:FROM|WHERE|AND|OR|ON|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|JOIN|GROUP|ORDER|HAVING|"
+    r"UNION|INTERSECT|EXCEPT|FETCH|OFFSET|LIMIT|VALUES|SET|INTO|OVER|PARTITION|CASE|WHEN|"
+    r"THEN|ELSE|END|BETWEEN|LIKE|IN|EXISTS|NOT|AS|ASC|DESC|BETWEEN|LIKE|TOP|DISTINCT|ALL|"
+    r"OPTION|RECOMPILE|FOR|OPEN|CLOSE|DEALLOCATE|NEXT|PREVIOUS|FIRST|LAST|ABSOLUTE|RELATIVE)\b",
+    re.IGNORECASE,
+)
 
 
 def _split_top_level_else(text: str) -> tuple[str, str | None]:
@@ -733,11 +741,11 @@ def _join_balanced_lines(body: str) -> list[str]:
     return joined
 
 
-def _transform_tsql_statement(line: str, statement_fn, declared, t_warns, returns_set) -> str | None:
+def _transform_tsql_statement(line: str, statement_fn, declared, t_warns, returns_set, is_procedure=False) -> str | None:
     """Rewrite a single completed statement, honoring an optional override."""
     if statement_fn is not None:
         return statement_fn(line, declared, t_warns, returns_set)
-    return _transform_statement(line, declared, t_warns, returns_set)
+    return _transform_statement(line, declared, t_warns, returns_set, is_procedure)
 
 
 def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=None) -> tuple[list[str], list[str], dict[str, str]]:
@@ -796,7 +804,7 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
         nonlocal buf
         if not buf:
             return
-        stmt = _transform_tsql_statement(" ".join(buf).rstrip(";").strip(), statement_fn, declared, t_warns, returns_set)
+        stmt = _transform_tsql_statement(" ".join(buf).rstrip(";").strip(), statement_fn, declared, t_warns, returns_set, kind in ("PROCEDURE", "PROC"))
         buf = []
         if stmt is not None:
             out.append(stmt)
@@ -813,7 +821,7 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             piece = piece.strip()
             if not piece:
                 continue
-            stmt = _transform_tsql_statement(piece, statement_fn, declared, t_warns, returns_set)
+            stmt = _transform_tsql_statement(piece, statement_fn, declared, t_warns, returns_set, kind in ("PROCEDURE", "PROC"))
             if stmt:
                 out.append(stmt)
         out.append("END;")
@@ -910,7 +918,10 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             continue
         if depth == 0 and buf:
             first_word = upper.split(maxsplit=1)[0] if upper.split() else ""
-            if _STMT_START_RE.match(first_word):
+            # Don't flush if the current line is a continuation keyword (FROM, WHERE, UNION, etc.)
+            if _CONTINUATION_KEYWORDS.match(first_word):
+                pass  # continue accumulating the current statement
+            elif _STMT_START_RE.match(first_word):
                 flush()
             elif first_word == "SET" and not _SET_START_EXCEPT.match(buf[0].lstrip()):
                 flush()
@@ -1035,13 +1046,36 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
     return out, t_warns, declared
 
 
-def _transform_statement(line: str, declared: dict[str, str], warnings: list[str], returns_set: bool) -> str | None:
+def _transform_statement(line: str, declared: dict[str, str], warnings: list[str], returns_set: bool, is_procedure: bool = False) -> str | None:
     # Normalize a leading SELECT TOP n to a trailing LIMIT n first so the
     # assignment-SELECT regexes below still match "SELECT TOP 1 @x = ...".
     line = _translate_top(line)
     upper = line.upper()
 
-    if upper in ("SET NOCOUNT ON", "SET NOCOUNT OFF"):
+    # T-SQL session settings that have no PostgreSQL equivalent — silently stripped.
+    _SET_SKIP = {
+        "SET NOCOUNT ON", "SET NOCOUNT OFF",
+        "SET ANSI_NULLS ON", "SET ANSI_NULLS OFF",
+        "SET ANSI_PADDING ON", "SET ANSI_PADDING OFF",
+        "SET ANSI_WARNINGS ON", "SET ANSI_WARNINGS OFF",
+        "SET ARITHABORT ON", "SET ARITHABORT OFF",
+        "SET QUOTED_IDENTIFIER ON", "SET QUOTED_IDENTIFIER OFF",
+        "SET XACT_ABORT ON", "SET XACT_ABORT OFF",
+        "SET NUMERIC_ROUNDABORT ON", "SET NUMERIC_ROUNDABORT OFF",
+        "SET CONCAT_NULL_YIELDS_NULL ON", "SET CONCAT_NULL_YIELDS_NULL OFF",
+        "SET CURSOR_CLOSE_ON_COMMIT ON", "SET CURSOR_CLOSE_ON_COMMIT OFF",
+        "SET IMPLICIT_TRANSACTIONS ON", "SET IMPLICIT_TRANSACTIONS OFF",
+        "SET DATEFORMAT MDY", "SET DATEFORMAT YMD", "SET DATEFORMAT DMY",
+        "SET DATEFIRST 1", "SET DATEFIRST 7",
+        "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    }
+    if upper in _SET_SKIP:
+        return None
+    # Generic SET <option> ON/OFF that wasn't caught above
+    if re.match(r"^SET\s+\w+\s+(ON|OFF)\s*$", line, re.IGNORECASE):
         return None
 
     # BEGIN/COMMIT/ROLLBACK TRANSACTION -> plain PL/pgSQL transaction control
@@ -1063,6 +1097,26 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
         else:
             declared[name] = target_type
         return None  # declaration collected into the header DECLARE block
+
+    # DECLARE name AS type / DECLARE name type (without @ prefix)
+    # T-SQL allows variable declarations without the @ prefix and with optional AS keyword.
+    m = re.match(rf"^DECLARE\s+([\w]+)\s+(?:AS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$", line, re.IGNORECASE)
+    if m:
+        name, dtype, init = m.group(1), m.group(2), m.group(3)
+        target_type, warn = convert_type(dtype, "tsql", "postgres")
+        if warn:
+            warnings.append(f"DECLARE {name}: {warn}")
+        target_type = target_type or "TEXT"
+        if init is not None:
+            declared[name] = f"{target_type} := {_expr(init.strip())}"
+        else:
+            declared[name] = target_type
+        return None  # declaration collected into the header DECLARE block
+
+    # DECLARE @x TABLE (...) — table variable declaration (skip, must be converted to temp table)
+    if re.match(r"^DECLARE\s+@[\w]+\s+TABLE\s*\(", line, re.IGNORECASE):
+        warnings.append("Table variable declaration — ensure a CREATE TEMP TABLE precedes it")
+        return None
 
     # SET @x = expr
     m = re.match(r"^SET\s+@([\w]+)\s*=\s*(.+)$", line, re.IGNORECASE)
@@ -1111,10 +1165,14 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
     if upper.startswith("THROW"):
         return "RAISE EXCEPTION 'error';"
 
-    # RETURN [expr]
+    # RETURN [expr] — in procedures, RETURN with a value is invalid in PG.
+    # In functions with OUT parameters, RETURN with a value is also invalid.
     m = re.match(r"^RETURN\s+(.+)$", line, re.IGNORECASE)
     if m:
-        return f"RETURN {_expr(m.group(1).strip())};"
+        expr_val = _expr(m.group(1).strip())
+        if is_procedure:
+            return f"RETURN;"
+        return f"RETURN {expr_val};"
     if upper == "RETURN":
         return "RETURN;"
 
@@ -1141,8 +1199,30 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
             warnings.append(f"Temp table '{tmp.group(1).lower()}' — ensure CREATE TEMP TABLE precedes it")
         return _expr(line) + ";"
 
-    # plain DML / control
+    # plain DML / control — translate T-SQL specific syntax before emitting.
+    line = _translate_tsql_body_syntax(line)
     return _expr(line) + ";"
+
+
+def _translate_tsql_body_syntax(line: str) -> str:
+    """Apply T-SQL-specific body transformations that don't go through _expr."""
+    # CROSS APPLY -> CROSS JOIN LATERAL (PG syntax)
+    line = re.sub(r"\bCROSS\s+APPLY\b", "CROSS JOIN LATERAL", line, flags=re.IGNORECASE)
+    # OUTER APPLY -> LEFT JOIN LATERAL ... ON TRUE
+    line = re.sub(r"\bOUTER\s+APPLY\b", "LEFT JOIN LATERAL", line, flags=re.IGNORECASE)
+    # Strip WITH (NOLOCK), WITH (UPDLOCK), WITH (TABLOCK), etc.
+    line = re.sub(r"\bWITH\s*\(\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|NOLOCK|INDEX\s*\([^)]*\))(?:\s*,\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|INDEX\s*\([^)]*\)))*\s*\)", "", line, flags=re.IGNORECASE)
+    # CREATE TABLE #temp; or CREATE TABLE temp; (no columns) -> CREATE TEMP TABLE temp ();
+    line = re.sub(r"(?i)\bCREATE\s+TABLE\s+(?:#([\w]+)|([\w]+))\s*;", lambda m: f"CREATE TEMP TABLE {m.group(1) or m.group(2)} ();", line)
+    # OPEN cursor FOR select -> cursor_name FOR select  (PG refcursor syntax)
+    m = re.match(r"^OPEN\s+([\w]+)\s+FOR\s+(.+)$", line, re.IGNORECASE)
+    if m:
+        cursor_name = m.group(1)
+        query = m.group(2).rstrip(";")
+        line = f"{cursor_name} FOR {query}"
+    # SET @x = value (without explicit SET keyword appearing as statement start)
+    # This handles cases where SET is inside a compound statement
+    return line
 
 
 def _delay_to_seconds(delay: str) -> float:
@@ -1218,7 +1298,7 @@ def _expr(text: str) -> str:
     """Translate expressions inside a statement."""
     text = translate_functions(text, "tsql", "postgres")
     # MSSQL bracket identifiers -> PG quoted identifiers
-    text = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', text)
+    text = re.sub(r"\[([^\[\]]+)\]", r'"\1"', text)
     # MSSQL N-prefixed string literals have no PG equivalent
     text = re.sub(r"\bN'", "'", text, flags=re.IGNORECASE)
     # variable references @x -> x (not inside string literals)

@@ -174,7 +174,7 @@ class PostgresConnector(DatabaseConnector):
                 for batch in rows:
                     for row in batch:
                         line = "\t".join(
-                            "\\N" if v is None else str(v).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+                            self._copy_escape(v)
                             for v in row
                         )
                         buf.write(line + "\n")
@@ -187,6 +187,16 @@ class PostgresConnector(DatabaseConnector):
         except psycopg2.Error as exc:
             raise ConnectorError(f"PostgreSQL COPY failed: {exc}") from exc
         return total
+
+    @staticmethod
+    def _copy_escape(v):
+        """Escape a value for PostgreSQL COPY TEXT format."""
+        if v is None:
+            return "\\N"
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return "\\x" + bytes(v).hex()
+        s = str(v)
+        return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
 
     def drop_indexes(self, table_name: str) -> list[str]:
         """Drop non-unique, non-PK indexes on *table_name*.  Returns DDL to recreate them."""

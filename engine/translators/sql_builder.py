@@ -99,6 +99,9 @@ def convert_type(data_type: str, source_dialect: str, target_dialect: str) -> tu
     if source_dialect == "tsql" and target_dialect == "postgres":
         base, params = _split_type(data_type)
         base_upper = base.upper()
+        # T-SQL uses "Date" (capitalized) but PostgreSQL uses lowercase "date"
+        if base_upper == "DATE":
+            return "DATE", None
         is_max = params is not None and params.strip().upper() == "MAX"
         mapped = _MSSQL_TYPES.get(base_upper)
         if mapped is None:
@@ -678,8 +681,10 @@ def build_sequence_ddl(seq: Sequence, target: str, source: str) -> tuple[list[st
     statements = [stmt]
     if seq.current_value is not None and seq.current_value != seq.start_value:
         if target == "postgres":
+            # PostgreSQL bigint range is 1..9223372036854775807; clamp if needed
+            cur_val = max(1, min(seq.current_value, 9223372036854775807))
             statements.append(
-                f"SELECT setval({_qstr(seq.name)}, {seq.current_value}, true)"
+                f"SELECT setval({_qstr(seq.name)}, {cur_val}, true)"
             )
         else:
             statements.append(
@@ -839,7 +844,7 @@ def _translate_default(expr: str | None, target: str) -> str | None:
         # few regexes so nothing invalid survives into the emitted DDL.
         from engine.translators.functions import translate_functions
         expr = translate_functions(expr, "tsql", "postgres")
-        expr = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', expr)
+        expr = re.sub(r"\[([^\[\]]+)\]", r'"\1"', expr)
         expr = re.sub(r'"\[([\w\s\d_]+)\]"', r'"\1"', expr)
         expr = re.sub(r"\bN'", "'", expr, flags=re.IGNORECASE)
         expr = _translate_top(expr)
@@ -889,7 +894,7 @@ def _translate_expr(expr: str, source: str, target: str) -> str:
     out = translate_functions(expr, source, target)
     if target == "postgres":
         # MSSQL bracket identifiers -> PG quoted identifiers
-        out = re.sub(r"\[([\w\s\d_]+)\]", r'"\1"', out)
+        out = re.sub(r"\[([^\[\]]+)\]", r'"\1"', out)
         # Heal identifiers whose content was already bracketed (e.g. from
         # catalog text quoted once more) so no '[' survives into PG DDL.
         out = re.sub(r'"\[([\w\s\d_]+)\]"', r'"\1"', out)
@@ -1130,7 +1135,14 @@ _SQL_KEYWORDS = frozenset(
     "else end inner outer left right full cross union all set table create alter drop index view "
     "procedure function trigger if while begin declare print raiserror throw waitfor commit rollback "
     "exec execute use default primary foreign references constraint unique check identity asc desc "
-    "with collate convert cast return returns returning returning limit offset".split()
+    "with collate convert cast return returns returning returning limit offset "
+    "role user domain type sequence grant usage privilege "
+    # SQL data type names that must never be quoted as identifiers
+    "date time datetime datetime2 smalldatetime datetimeoffset timestamp text ntext "
+    "int integer bigint smallint tinyint bit money smallmoney float real "
+    "decimal numeric char nchar varchar nvarchar binary varbinary image "
+    "uniqueidentifier xml sysname cursor sql_variant geography hierarchyid rowversion "
+    "serial bigserial smallserial boolean bytea uuid".split()
 )
 
 
