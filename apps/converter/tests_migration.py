@@ -14,6 +14,7 @@ from engine.connectors.mssql import MSSQLConnector
 from engine.connectors.postgres import PostgresConnector
 from engine.migration.orchestrator import MigrationOrchestrator
 from engine.schema import Column, Constraint, Database, Table
+from engine.translators.sql_builder import build_table_ddl
 
 
 class MSSQLConnectorTests(SimpleTestCase):
@@ -59,6 +60,53 @@ class MSSQLConnectorTests(SimpleTestCase):
 
 
 class PostgresConnectorPaginationTests(SimpleTestCase):
+    def test_copy_streams_binary_as_bytea_without_raw_non_utf8_bytes(self):
+        copied_chunks = []
+        cursor = Mock()
+        cursor.__enter__ = Mock(return_value=cursor)
+        cursor.__exit__ = Mock(return_value=False)
+
+        def consume_copy(_sql, stream):
+            while chunk := stream.read(7):
+                copied_chunks.append(chunk)
+
+        cursor.copy_expert.side_effect = consume_copy
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        connector = PostgresConnector("host", 5432, "db", "user", "password")
+        connector._conn = connection
+
+        batches_consumed = []
+
+        def rows():
+            for batch in [[(1, b"\xff\xd8")], [(2, memoryview(b"\x00\x80"))]]:
+                batches_consumed.append(batch)
+                yield batch
+
+        copied = connector.copy_to_table("dbo.Attachments", ["id", "payload"], rows())
+        payload = "".join(copied_chunks)
+
+        self.assertEqual(copied, 2)
+        self.assertEqual(len(batches_consumed), 2)
+        self.assertIn("1\t\\\\xffd8\n", payload)
+        self.assertIn("2\t\\\\x0080\n", payload)
+        self.assertNotIn("\xff", payload)
+
+    def test_computed_column_downgrade_keeps_materialized_source_value_copyable(self):
+        computed = Column(
+            "DisplayName", "NVARCHAR(200)", is_computed=True,
+            computed_definition="CONCAT([FirstName], [LastName])",
+        )
+        table = Table(name="dbo.People", columns=[Column("Id", "INT"), computed])
+
+        statements, _warnings = build_table_ddl(
+            table, "postgres", "tsql", downgrade_computed=True,
+        )
+
+        self.assertIn('"DisplayName" VARCHAR(200)', statements[0])
+        self.assertNotIn("GENERATED ALWAYS", statements[0])
+        self.assertFalse(computed.is_computed)
+
     def test_composite_key_uses_tuple_pagination_and_real_column_positions(self):
         connector = PostgresConnector("host", 5432, "db", "user", "password")
         connector.fetch = Mock(side_effect=[[("first", 1, 2), ("second", 1, 3)], [("third", 2, 1)]])

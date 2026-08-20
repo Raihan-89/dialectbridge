@@ -133,7 +133,14 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     if kind == "FUNCTION":
         if returns.lower().strip() == "table" or "table" in returns.lower():
-            sig_returns = "TABLE(...)"
+            result_columns = _infer_result_columns(transformed, tables)
+            if not result_columns:
+                return None, warnings + [
+                    "Table-valued function result columns could not be inferred safely — manual conversion required"
+                ]
+            sig_returns = "TABLE(" + ", ".join(
+                f'"{column}" {data_type}' for column, data_type in result_columns
+            ) + ")"
         else:
             # Scalar return types are still T-SQL types — map to PostgreSQL
             # (nvarchar -> TEXT, decimal(p,s) -> NUMERIC(p,s), ...).
@@ -160,10 +167,6 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
             param_list.append(f"OUT {pname} {tgt_type}")
         else:
             param_list.append(f"{pname} {tgt_type}")
-    if kind == "FUNCTION" and "TABLE(...)" in sig_returns:
-        # parse the @table variable form later; keep a placeholder
-        sig_returns = "TABLE(...)"
-
     if kind in ("PROCEDURE", "PROC"):
         transformed, cursor_params = _procedure_result_cursors(transformed)
         param_list.extend(cursor_params)
@@ -174,11 +177,6 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     else:
         header = f"CREATE OR REPLACE PROCEDURE {name}({signature}) AS $$"
     footer = "$$ LANGUAGE plpgsql;"
-
-    # table-returning functions need a return statement
-    if kind == "FUNCTION" and "TABLE(" in sig_returns:
-        transformed.append("RETURN QUERY SELECT ...;")
-        warnings.append("Table-valued function body requires manual review of the RETURN clause")
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
     return converted, warnings
@@ -1294,7 +1292,7 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
 
     # plain DML / control — translate T-SQL specific syntax before emitting.
     line = _translate_tsql_body_syntax(line)
-    return _expr(line) + ";"
+    return _expr(line).rstrip(";") + ";"
 
 
 def _translate_tsql_body_syntax(line: str) -> str:

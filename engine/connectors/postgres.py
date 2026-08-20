@@ -22,6 +22,46 @@ def _adapt_uuid(uuid_obj: UUID) -> psycopg2.extensions.AsIs:
 psycopg2.extensions.register_adapter(UUID, _adapt_uuid)
 
 
+class _CopyTextStream(io.TextIOBase):
+    """Expose row batches as a bounded text stream for psycopg2 COPY.
+
+    ``copy_expert`` pulls small chunks through ``read()``.  Keeping only the
+    unread tail here avoids assembling a whole (potentially multi-hundred-GB)
+    table in a ``StringIO`` before PostgreSQL starts receiving it.
+    """
+
+    def __init__(self, rows: Iterator, escape):
+        self._rows = (row for batch in rows for row in batch)
+        self._escape = escape
+        self._pending = ""
+        self.rows_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> str:
+        if size == 0:
+            return ""
+        if size < 0:
+            chunks = [self._pending]
+            self._pending = ""
+            for row in self._rows:
+                chunks.append(self._line(row))
+            return "".join(chunks)
+
+        while len(self._pending) < size:
+            try:
+                self._pending += self._line(next(self._rows))
+            except StopIteration:
+                break
+        chunk, self._pending = self._pending[:size], self._pending[size:]
+        return chunk
+
+    def _line(self, row) -> str:
+        self.rows_read += 1
+        return "\t".join(self._escape(value) for value in row) + "\n"
+
+
 class PostgresConnector(DatabaseConnector):
     dialect = "postgres"
 
@@ -167,26 +207,16 @@ class PostgresConnector(DatabaseConnector):
         self._ensure_conn()
         tbl = self.quote_ident(table_name)
         col_list = ", ".join(f'"{c}"' for c in columns)
-        total = 0
+        stream = _CopyTextStream(rows, self._copy_escape)
         try:
             with self._conn.cursor() as cur:
-                buf = io.StringIO()
-                for batch in rows:
-                    for row in batch:
-                        line = "\t".join(
-                            self._copy_escape(v)
-                            for v in row
-                        )
-                        buf.write(line + "\n")
-                        total += 1
-                buf.seek(0)
                 cur.copy_expert(
                     f"COPY {tbl} ({col_list}) FROM STDIN",
-                    buf,
+                    stream,
                 )
         except psycopg2.Error as exc:
             raise ConnectorError(f"PostgreSQL COPY failed: {exc}") from exc
-        return total
+        return stream.rows_read
 
     @staticmethod
     def _copy_escape(v):
@@ -194,7 +224,11 @@ class PostgresConnector(DatabaseConnector):
         if v is None:
             return "\\N"
         if isinstance(v, (bytes, bytearray, memoryview)):
-            return "\\x" + bytes(v).hex()
+            # COPY TEXT consumes one escaping layer before BYTEA parses the
+            # value.  Send two backslashes so BYTEA receives its required
+            # ``\x<hex>`` representation instead of COPY decoding ``\xff``
+            # into an invalid raw UTF-8 byte.
+            return "\\\\x" + bytes(v).hex()
         s = str(v)
         return s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
 

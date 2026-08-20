@@ -136,7 +136,21 @@ def _ddl_statement(line: str, declared: dict[str, str], warns: list[str],
                    returns_set: bool, ddl_warnings: list[str]) -> str | None:
     stripped = line.strip()
     upper = stripped.upper()
-    if upper in ("SET NOCOUNT ON", "SET NOCOUNT OFF"):
+    # OBJECT_DEFINITION from replication/system DDL triggers can include
+    # several SQL Server session options on the same physical line before the
+    # real body statement. They are creation metadata, not executable logic.
+    stripped = re.sub(
+        r"^(?:SET\s+\w+\s+(?:ON|OFF)\s*;?\s*)+",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not stripped:
+        return None
+    upper = stripped.upper()
+    if upper in ("SET NOCOUNT ON", "SET NOCOUNT OFF") or re.match(
+        r"^SET\s+\w+\s+(?:ON|OFF)$", upper
+    ):
         return None
     if re.match(r"^BEGIN\s+(TRANSACTION|TRAN|WORK)\b", stripped, re.IGNORECASE):
         warns.append("transaction control inside a DDL trigger has no PostgreSQL equivalent and was removed")
@@ -160,7 +174,7 @@ def _ddl_statement(line: str, declared: dict[str, str], warns: list[str],
     stmt = re.sub(r"^PRINT\s+", "RAISE NOTICE ", stmt, flags=re.IGNORECASE)
     stmt = _translate_raiseerror(stmt)
     stmt = _expr(stmt)
-    return stmt + ";"
+    return stmt.rstrip(";") + ";"
 
 
 # ---------------------------------------------------------------------------

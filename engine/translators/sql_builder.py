@@ -324,6 +324,11 @@ def _build_column(col: Column, target: str, source: str,
             parts = [f"{_qident(col.name, target)}"]
             parts[0] += f" AS ({expr}) PERSISTED"
     else:
+        if col.is_computed and target == "postgres" and downgrade_computed:
+            # The runtime retry converts every generated column to a regular
+            # column. Mark it copyable so DataMigration preserves the values
+            # materialized by SQL Server instead of loading NULL.
+            col.is_computed = False
         # COLLATE must directly follow the data type in both dialects — never
         # after IDENTITY/DEFAULT/NOT NULL (T-SQL error 156).
         parts[0] += collation_frag

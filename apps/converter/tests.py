@@ -930,6 +930,35 @@ END
         self.assertIn("RETURN 1;", conv)
         self.assertNotIn("WITH ProductSearch AS (;", conv)
 
+    def test_empty_temp_table_does_not_emit_duplicate_semicolon(self):
+        proc = """
+CREATE PROCEDURE dbo.BuildReport
+AS
+BEGIN
+    CREATE TABLE #Temp
+    SELECT 1;
+END
+"""
+        conv, _warnings = translate_routine(proc, source="procedure", target="postgres")
+        self.assertIn("CREATE TEMP TABLE Temp ();", conv)
+        self.assertNotIn("();;", conv)
+
+    def test_table_function_never_emits_invalid_returns_placeholder(self):
+        fn = """
+CREATE FUNCTION dbo.ListProducts()
+RETURNS TABLE
+AS
+RETURN (SELECT ProductID, ProductName FROM dbo.ProductMaster)
+"""
+        conv, warnings = translate_routine(
+            fn, source="function", target="postgres", tables=self._db().tables,
+        )
+        if conv is not None:
+            self.assertNotIn("TABLE(...)", conv)
+            self.assertNotIn("SELECT ...", conv)
+        else:
+            self.assertTrue(any("manual conversion required" in warning for warning in warnings))
+
     def test_multiline_if_condition_with_comment(self):
         fn = """
 CREATE PROCEDURE dbo.sp_Check(@id int)
@@ -1960,6 +1989,24 @@ END""",
         self.assertIn("RETURNS event_trigger", stmts[0])
         self.assertIn("WHEN TAG IN ('CREATE TABLE', 'DROP TABLE')", stmts[0])
         self.assertIn("RAISE EXCEPTION", stmts[0])
+
+    def test_tsql_ddl_trigger_strips_session_set_options(self):
+        db = self._base_tsql()
+        db.triggers = [Trigger(
+            name="tr_MStran_altertable", table=None, timing="AFTER",
+            events=["ALTER_TABLE"],
+            definition=(
+                "CREATE TRIGGER tr_MStran_altertable ON DATABASE FOR ALTER_TABLE "
+                "AS BEGIN SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON; PRINT 'changed'; END"
+            ),
+            is_ddl=True, ddl_scope="database",
+        )]
+
+        statements, _warnings = build_database_ddl(db, "postgres")
+
+        self.assertNotIn("SET ANSI_NULLS", statements[0])
+        self.assertNotIn("SET QUOTED_IDENTIFIER", statements[0])
+        self.assertIn("RAISE NOTICE 'changed';", statements[0])
 
     def test_event_trigger_to_tsql_ddl_trigger(self):
         db = self._base_postgres()
