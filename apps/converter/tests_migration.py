@@ -391,3 +391,54 @@ class OrphanObjectReportingTests(SimpleTestCase):
         view_result = next(r for r in report.schema_results if r.kind == "view")
         self.assertEqual(view_result.status, "failed")
         self.assertFalse(report.success)
+
+
+class CopyStreamRenderingTests(SimpleTestCase):
+    """The COPY TEXT renderer is the hot path of every migration; these pin the
+    escaping contract so speed work can never corrupt a value."""
+
+    def _render(self, batches):
+        from engine.connectors.postgres import _CopyTextStream
+        stream = _CopyTextStream(batches)
+        return stream.read(), stream.rows_read
+
+    def test_reserved_characters_are_escaped_and_null_becomes_backslash_n(self):
+        text, rows = self._render([[["a\tb", "c\nd", "e\\f", None, "plain"]]])
+        self.assertEqual(text, "a\\tb\tc\\nd\te\\\\f\t\\N\tplain\n")
+        self.assertEqual(rows, 1)
+
+    def test_carriage_return_is_escaped(self):
+        text, _ = self._render([[["a\rb"]]])
+        self.assertEqual(text, "a\\rb\n")
+
+    def test_binary_values_keep_the_double_escaped_hex_form(self):
+        text, _ = self._render([[[b"\xff\x00"]]])
+        self.assertEqual(text, "\\\\xff00\n")
+
+    def test_numbers_dates_and_decimals_round_trip_as_text(self):
+        import datetime
+        from decimal import Decimal
+        text, _ = self._render([[[1, 2.5, Decimal("3.40"),
+                                  datetime.datetime(2020, 1, 2, 3, 4, 5), True]]])
+        self.assertEqual(text, "1\t2.5\t3.40\t2020-01-02 03:04:05\tTrue\n")
+
+    def test_multiple_batches_and_empty_batches_stream_every_row(self):
+        batches = [[[1], [2]], [], [[3]]]
+        text, rows = self._render(batches)
+        self.assertEqual(text, "1\n2\n3\n")
+        self.assertEqual(rows, 3)
+
+    def test_chunked_reads_reassemble_the_same_payload(self):
+        from engine.connectors.postgres import _CopyTextStream
+        batches = [[[f"row-{i}", i] for i in range(500)],
+                   [[f"row-{i}", i] for i in range(500, 900)]]
+        expected, _ = self._render([list(b) for b in batches])
+        stream = _CopyTextStream([list(b) for b in batches])
+        out = []
+        while True:
+            chunk = stream.read(64)
+            if not chunk:
+                break
+            out.append(chunk)
+        self.assertEqual("".join(out), expected)
+        self.assertEqual(stream.rows_read, 900)

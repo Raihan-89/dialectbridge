@@ -20,6 +20,9 @@ Design:
 """
 from __future__ import annotations
 
+import queue
+import threading
+
 from engine.connectors.base import ConnectorError
 from engine.schema import Table
 
@@ -27,6 +30,50 @@ _INT_TYPES = {"BIGINT", "INT", "SMALLINT", "TINYINT"}
 _WIDE_TYPE_MARKERS = ("BINARY", "IMAGE", "BYTEA", "TEXT", "NTEXT", "XML", "MAX")
 _DEFAULT_COPY_BATCH_SIZE = 25_000
 _WIDE_COPY_BATCH_SIZE = 5_000
+# Batches held in flight between the reader thread and the COPY writer. Two is
+# enough to keep both stages busy while bounding memory to a couple of batches.
+_PREFETCH_DEPTH = 2
+_READER_STOPPED = object()
+
+
+def _prefetch(batches):
+    """Read *batches* on a background thread so the source read overlaps the
+    target write.
+
+    Reading from SQL Server and COPYing into PostgreSQL used to run strictly in
+    turn — the COPY stream pulled a batch, waited for the network round trip,
+    then pushed it. Overlapping the two stages makes a table cost about as long
+    as its slower half instead of the sum of both.
+    """
+    handoff: queue.Queue = queue.Queue(maxsize=_PREFETCH_DEPTH)
+
+    def _pump():
+        try:
+            for batch in batches:
+                handoff.put(batch)
+        except BaseException as exc:                     # re-raised in consumer
+            handoff.put(exc)
+        else:
+            handoff.put(_READER_STOPPED)
+
+    reader = threading.Thread(target=_pump, name="dialectbridge-reader", daemon=True)
+    reader.start()
+    try:
+        while True:
+            item = handoff.get()
+            if item is _READER_STOPPED:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        # Drain so a consumer that stops early (COPY error) cannot wedge the
+        # reader on a full queue.
+        while reader.is_alive():
+            try:
+                handoff.get_nowait()
+            except queue.Empty:
+                reader.join(timeout=0.1)
 
 
 class DataMigration:
@@ -91,12 +138,13 @@ class DataMigration:
         running_count = 0
 
         def _progress_iter():
-            """Yield batches and report progress after each one."""
+            """Yield prefetched batches and report progress after each one."""
             nonlocal running_count
-            for batch in self.source.iter_table_rows(
+            source_batches = self.source.iter_table_rows(
                 self.table.name, cols, order_cols,
                 batch_size=self.batch_size, int_columns=self._int_columns(),
-            ):
+            )
+            for batch in _prefetch(source_batches):
                 if batch:
                     yield batch
                     running_count += len(batch)
