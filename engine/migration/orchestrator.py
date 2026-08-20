@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
+import re
 from time import monotonic
 
 from engine.connectors.base import ConnectorError
@@ -31,6 +32,9 @@ _PRE_DATA_PREFIXES = ("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX",
 _FK_PREFIXES = ("ALTER TABLE",)
 _PRE_TABLE_PREFIXES = ("CREATE DOMAIN", "CREATE TYPE", "CREATE SEQUENCE")
 logger = logging.getLogger("dialectbridge.migration")
+_MISSING_RELATION_RE = re.compile(
+    r'relation "([^"]+)" does not exist', re.IGNORECASE,
+)
 
 
 class MigrationCancelledError(Exception):
@@ -115,6 +119,7 @@ class MigrationOrchestrator:
         self.progress_callback = progress_callback
         self.cancel_check = cancel_check
         self._table_progress: dict = {}
+        self._source_objects: set[str] = set()
 
     def _check_cancelled(self) -> None:
         if self.cancel_check is not None and self.cancel_check():
@@ -157,6 +162,13 @@ class MigrationOrchestrator:
             report.finished_at = _now()
             report.summary = {"status": "failed", "reason": "extraction"}
             return report
+
+        self._source_objects = {
+            obj.name.rsplit(".", 1)[-1].lower()
+            for group in (schema.tables, schema.views, schema.functions,
+                          schema.procedures, schema.sequences, schema.synonyms)
+            for obj in group
+        }
 
         report.warnings.extend(schema.warnings)
         if schema.warnings:
@@ -455,7 +467,7 @@ class MigrationOrchestrator:
 
     def _apply_table(self, report: MigrationReport, schema, table) -> None:
         from engine.translators.sql_builder import build_table_ddl
-        stmts, warnings = build_table_ddl(table, self.target.dialect, schema.dialect)
+        stmts, warnings = build_table_ddl(table, self.target.dialect, schema.dialect, schema)
         report.warnings.extend(warnings)
         for stmt in stmts:
             self._apply(report, "table", stmt, object_name=table.name)
@@ -464,7 +476,7 @@ class MigrationOrchestrator:
                     and last_result.kind == "table"
                     and "generation expression is not immutable" in last_result.detail):
                 retry_stmts, retry_warnings = build_table_ddl(
-                    table, self.target.dialect, schema.dialect,
+                    table, self.target.dialect, schema.dialect, schema,
                     downgrade_computed=True,
                 )
                 report.warnings.extend(retry_warnings)
@@ -498,12 +510,41 @@ class MigrationOrchestrator:
                 table.name, obj.rows_copied, monotonic() - started,
             )
 
+    def _missing_source_dependency(self, message: str) -> str | None:
+        """Return the referenced object when the failure is caused by something
+        that does not exist in the *source* database either.
+
+        Real databases accumulate views and routines whose underlying tables
+        were dropped long ago; SQL Server keeps them because it does not check
+        dependencies. They can never be created on the target, so they are
+        reported as skipped rather than as migration failures.
+        """
+        match = _MISSING_RELATION_RE.search(message)
+        if not match:
+            return None
+        reference = match.group(1)
+        if reference.rsplit(".", 1)[-1].lower() in self._source_objects:
+            return None
+        return reference
+
     def _apply(self, report: MigrationReport, kind: str, stmt: str, object_name: str | None = None) -> None:
         name = object_name or _name_from_stmt(stmt)
         try:
             self.target.execute(stmt)
             report.schema_results.append(ObjectResult(kind=kind, name=name))
         except ConnectorError as exc:
+            missing = self._missing_source_dependency(str(exc))
+            if missing:
+                detail = (
+                    f"References '{missing}', which does not exist in the source "
+                    f"database — the object was skipped"
+                )
+                logger.warning("Schema object skipped kind=%s name=%s reason=%s", kind, name, detail)
+                report.schema_results.append(
+                    ObjectResult(kind=kind, name=name, status="skipped", detail=detail)
+                )
+                report.warnings.append(f"{kind.title()} '{name}': {detail}")
+                return
             logger.error("Schema object creation failed kind=%s name=%s error=%s", kind, name, exc)
             report.schema_results.append(
                 ObjectResult(

@@ -141,10 +141,14 @@ WHERE OBJECT_SCHEMA_NAME(cc.parent_object_id) = %s AND OBJECT_NAME(cc.parent_obj
 ORDER BY cc.name
 """
 
+# is_ms_shipped objects are SQL Server's own (replication catalog views such as
+# sysextendedarticlesview, CDC helpers). They reference engine-internal tables
+# that do not exist in PostgreSQL and must never be migrated.
 _VIEWS_SQL = """
-SELECT TABLE_SCHEMA + '.' + TABLE_NAME AS name, OBJECT_DEFINITION(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME))
-FROM INFORMATION_SCHEMA.VIEWS
-ORDER BY TABLE_SCHEMA, TABLE_NAME
+SELECT OBJECT_SCHEMA_NAME(v.object_id) + '.' + v.name AS name, OBJECT_DEFINITION(v.object_id)
+FROM sys.views v
+WHERE v.is_ms_shipped = 0
+ORDER BY OBJECT_SCHEMA_NAME(v.object_id), v.name
 """
 
 _INDEXED_VIEWS_SQL = """
@@ -172,6 +176,7 @@ ORDER BY i.name, ic.key_ordinal
 _PROCEDURES_SQL = """
 SELECT OBJECT_SCHEMA_NAME(object_id) + '.' + name, OBJECT_DEFINITION(object_id)
 FROM sys.procedures
+WHERE is_ms_shipped = 0
 ORDER BY name
 """
 
@@ -182,6 +187,7 @@ SELECT
     CASE type WHEN 'FN' THEN 'scalar' WHEN 'IF' THEN 'inline_table' WHEN 'TF' THEN 'table' END
 FROM sys.objects
 WHERE type IN ('FN', 'IF', 'TF')
+    AND is_ms_shipped = 0
 ORDER BY name
 """
 
@@ -193,10 +199,12 @@ SELECT
     OBJECT_DEFINITION(tr.object_id)
 FROM sys.triggers tr
 WHERE tr.parent_class = 1
+    AND tr.is_ms_shipped = 0
 ORDER BY tr.name
 """
 
-# Database-scoped DDL triggers (parent_class = 0).
+# Database-scoped DDL triggers (parent_class = 0). SQL Server's own replication
+# triggers (tr_MStran_*) call sys.sp_MStran_ddlrepl and are excluded.
 _DDL_TRIGGERS_SQL = """
 SELECT
     tr.name,
@@ -205,6 +213,7 @@ SELECT
 FROM sys.triggers tr
 JOIN sys.trigger_events te ON te.object_id = tr.object_id
 WHERE tr.parent_class = 0
+    AND tr.is_ms_shipped = 0
 ORDER BY tr.name, te.type_desc
 """
 

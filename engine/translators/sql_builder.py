@@ -212,8 +212,16 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
     statements.extend(stmts)
     warnings.extend(tw)
 
-    table_names = [t.name for t in database.tables]
-    statements = [_qualify_body_refs(s, database.tables, target_dialect) for s in statements]
+    # Only view/routine/trigger bodies contain unquoted references that need
+    # rewriting. Structural DDL (tables, indexes, constraints, sequences,
+    # grants) already carries the exact identifiers taken from the source
+    # catalog — rewriting those corrupts column names that differ only in case
+    # between tables (e.g. "STATUS" on one table and "status" on another).
+    statements = [
+        _qualify_body_refs(s, database.tables, target_dialect)
+        if _is_body_statement(s) else s
+        for s in statements
+    ]
 
     # Deduplicate warnings globally — the same temp-table or EVENTDATA()
     # warning can be emitted by many routines; keep each unique message once.
@@ -225,6 +233,19 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
             unique_warnings.append(w)
 
     return statements, unique_warnings
+
+
+_BODY_STMT_RE = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?"
+    r"(?:MATERIALIZED\s+)?(?:EVENT\s+)?"
+    r"(?:VIEW|FUNCTION|PROCEDURE|TRIGGER)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_body_statement(stmt: str) -> bool:
+    """True for statements that embed a SQL body needing reference rewriting."""
+    return bool(_BODY_STMT_RE.match(stmt))
 
 
 def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
@@ -267,7 +288,9 @@ def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
 
     if table.is_partitioned:
         if target_dialect == "postgres" and table.partition_key and table.partition_type in ("range", "list"):
-            create += f"\nPARTITION BY {table.partition_type.upper()} ({_translate_expr(table.partition_key, source_dialect, target_dialect)})"
+            key_expr = _translate_expr(table.partition_key, source_dialect, target_dialect)
+            key_expr = _quote_partition_key(key_expr, table, target_dialect)
+            create += f"\nPARTITION BY {table.partition_type.upper()} ({key_expr})"
             statements[0] = create
             for child in table.partition_children:
                 statements.append(
@@ -281,6 +304,19 @@ def build_table_ddl(table: Table, target_dialect: str, source_dialect: str,
             )
 
     return statements, warnings
+
+
+def _quote_partition_key(key_expr: str, table: Table, target: str) -> str:
+    """Quote a bare partition-key column so PostgreSQL preserves its casing."""
+    if target != "postgres":
+        return key_expr
+    bare = key_expr.strip()
+    if not re.fullmatch(r"[A-Za-z_]\w*", bare):
+        return key_expr
+    for col in table.columns:
+        if col.name.lower() == bare.lower():
+            return f'"{col.name}"'
+    return key_expr
 
 
 def _build_column(col: Column, target: str, source: str,
@@ -483,6 +519,10 @@ def build_check_ddl(table: Table, check, target: str) -> str:
     if target == "postgres":
         # MSSQL sys.check_constraints.definition looks like "([Status]=N'Pending')"
         expr = _translate_expr(check.definition.strip(), "tsql", "postgres")
+        # SQL Server stores the constraint text as authored, so its column
+        # references can differ in case from sys.columns. PostgreSQL quoted
+        # identifiers are case-sensitive — realign them with the real columns.
+        expr = _normalize_index_where_columns(expr, table)
         if not expr.upper().startswith("CHECK"):
             expr = f"CHECK {expr}"
     else:
@@ -1210,14 +1250,55 @@ _SQL_KEYWORDS = frozenset(
 )
 
 
+_REF_PART = r'(?:"[^"]+"|\[[^\]]+\]|[A-Za-z_]\w*)'
+
+# `alias.column` / `"schema"."table".column`, where the qualifier may itself be
+# a dotted, quoted or bracketed reference.
+_QUALIFIED_COL_RE = re.compile(
+    rf'(?P<prefix>{_REF_PART}(?:\.{_REF_PART})*)\.(?P<col>"[A-Za-z_]\w*"|[A-Za-z_]\w*)'
+)
+
+# An unqualified identifier: not preceded by a dot/quote and not a function call.
+_STANDALONE_COL_RE = re.compile(r'(?<![\w."\[])("[A-Za-z_]\w*"|[A-Za-z_]\w*)(?![\w."\[(])')
+
+_ALIAS_STOP = (
+    "ON|WHERE|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|JOIN|GROUP|ORDER|HAVING|"
+    "UNION|INTERSECT|EXCEPT|SET|VALUES|WITH|SELECT|AND|OR|LIMIT|OFFSET|FOR"
+)
+_FROM_ALIAS_RE = re.compile(
+    rf'\b(?:FROM|JOIN)\s+(?P<ref>{_REF_PART}(?:\s*\.\s*{_REF_PART})*)'
+    rf'(?:\s+(?:AS\s+)?(?!(?:{_ALIAS_STOP})\b)(?P<alias>[A-Za-z_]\w*))?',
+    re.IGNORECASE,
+)
+
+
+def _alias_bindings(text: str, tables_by_key: dict) -> dict:
+    """Map every alias (and bare table name) used in ``text`` to its Table."""
+    bindings: dict = {}
+    for match in _FROM_ALIAS_RE.finditer(text):
+        bare = re.split(r"\s*\.\s*", match.group("ref"))[-1].strip('"[] ')
+        table = tables_by_key.get(bare.lower())
+        if table is None:
+            continue
+        bindings[bare.lower()] = table
+        if match.group("alias"):
+            bindings[match.group("alias").lower()] = table
+    return bindings
+
+
 def _qualify_body_refs(text: str, tables: list, target: str) -> str:
     """Rewrite body expressions so unquoted MSSQL references resolve in PostgreSQL.
 
     MSSQL bodies are written case-insensitively (``FROM Orders``, ``o.CustomerID``);
     PostgreSQL quoted identifiers are case-sensitive. We (1) qualify bare table
     names to their quoted schema-qualified form and (2) quote column references
-    using the original casing captured from the source schema. String literals
-    and already-quoted identifiers are masked so they are never rewritten.
+    using the original casing captured from the source schema.
+
+    Column casing is resolved **per table**: the FROM/JOIN clauses of the
+    statement bind each alias to a table, so ``b."Age"`` in a query over a table
+    whose column is ``age`` is corrected while another table's genuine ``Age``
+    column is left alone. A name is only rewritten from the global schema when
+    every table that owns it agrees on the casing.
     """
     if target != "postgres":
         # PostgreSQL extraction already preserves identifiers with quotes and
@@ -1225,29 +1306,32 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
         # names here corrupts SELECT aliases (Category -> dbo.Category).
         return text
 
-    col_casing: dict[str, str] = {}
+    tables_by_key: dict = {}
+    per_table: dict[str, dict[str, str]] = {}
+    variants: dict[str, set] = {}
     for table in tables:
+        tables_by_key.setdefault(table.name.lower(), table)
+        tables_by_key.setdefault(table.name.rsplit(".", 1)[-1].lower(), table)
+        casing: dict[str, str] = {}
         for col in table.columns:
-            col_casing.setdefault(col.name.lower(), col.name)
+            casing.setdefault(col.name.lower(), col.name)
+            variants.setdefault(col.name.lower(), set()).add(col.name)
+        per_table[table.name.lower()] = casing
+    unambiguous = {k: next(iter(v)) for k, v in variants.items() if len(v) == 1}
 
-    # Fix casing of already-quoted column identifiers.
-    # e.g. "dbo"."Age" where the actual column is "age" -> "dbo"."age"
-    def _fix_quoted_col_casing(m):
-        prefix = m.group(1) or ""
-        col_name = m.group(2)
-        canon = col_casing.get(col_name.lower())
-        if canon and canon != col_name:
-            return f'{prefix}"{canon}"'
-        return m.group(0)
-    text = re.sub(r'(?:(\w+)\.)"([A-Za-z_]\w*)"', _fix_quoted_col_casing, text)
-    # Also handle standalone quoted columns: "Age" -> "age"
-    def _fix_standalone_quoted_casing(m):
-        col_name = m.group(1)
-        canon = col_casing.get(col_name.lower())
-        if canon and canon != col_name:
-            return f'"{canon}"'
-        return m.group(0)
-    text = re.sub(r'(?<![\w.])"([A-Za-z_]\w*)"(?![.\w(])', _fix_standalone_quoted_casing, text)
+    bindings = _alias_bindings(text, tables_by_key)
+    bound = {t.name.lower(): t for t in bindings.values()}
+
+    def _canonical(prefix: str | None, name: str) -> str | None:
+        lowered = name.lower()
+        if prefix:
+            table = bindings.get(prefix) or tables_by_key.get(prefix)
+            if table is not None:
+                return per_table[table.name.lower()].get(lowered)
+        candidates = {per_table[key][lowered] for key in bound if lowered in per_table[key]}
+        if len(candidates) == 1:
+            return next(iter(candidates))
+        return unambiguous.get(lowered)
 
     masked, stash = _mask(text)
     masked = _qualify_table_refs(masked, [t.name for t in tables], target)
@@ -1256,20 +1340,29 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
     # PL/pgSQL resolves them as variables rather than ambiguous columns.
     param_names = _signature_param_names(masked)
 
-    def _repl(match) -> str:
-        alias, col = match.group(1), match.group(2)
-        if col is None:
-            alias, col = "", match.group(3)
-            if col.lower() in param_names:
-                return match.group(0)
-        if col.lower() in _SQL_KEYWORDS:
-            return match.group(0)
-        canon = col_casing.get(col.lower())
+    def _qualified(match) -> str:
+        prefix = match.group("prefix")
+        raw = match.group("col")
+        owner = re.split(r"\s*\.\s*", prefix)[-1].strip('"[] ').lower()
+        canon = _canonical(owner, raw.strip('"'))
         if not canon:
             return match.group(0)
-        return f'{alias}."{canon}"' if alias else f'"{canon}"'
+        return f'{prefix}."{canon}"'
 
-    masked = re.sub(r"(\b\w+)\.([A-Za-z_]\w*)|(?<![\w.\"])([A-Za-z_]\w*)", _repl, masked)
+    masked = _QUALIFIED_COL_RE.sub(_qualified, masked)
+
+    def _standalone(match) -> str:
+        raw = match.group(1)
+        bare = raw.strip('"')
+        if not raw.startswith('"'):
+            if bare.lower() in param_names or bare.lower() in _SQL_KEYWORDS:
+                return match.group(0)
+        canon = _canonical(None, bare)
+        if not canon:
+            return match.group(0)
+        return f'"{canon}"'
+
+    masked = _STANDALONE_COL_RE.sub(_standalone, masked)
     return _unmask(masked, stash)
 
 
@@ -1300,10 +1393,16 @@ def _mask(text: str) -> tuple[str, list[str]]:
         return f"\x01{len(stash) - 1}\x01"
 
     text = re.sub(r"'([^']*)'", _s1, text)
-    text = re.sub(r'"([^"]*)"', _s2, text)
+    # Quoted identifiers stay visible: the column rewriter needs to read the
+    # table qualifier in `"dbo"."tm_Bomas".intPayamid` to resolve the column's
+    # real casing. They are safe because every rewrite rejects a `"` neighbour.
+    # Only quoted identifiers that are *not* schema objects (delimited aliases,
+    # spaces in them) are hidden below.
+    text = re.sub(r'"[^"]*[^"\w][^"]*"', _s2, text)
     # Column/table aliases introduced by `AS` are local to the statement and
     # must never be rewritten as qualified identifiers (they aren't schema
     # objects). Masked before the table-ref rewrite below.
+    text = re.sub(r'\bAS\s+"[^"]*"', _s2, text, flags=re.IGNORECASE)
     text = re.sub(r"\bAS\s+([A-Za-z_][A-Za-z0-9_]*)\b", _s2, text, flags=re.IGNORECASE)
     return text, stash
 

@@ -149,17 +149,18 @@ def _ddl_statement(line: str, declared: dict[str, str], warns: list[str],
     # before translating the remaining statement.
     while True:
         declaration = re.match(
-            r"^DECLARE\s+@?([A-Za-z_]\w*)\s+(?:AS\s+)?([\w.]+(?:\s*\([^;]+?\))?)\s*;\s*(.*)$",
+            r"^DECLARE\s+@?([A-Za-z_]\w*)\s+(?:AS\s+)?([\w.]+(?:\s*\([^;]+?\))?)\s*"
+            r"(?:;\s*(.*))?$",
             stripped,
             re.IGNORECASE | re.DOTALL,
         )
         if not declaration:
             break
         data_type, warning = convert_type(declaration.group(2), "tsql", "postgres")
-        declared[declaration.group(1)] = data_type
+        declared[declaration.group(1)] = data_type or "TEXT"
         if warning:
             warns.append(warning)
-        stripped = declaration.group(3).strip()
+        stripped = (declaration.group(3) or "").strip()
         if not stripped:
             return None
     upper = stripped.upper()

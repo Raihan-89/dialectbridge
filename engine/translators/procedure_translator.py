@@ -190,9 +190,9 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
             warnings.append(f"Parameter @{pname} type '{ptype}': {warn}")
         tgt_type = tgt_type or "TEXT"
         if output:
-            param_list.append(f"OUT {pname} {tgt_type}")
+            param_list.append(f"OUT {_safe_var(pname)} {tgt_type}")
         else:
-            param_list.append(f"{pname} {tgt_type}")
+            param_list.append(f"{_safe_var(pname)} {tgt_type}")
     if kind in ("PROCEDURE", "PROC"):
         transformed, cursor_params = _procedure_result_cursors(transformed)
         param_list.extend(cursor_params)
@@ -475,12 +475,27 @@ def _split_top_level(text: str) -> list[str]:
     return parts
 
 
+# Words PostgreSQL refuses as an *unquoted* PL/pgSQL variable name. Derived by
+# testing every pg_get_keywords() entry plus the PL/pgSQL-only keywords against
+# `DO $$ DECLARE <word> int; BEGIN END $$`. T-SQL happily allows @End / @Type /
+# @Case, so colliding names are renamed (consistently at every reference).
+_PLPGSQL_RESERVED_VARS = frozenset(
+    "all begin by case declare else end execute for foreach from if in into "
+    "not null or strict then to using when".split()
+)
+
+
+def _safe_var(name: str) -> str:
+    """Rename a variable/parameter whose name PL/pgSQL reserves."""
+    return f"v_{name}" if name.lower() in _PLPGSQL_RESERVED_VARS else name
+
+
 def _join_declares(declared: dict[str, str]) -> str:
     if not declared:
         return ""
     lines = []
     for name, type_and_init in declared.items():
-        lines.append(f"  {name} {type_and_init};")
+        lines.append(f"  {_safe_var(name)} {type_and_init};")
     return "\n".join(lines)
 
 
@@ -597,6 +612,7 @@ _STMT_START_RE = re.compile(
     re.IGNORECASE,
 )
 _SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
+_SET_SESSION_OPTION_RE = re.compile(r"^SET\s+\w+(?:\s+\w+)*\s+(?:ON|OFF)\s*;?\s*$", re.IGNORECASE)
 _SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT|UNION|INTERSECT|EXCEPT)\b", re.IGNORECASE)
 
 
@@ -1005,9 +1021,15 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
 
     for raw_line in _join_balanced_lines(body):
         line = raw_line.strip()
+        # T-SQL authors defensively prefix a CTE with a semicolon (`;WITH x AS`)
+        # to terminate whatever came before. Keeping it would emit an empty
+        # statement and hide the WITH from the CTE/SELECT continuation check.
+        if line.startswith(";"):
+            line = line.lstrip(";").strip()
         if not line:
-            if not _case_open(" ".join(buf)):
-                flush()
+            # Blank lines carry no meaning in T-SQL. Real-world procedures put
+            # them *inside* long SELECT lists and JOIN chains, so flushing here
+            # chopped one statement into fragments that each got a trailing ';'.
             continue
         # Standalone T-SQL comments must not merge with (and swallow) the next
         # statement; they are documentation only and are dropped.
@@ -1045,12 +1067,25 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
                 pass  # continue accumulating the current statement
             elif _STMT_START_RE.match(first_word):
                 flush()
+            elif first_word == "SET" and _SET_SESSION_OPTION_RE.match(line):
+                # `SET NOCOUNT OFF` after an UPDATE ... SET is a new statement,
+                # never a continuation of the UPDATE's SET clause.
+                flush()
             elif first_word == "SET" and not _SET_START_EXCEPT.match(buf[0].lstrip()):
                 flush()
             elif first_word == "SELECT" and not _SELECT_START_EXCEPT.match(buf[0].lstrip()):
                 # A SELECT after UNION/INTERSECT/EXCEPT continues the set operation
                 if not _ends_with_set_op(" ".join(buf)):
                     flush()
+            elif (first_word == "SELECT"
+                  and re.match(r"^INSERT\b", buf[0].lstrip(), re.IGNORECASE)
+                  and (_contains_toplevel_keyword(" ".join(buf), "SELECT")
+                       or _contains_toplevel_keyword(" ".join(buf), "VALUES"))
+                  and not _ends_with_set_op(" ".join(buf))):
+                # `INSERT INTO t SELECT ...` / `INSERT INTO t VALUES (...)` is
+                # already complete, so a SELECT starting the next line is a new
+                # statement — T-SQL lets the author omit the semicolon.
+                flush()
 
         is_control = (
             upper in ("BEGIN", "END", "ELSE")
@@ -1183,7 +1218,43 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
     return out, t_warns, declared
 
 
+def _contains_toplevel_keyword(text: str, word: str) -> bool:
+    """True when ``word`` appears in ``text`` outside parentheses and strings."""
+    upper_word = word.upper()
+    width = len(word)
+    depth, i, n = 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            i += 1
+            while i < n:
+                if text[i] == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    break
+                i += 1
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif (depth == 0
+              and text[i:i + width].upper() == upper_word
+              and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))
+              and (i + width >= n
+                   or not (text[i + width].isalnum() or text[i + width] == "_"))):
+            return True
+        i += 1
+    return False
+
+
 def _transform_statement(line: str, declared: dict[str, str], warnings: list[str], returns_set: bool, is_procedure: bool = False) -> str | None:
+    # A whole statement wrapped in parentheses — `(SELECT ...)` — is how some
+    # T-SQL procedures return a result set. Unwrap it so the result-select
+    # handling below recognises it.
+    wrapped = re.match(r"^\(\s*(SELECT\b.*)\)\s*;?\s*$", line, re.IGNORECASE | re.DOTALL)
+    if wrapped and _paren_delta(wrapped.group(1)) == 0:
+        line = wrapped.group(1).strip()
     # Normalize a leading SELECT TOP n to a trailing LIMIT n first so the
     # assignment-SELECT regexes below still match "SELECT TOP 1 @x = ...".
     line = _translate_top(line)
@@ -1235,8 +1306,11 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
     if re.match(r"^(COMMIT|ROLLBACK)\s+(TRANSACTION|TRAN|WORK)\b", line, re.IGNORECASE):
         return f"{upper.split()[0]};"
 
-    # DECLARE @x INT / DECLARE @x INT = expr
-    m = re.match(rf"^DECLARE\s+@([\w]+)\s+({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$", line, re.IGNORECASE)
+    # DECLARE @x INT / DECLARE @x AS INT / DECLARE @x INT = expr
+    m = re.match(
+        rf"^DECLARE\s+@([\w]+)\s+(?:AS\s+|IS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$",
+        line, re.IGNORECASE,
+    )
     if m:
         name, dtype, init = m.group(1), m.group(2), m.group(3)
         target_type, warn = convert_type(dtype, "tsql", "postgres")
@@ -1291,7 +1365,7 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
         for part in parts:
             # Try: name type, name AS type, name type = expr, name AS type = expr
             vm = re.match(
-                rf"""(?:"([\w]+)"|([\w]+))\s+(?:AS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$""",
+                rf"""(?:"([\w]+)"|@?([\w]+))\s+(?:AS\s+|IS\s+)?({_TSQL_TYPE_RE})\s*(?:=\s*(.*))?$""",
                 part.strip(), re.IGNORECASE,
             )
             if vm:
@@ -1319,26 +1393,26 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
     # SET @x = expr
     m = re.match(r"^SET\s+@([\w]+)\s*=\s*(.+)$", line, re.IGNORECASE)
     if m:
-        return f"{m.group(1)} := {_expr(m.group(2))};"
+        return f"{_safe_var(m.group(1))} := {_expr(m.group(2))};"
 
     # SELECT @x = expr [FROM ...]  (single assignment)
     m = re.match(r"^SELECT\s+@([\w]+)\s*=\s*(.+?)\s+FROM\s+(.+)$", line, re.IGNORECASE | re.DOTALL)
     if m:
         var, expr, tail = m.group(1), m.group(2), m.group(3)
-        return f"SELECT {_expr(expr)} INTO {var} FROM {_expr(tail)};"
+        return f"SELECT {_expr(expr)} INTO {_safe_var(var)} FROM {_expr(tail)};"
 
     # SELECT @x = expr  (no FROM)
     m = re.match(r"^SELECT\s+@([\w]+)\s*=\s*(.+)$", line, re.IGNORECASE | re.DOTALL)
     if m:
         var, expr = m.group(1), m.group(2)
-        return f"SELECT {_expr(expr)} INTO {var};"
+        return f"SELECT {_expr(expr)} INTO {_safe_var(var)};"
 
     # PRINT @x / PRINT 'text'
     m = re.match(r"^PRINT\s+(.+)$", line, re.IGNORECASE)
     if m:
         arg = m.group(1).strip()
         if arg.startswith("@"):
-            return f"RAISE NOTICE '%', {arg[1:]};"
+            return f"RAISE NOTICE '%', {_safe_var(arg[1:])};"
         return f"RAISE NOTICE {arg};"
 
     # RAISERROR / THROW
@@ -1418,12 +1492,10 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
 
 def _translate_tsql_body_syntax(line: str) -> str:
     """Apply T-SQL-specific body transformations that don't go through _expr."""
-    # CROSS APPLY -> CROSS JOIN LATERAL (PG syntax)
-    line = re.sub(r"\bCROSS\s+APPLY\b", "CROSS JOIN LATERAL", line, flags=re.IGNORECASE)
-    # OUTER APPLY -> LEFT JOIN LATERAL ... ON TRUE
-    line = re.sub(r"\bOUTER\s+APPLY\b", "LEFT JOIN LATERAL", line, flags=re.IGNORECASE)
-    # Strip WITH (NOLOCK), WITH (UPDLOCK), WITH (TABLOCK), etc.
-    line = re.sub(r"\bWITH\s*\(\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|NOLOCK|INDEX\s*\([^)]*\))(?:\s*,\s*(?:NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|INDEX\s*\([^)]*\)))*\s*\)", "", line, flags=re.IGNORECASE)
+    # T-SQL allows `INSERT tbl VALUES (...)` without INTO; PostgreSQL requires it.
+    line = re.sub(r"^(INSERT)\s+(?!INTO\b)(?=[\w\"\[#])", r"\1 INTO ", line, flags=re.IGNORECASE)
+    # Column definitions inside a body CREATE TABLE keep their T-SQL types.
+    line = _translate_body_create_table(line)
     # CREATE TABLE #temp; or CREATE TABLE temp; (no columns) -> CREATE TEMP TABLE temp ();
     line = re.sub(r"(?i)\bCREATE\s+TABLE\s+(?:#([\w]+)|([\w]+))\s*;?\s*$", lambda m: f"CREATE TEMP TABLE {m.group(1) or m.group(2)} ();", line)
     # OPEN cursor FOR select -> cursor_name FOR select  (PG refcursor syntax)
@@ -1435,6 +1507,52 @@ def _translate_tsql_body_syntax(line: str) -> str:
     # SET @x = value (without explicit SET keyword appearing as statement start)
     # This handles cases where SET is inside a compound statement
     return line
+
+
+# T-SQL column types that appear inside a body CREATE TABLE. PostgreSQL has no
+# DATETIME/BIT/NVARCHAR, so the declaration fails unless they are mapped.
+_BODY_TYPE_REWRITES = [
+    (r"\b(?:n?varchar|n?char)\s*\(\s*max\s*\)", "TEXT"),
+    (r"\bnvarchar\s*\(", "VARCHAR("),
+    (r"\bnchar\s*\(", "CHAR("),
+    (r"\bdatetime2\s*(?:\(\s*\d+\s*\))?", "TIMESTAMP"),
+    (r"\bsmalldatetime\b", "TIMESTAMP"),
+    (r"\bdatetimeoffset\s*(?:\(\s*\d+\s*\))?", "TIMESTAMPTZ"),
+    (r"\bdatetime\b", "TIMESTAMP"),
+    (r"\buniqueidentifier\b", "UUID"),
+    (r"\btinyint\b", "SMALLINT"),
+    (r"\bbit\b", "BOOLEAN"),
+    (r"\bsmallmoney\b", "NUMERIC(10,4)"),
+    (r"\bmoney\b", "NUMERIC(19,4)"),
+    (r"\bntext\b", "TEXT"),
+    (r"\bimage\b", "BYTEA"),
+    (r"\bvarbinary\s*\([^)]*\)", "BYTEA"),
+    (r"\bbinary\s*\([^)]*\)", "BYTEA"),
+    (r"\bdecimal\b", "NUMERIC"),
+    (r"\bfloat\b", "DOUBLE PRECISION"),
+    (r"\bsysname\b", "VARCHAR(128)"),
+]
+
+_BODY_CREATE_TABLE_RE = re.compile(
+    r"^(?P<create>CREATE\s+)(?P<temp>TEMP\s+|TEMPORARY\s+)?TABLE\s+"
+    r"(?P<name>#?[\w\".\[\]]+)\s*\((?P<cols>.*)\)(?P<tail>[^)]*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _translate_body_create_table(line: str) -> str:
+    """Map T-SQL column types (and drop the trailing comma SQL Server allows)
+    inside a ``CREATE TABLE`` written in a routine body."""
+    match = _BODY_CREATE_TABLE_RE.match(line.strip())
+    if not match:
+        return line
+    name = match.group("name")
+    temp = bool(match.group("temp")) or name.startswith("#")
+    columns = re.sub(r",\s*$", "", match.group("cols").strip())
+    for pattern, replacement in _BODY_TYPE_REWRITES:
+        columns = re.sub(pattern, replacement, columns, flags=re.IGNORECASE)
+    keyword = "CREATE TEMP TABLE " if temp else "CREATE TABLE "
+    return f"{keyword}{name.lstrip('#')} ({columns}){match.group('tail')}"
 
 
 def _delay_to_seconds(delay: str) -> float:
@@ -1506,6 +1624,33 @@ def _replace_concat(text: str) -> str:
     return "".join(out)
 
 
+# Keywords PostgreSQL refuses as a *bare* column alias (`SELECT pc_year Year`)
+# but accepts after an explicit AS. Restricted to the type/temporal names real
+# schemas actually alias with — clause keywords (FROM/WHERE/GROUP/...) and the
+# type-name parts (PRECISION in DOUBLE PRECISION) are deliberately excluded so
+# genuine syntax is never rewritten.
+_BARE_ALIAS_KEYWORDS = "year month day hour minute second array within without"
+_BARE_ALIAS_RE = re.compile(
+    rf'(?<=[\w)"])\s+(?P<alias>{_BARE_ALIAS_KEYWORDS.replace(" ", "|")})\s*(?=,|\bFROM\b|$)',
+    re.IGNORECASE,
+)
+
+
+def _fix_bare_aliases(text: str) -> str:
+    """Insert the optional AS before a column alias PostgreSQL treats as a keyword."""
+    return _BARE_ALIAS_RE.sub(lambda m: f" AS {m.group('alias')}", text)
+
+
+_TABLE_HINT = (
+    r"NOLOCK|UPDLOCK|TABLOCK|TABLOCKX|PAGLOCK|ROWLOCK|HOLDLOCK|XLOCK|NOWAIT|READPAST|"
+    r"READCOMMITTED|READCOMMITTEDLOCK|REPEATABLEREAD|SERIALIZABLE|INDEX\s*\([^)]*\)"
+)
+_TABLE_HINT_RE = re.compile(
+    rf"(?:\bWITH\s*)?\(\s*(?:{_TABLE_HINT})(?:\s*,\s*(?:{_TABLE_HINT}))*\s*\)",
+    re.IGNORECASE,
+)
+
+
 def _expr(text: str) -> str:
     """Translate expressions inside a statement."""
     text = translate_functions(text, "tsql", "postgres")
@@ -1513,12 +1658,22 @@ def _expr(text: str) -> str:
     text = re.sub(r"\[([^\[\]]+)\]", r'"\1"', text)
     # MSSQL N-prefixed string literals have no PG equivalent
     text = re.sub(r"\bN'", "'", text, flags=re.IGNORECASE)
+    # Locking hints (`WITH (NOLOCK)`, bare `(NOLOCK)`) have no PG equivalent.
+    text = _TABLE_HINT_RE.sub("", text)
+    # APPLY operators become lateral joins
+    text = re.sub(r"\bCROSS\s+APPLY\b", "CROSS JOIN LATERAL", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bOUTER\s+APPLY\b", "LEFT JOIN LATERAL", text, flags=re.IGNORECASE)
+    # T-SQL single-quoted column aliases (AS 'Cash+ FLI') are identifiers in PG
+    text = re.sub(r"\bAS\s+'([^']*)'", lambda m: f'AS "{m.group(1)}"', text, flags=re.IGNORECASE)
+    text = _fix_bare_aliases(text)
+    # @@system vars — resolved before the single-@ strip below, which would
+    # otherwise turn @@IDENTITY into an unknown @IDENTITY variable.
+    text = re.sub(r"@@ROWCOUNT\b", "ROW_COUNT()", text, flags=re.IGNORECASE)
+    text = re.sub(r"@@IDENTITY\b", "LASTVAL()", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bSCOPE_IDENTITY\s*\(\s*\)", "LASTVAL()", text, flags=re.IGNORECASE)
     # variable references @x -> x (not inside string literals)
-    text = re.sub(r"@([A-Za-z_][A-Za-z0-9_]*)", r"\1", text)
-    # @@system vars
-    text = re.sub(r"@@ROWCOUNT", "ROW_COUNT()", text, flags=re.IGNORECASE)
-    text = re.sub(r"@@IDENTITY", "LASTVAL()", text, flags=re.IGNORECASE)
-    text = re.sub(r"SCOPE_IDENTITY\s*\(\)", "LASTVAL()", text, flags=re.IGNORECASE)
+    text = re.sub(r"@([A-Za-z_][A-Za-z0-9_]*)",
+                  lambda m: _safe_var(m.group(1)), text)
     # #temp references
     text = re.sub(r"\[?#([\w\d_]+)\]?", r"\1", text)
     # SELECT TOP n -> trailing LIMIT n

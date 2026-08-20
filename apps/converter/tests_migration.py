@@ -14,7 +14,7 @@ from engine.connectors.mssql import MSSQLConnector
 from engine.connectors.postgres import PostgresConnector
 from engine.migration.data_mover import DataMigration
 from engine.migration.orchestrator import MigrationOrchestrator
-from engine.schema import Column, Constraint, Database, Index, Table
+from engine.schema import Column, Constraint, Database, Index, Table, View
 from engine.translators.sql_builder import build_table_ddl
 
 
@@ -344,3 +344,50 @@ class MigrationPipelineSmokeTests(SimpleTestCase):
         self.assertIn("DROP USER [dbo].[other_user]", target.executed)
         self.assertIn("DROP ROLE [dbo].[ProductReader]", target.executed)
         self.assertNotIn("DROP USER [dbo].[migrator]", target.executed)
+
+
+class _FakeViewFailureTarget(_FakeConnector):
+    """Target that rejects every CREATE VIEW with a missing-relation error."""
+
+    def __init__(self, missing: str):
+        super().__init__({}, dialect="postgres")
+        self.missing = missing
+
+    def execute(self, sql, params=None):
+        if sql.lstrip().upper().startswith("CREATE OR REPLACE VIEW"):
+            raise ConnectorError(
+                f'PostgreSQL execute failed: relation "{self.missing}" does not exist'
+            )
+        return super().execute(sql, params)
+
+
+class OrphanObjectReportingTests(SimpleTestCase):
+    """SQL Server keeps views/routines whose tables were dropped long ago.
+
+    They can never be created on the target, so they must be reported as
+    skipped instead of inflating the failure count of an otherwise clean run.
+    """
+
+    def _run(self, missing):
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.views = [View(name="dbo.Vw_Orphan",
+                             definition="SELECT * FROM dbo.tbl_BeneficiaryDet")]
+        source.extract_schema = Mock(return_value=schema)
+        target = _FakeViewFailureTarget(missing)
+        return MigrationOrchestrator(source, target, copy_data=False).run()
+
+    def test_view_over_a_table_missing_from_the_source_is_skipped(self):
+        report = self._run("dbo.tbl_beneficiarydet")
+        view_result = next(r for r in report.schema_results if r.kind == "view")
+        self.assertEqual(view_result.status, "skipped")
+        self.assertIn("does not exist in the source database", view_result.detail)
+        self.assertTrue(report.success)
+        self.assertEqual(report.summary["schema_failed"], 0)
+
+    def test_view_over_a_table_present_in_the_source_still_fails(self):
+        """A genuinely broken migration must not be hidden by the skip path."""
+        report = self._run("dbo.users")
+        view_result = next(r for r in report.schema_results if r.kind == "view")
+        self.assertEqual(view_result.status, "failed")
+        self.assertFalse(report.success)

@@ -2298,3 +2298,196 @@ END
         self.assertIn("n.nspname = 'dbo'", routine_grant)
         self.assertIn("p.proname = 'fn_CheckStockAvailability'", routine_grant)
         self.assertIn("GRANT EXECUTE ON ROUTINE %s TO %I", routine_grant)
+
+
+class RealWorldMigrationRegressionTests(TestCase):
+    """Shapes taken verbatim from a failed production MSSQL -> PostgreSQL run.
+
+    Each test pins one root cause that made the migration report errors so the
+    same construct can never silently regress.
+    """
+
+    def _routine(self, tsql):
+        converted, _ = translate_routine(tsql, source="procedure", target="postgres")
+        return converted
+
+    # -- identifier casing -------------------------------------------------
+    def test_audit_table_keeps_its_own_uppercase_column_casing(self):
+        """Envers-style `_AUD` tables use UPPERCASE columns while the main table
+        uses lowercase. A single global casing map rewrote one into the other and
+        every index/FK/CHECK on the audit table failed."""
+        main = Table(name="dbo.p2_beneficiary", columns=[
+            Column("id", "int", nullable=False), Column("status", "int"),
+            Column("gender", "int"),
+        ])
+        main.indexes = [Index("idx_status", ["status"])]
+        aud = Table(name="dbo.P2_BENEFICIARY_AUD", columns=[
+            Column("ID", "int", nullable=False), Column("STATUS", "int"),
+            Column("GENDER", "int"),
+        ])
+        aud.check_constraints = [
+            CheckConstraint("CK_GENDER", "([GENDER]>=(0) AND [GENDER]<=(1))")
+        ]
+        db = Database(name="P", dialect="tsql", tables=[main, aud])
+        stmts, _ = build_database_ddl(db, "postgres")
+
+        create_aud = next(s for s in stmts if "P2_BENEFICIARY_AUD" in s and s.startswith("CREATE TABLE"))
+        self.assertIn('"STATUS" INTEGER', create_aud)
+        check = next(s for s in stmts if "CK_GENDER" in s)
+        self.assertIn('"GENDER"', check)
+        self.assertNotIn('"gender"', check)
+        index = next(s for s in stmts if s.startswith("CREATE INDEX"))
+        self.assertIn('"status"', index)
+        self.assertNotIn('"STATUS"', index)
+
+    def test_view_column_casing_resolves_through_the_alias_binding(self):
+        """`b."Age"` must follow the casing of the table bound to alias `b`."""
+        ben = Table(name="dbo.p2_beneficiary", columns=[
+            Column("id", "int"), Column("age", "int"), Column("Gender", "int"),
+        ])
+        view = View(name="dbo.Vw_BenfAttdData",
+                    definition="SELECT b.Age AS Age, b.Gender FROM dbo.p2_beneficiary AS b")
+        db = Database(name="P", dialect="tsql", tables=[ben], views=[view])
+        stmts, _ = build_database_ddl(db, "postgres")
+        sql = next(s for s in stmts if "Vw_BenfAttdData" in s)
+        self.assertIn('b."age"', sql)
+        self.assertIn('b."Gender"', sql)
+
+    def test_schema_qualified_column_reference_keeps_source_casing(self):
+        """`dbo.tm_Bomas.intPayamid` folded to lowercase and broke ViewBomsList."""
+        bomas = Table(name="dbo.tm_Bomas", columns=[
+            Column("intBomasid", "int"), Column("intPayamid", "int")])
+        payams = Table(name="dbo.tm_Payams", columns=[Column("intPayamid", "int")])
+        view = View(name="dbo.ViewBomsList", definition=(
+            "SELECT dbo.tm_Bomas.intBomasid FROM dbo.tm_Bomas "
+            "INNER JOIN dbo.tm_Payams ON dbo.tm_Bomas.intPayamid = dbo.tm_Payams.intPayamid"))
+        db = Database(name="P", dialect="tsql", tables=[bomas, payams], views=[view])
+        stmts, _ = build_database_ddl(db, "postgres")
+        sql = next(s for s in stmts if "ViewBomsList" in s)
+        self.assertIn('"dbo"."tm_Bomas"."intPayamid"', sql)
+        self.assertNotIn(".intpayamid", sql)
+
+    # -- routine bodies ----------------------------------------------------
+    def test_variable_named_like_a_plpgsql_keyword_is_renamed(self):
+        """T-SQL allows @End; PL/pgSQL reserves END, so the DECLARE was invalid."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @FromDate datetime AS BEGIN\n"
+            "DECLARE @Start datetime,@End datetime\n"
+            "SET @End = @Start\n"
+            "SELECT @End = MAX(d) FROM t\n"
+            "END")
+        self.assertIn("v_End TIMESTAMP;", out)
+        self.assertIn("v_End := Start;", out)
+        self.assertIn("INTO v_End", out)
+        self.assertNotRegex(out, r"(?m)^\s*End\s")
+
+    def test_parameter_named_like_a_plpgsql_keyword_is_renamed(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.sp_generate_merge @table_name varchar(776), @from varchar(800) "
+            "AS BEGIN SET @from = @table_name END")
+        self.assertIn("v_from VARCHAR(800)", out)
+        self.assertIn("v_from := table_name;", out)
+
+    def test_declare_with_as_keyword_is_hoisted(self):
+        """`DECLARE @Count as int` was emitted verbatim inside BEGIN."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\nDECLARE @Count as int\nSET @Count = 1\nEND")
+        self.assertIn("Count INTEGER;", out)
+        self.assertNotIn("as int", out)
+
+    def test_blank_line_inside_a_select_list_does_not_split_the_statement(self):
+        """A blank line between select-list items produced `... ,;` fragments."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "SELECT DISTINCT a.id,\n"
+            "\n"
+            "(SELECT COUNT(*) FROM w WHERE w.id = a.id)\n"
+            "AS Total\n"
+            "\n"
+            "FROM dbo.a AS a\n"
+            "END")
+        body = [l for l in out.splitlines() if l.startswith("OPEN")]
+        self.assertEqual(len(body), 1)
+        self.assertNotIn(",;", out)
+        self.assertIn("FROM dbo.a AS a;", body[0])
+
+    def test_set_session_option_after_update_is_a_new_statement(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @u varchar(50) AS BEGIN\n"
+            "Update tbl_Users set password='x' where user_id=@u\n"
+            "set nocount off\nEND")
+        self.assertIn("where user_id=u;", out)
+        self.assertNotIn("set nocount", out.lower())
+
+    def test_select_after_a_complete_insert_select_starts_a_new_statement(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @ip varchar(8) AS BEGIN\n"
+            "INSERT INTO #t\nSELECT a.x FROM src a WHERE a.ip LIKE @ip\n"
+            "SELECT DISTINCT x FROM #t\nEND")
+        self.assertIn("WHERE a.ip LIKE ip;", out)
+        self.assertIn("SELECT DISTINCT x FROM t", out)
+
+    def test_body_create_table_maps_tsql_types_and_drops_trailing_comma(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "CREATE TABLE #Temp\n(\n[leave_date] datetime,\n[flag] bit,\n[note] nvarchar(max),\n)\nEND")
+        self.assertIn("CREATE TEMP TABLE Temp (", out)
+        self.assertIn('"leave_date" TIMESTAMP', out)
+        self.assertIn('"flag" BOOLEAN', out)
+        self.assertIn('"note" TEXT', out)
+        self.assertNotIn(",)", out.replace(" ", ""))
+
+    def test_table_hints_and_apply_are_translated_inside_expressions(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "select a.id from tr_Ben a WITH(NOLOCK) CROSS APPLY dbo.f(a.id) x\nEND")
+        self.assertNotIn("NOLOCK", out)
+        self.assertIn("CROSS JOIN LATERAL", out)
+
+    def test_insert_without_into_and_single_quoted_alias(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @c int AS BEGIN\n"
+            "insert #t_ctry values (@c)\n"
+            "select x as 'Cash+ FLI' from t\nEND")
+        self.assertIn("INTO t_ctry", out)
+        self.assertIn('AS "Cash+ FLI"', out)
+
+    def test_bare_alias_that_postgres_reserves_gets_an_explicit_as(self):
+        """`select pc_year Year` is valid T-SQL but a syntax error in PostgreSQL."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\nselect pc_year Year, cycle PaymentCycle FROM t\nEND")
+        self.assertIn("pc_year AS Year", out)
+        self.assertIn("cycle PaymentCycle", out)
+
+    def test_ddl_trigger_declare_is_hoisted_not_duplicated(self):
+        from engine.translators.ddl_trigger_translator import translate_ddl_trigger
+        trigger = Trigger(
+            name="trg_audit_ddl", table="", timing="AFTER", events=["ALTER_TABLE"],
+            definition=("CREATE TRIGGER trg_audit_ddl ON DATABASE FOR ALTER_TABLE AS BEGIN\n"
+                        "    DECLARE @EventData XML\n"
+                        "    SET @EventData = EVENTDATA()\n"
+                        "END"),
+            is_ddl=True, ddl_scope="database")
+        out, _ = translate_ddl_trigger(trigger, "postgres")
+        self.assertIn("DECLARE\n    EventData XML;", out)
+        self.assertEqual(out.upper().count("DECLARE"), 1)
+
+    def test_system_shipped_objects_are_never_extracted(self):
+        """Replication/CDC objects (sysextendedarticlesview, tr_MStran_* triggers)
+        read SQL Server's own catalog tables and can never exist in PostgreSQL."""
+        from engine.extractors import mssql as ex
+        for name in ("_VIEWS_SQL", "_PROCEDURES_SQL", "_FUNCTIONS_SQL",
+                     "_TRIGGERS_SQL", "_DDL_TRIGGERS_SQL"):
+            self.assertIn("is_ms_shipped = 0", getattr(ex, name),
+                          f"{name} must exclude system-shipped objects")
+
+    def test_leading_semicolon_cte_stays_attached_to_its_select(self):
+        """T-SQL authors write `;WITH x AS (...)` — the semicolon produced an
+        empty statement and detached the CTE from the SELECT that consumes it."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @id int AS BEGIN\n"
+            ";WITH dsc AS (SELECT 1 AS a)\n"
+            "SELECT a FROM dsc WHERE a = @id\n"
+            "END")
+        self.assertNotIn(";WITH", out)
+        self.assertIn("WITH dsc AS (SELECT 1 AS a) SELECT a FROM dsc WHERE a = id;", out)
