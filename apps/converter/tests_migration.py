@@ -109,6 +109,38 @@ class PostgresConnectorPaginationTests(SimpleTestCase):
         self.assertNotIn("GENERATED ALWAYS", statements[0])
         self.assertFalse(computed.is_computed)
 
+    def test_function_based_computed_column_is_downgraded_before_create_table(self):
+        computed = Column(
+            "DisplayName", "NVARCHAR(200)", is_computed=True,
+            computed_definition="CONCAT([FirstName], ' ', [LastName])",
+        )
+        table = Table(name="dbo.People", columns=[
+            Column("FirstName", "NVARCHAR(80)"),
+            Column("LastName", "NVARCHAR(80)"),
+            computed,
+        ])
+
+        statements, warnings = build_table_ddl(table, "postgres", "tsql")
+
+        self.assertNotIn("GENERATED ALWAYS", statements[0])
+        self.assertIn('"DisplayName" VARCHAR(200) DEFAULT NULL', statements[0])
+        self.assertFalse(computed.is_computed)
+        self.assertTrue(any("plain nullable column" in warning for warning in warnings), warnings)
+
+    def test_pure_arithmetic_computed_column_remains_generated(self):
+        computed = Column(
+            "LineTotal", "DECIMAL(18,2)", is_computed=True,
+            computed_definition="([Quantity] * [UnitPrice])",
+        )
+        table = Table(name="dbo.Lines", columns=[
+            Column("Quantity", "INT"), Column("UnitPrice", "DECIMAL(18,2)"), computed,
+        ])
+
+        statements, _warnings = build_table_ddl(table, "postgres", "tsql")
+
+        self.assertIn("GENERATED ALWAYS AS", statements[0])
+        self.assertTrue(computed.is_computed)
+
     def test_copy_batch_size_is_large_for_narrow_tables_and_bounded_for_lobs(self):
         narrow = Table("dbo.Attendance", [Column("Id", "BIGINT"), Column("Day", "DATE")])
         wide = Table("dbo.Attachments", [Column("Id", "BIGINT"), Column("Payload", "VARBINARY(MAX)")])

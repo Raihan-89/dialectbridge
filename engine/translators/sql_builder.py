@@ -992,8 +992,8 @@ def _select_end(after: str) -> int:
     return len(after)
 
 
-# Functions that are not IMMUTABLE in PostgreSQL and therefore cannot appear
-# in a generated column's generation expression.
+# Functions known to be non-IMMUTABLE in PostgreSQL and therefore forbidden
+# in generated-column expressions.
 _NON_IMMUTABLE_FUNC_RE = re.compile(
     r"\b(?:GETDATE|GETUTCDATE|SYSDATETIME|SYSUTCDATETIME|SYSDATETIMEOFFSET|"
     r"CURRENT_TIMESTAMP|NOW|CURRENT_TIME|CURRENT_DATE|LOCALTIME|LOCALTIMESTAMP|"
@@ -1004,14 +1004,18 @@ _NON_IMMUTABLE_FUNC_RE = re.compile(
 
 
 def _expr_is_immutable(expr: str) -> bool:
-    """Heuristic: True if an expression contains no known non-immutable calls.
+    """Conservatively decide whether PostgreSQL will accept a generated expression.
 
-    PostgreSQL generated columns require IMMUTABLE expressions; T-SQL computed
-    columns routinely use GETDATE()/NEWID(), which would abort the whole table
-    DDL with ``generation expression is not immutable``. Column references,
-    literals, arithmetic, CASE, and deterministic functions are unaffected.
+    Absence from a volatile-function blacklist is not proof of immutability:
+    common T-SQL computed expressions translate to PostgreSQL ``concat()``,
+    ``to_char()`` or type-output casts that are STABLE rather than IMMUTABLE.
+    PostgreSQL then rejects the entire CREATE TABLE. Pure column/literal
+    arithmetic and CASE expressions are safe; any function/cast call that has
+    not been explicitly proven safe is migrated as a regular copied column.
     """
-    return not _NON_IMMUTABLE_FUNC_RE.search(expr)
+    if _NON_IMMUTABLE_FUNC_RE.search(expr):
+        return False
+    return re.search(r"\b[A-Za-z_][A-Za-z0-9_.]*\s*\(", expr) is None
 
 
 def _translate_top(text: str) -> str:
