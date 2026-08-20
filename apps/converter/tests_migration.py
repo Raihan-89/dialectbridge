@@ -509,3 +509,53 @@ class ParallelCopyTests(SimpleTestCase):
         failed = [r for r in report.data_results if r.status == "failed"]
         self.assertEqual(len(failed), 2)
         self.assertIn("boom", failed[0].detail)
+
+
+class TableDurationReportingTests(SimpleTestCase):
+    """The UI showed the running table as `29685080m 17s`: it subtracted a
+    monotonic() reading from the browser's epoch clock. The elapsed time is now
+    computed where the monotonic base is known."""
+
+    def _capture(self):
+        samples = []
+
+        def callback(pct, stage, data=None):
+            for name, entry in ((data or {}).get("table_progress") or {}).items():
+                if "elapsed_seconds" in entry:
+                    samples.append((name, entry["elapsed_seconds"], entry.get("done")))
+
+        source = _FakeConnector({"dbo.a": [(1, "x")], "dbo.b": [(2, "y")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        MigrationOrchestrator(source, target, copy_data=True,
+                              progress_callback=callback).run()
+        return samples
+
+    def test_every_table_reports_a_plausible_duration(self):
+        samples = self._capture()
+        self.assertTrue(samples, "no per-table elapsed times were emitted")
+        self.assertEqual({name for name, _, _ in samples}, {"dbo.a", "dbo.b"})
+        for name, elapsed, _done in samples:
+            self.assertGreaterEqual(elapsed, 0.0, name)
+            # A monotonic/epoch mix-up lands around 1.7e9 seconds.
+            self.assertLess(elapsed, 600, f"{name} reported {elapsed}s")
+
+    def test_finished_tables_freeze_their_duration(self):
+        samples = self._capture()
+        done = [(n, e) for n, e, d in samples if d]
+        self.assertTrue(done)
+        for name, elapsed in done:
+            self.assertLess(elapsed, 600, f"{name} reported {elapsed}s")
+
+    def test_elapsed_is_the_finished_span_once_a_table_is_done(self):
+        progress = {
+            "dbo.a": {"table_started": 100.0, "table_finished": 142.5, "done": True},
+            "dbo.b": {"table_started": 200.0, "done": False},
+        }
+        MigrationOrchestrator._stamp_elapsed(progress)
+        self.assertEqual(progress["dbo.a"]["elapsed_seconds"], 42.5)
+        self.assertGreaterEqual(progress["dbo.b"]["elapsed_seconds"], 0.0)
+
+    def test_entries_without_a_start_are_left_alone(self):
+        progress = {"dbo.a": {"rows_copied": 0}}
+        MigrationOrchestrator._stamp_elapsed(progress)
+        self.assertNotIn("elapsed_seconds", progress["dbo.a"])

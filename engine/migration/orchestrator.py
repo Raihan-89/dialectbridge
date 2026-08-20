@@ -135,10 +135,32 @@ class MigrationOrchestrator:
         if self.progress_callback:
             self.progress_callback(percent, stage)
 
+    @staticmethod
+    def _stamp_elapsed(table_progress: dict) -> None:
+        """Attach each table's copy duration in seconds.
+
+        ``table_started``/``table_finished`` come from ``monotonic()``, which is
+        the right base for measuring a duration but is not a wall clock. The UI
+        cannot subtract the browser's epoch time from it — doing so reported the
+        running table as ~56 years old. Only this side knows the monotonic base,
+        so the elapsed time is computed here and sent ready to display.
+        """
+        now = monotonic()
+        for entry in table_progress.values():
+            started = entry.get("table_started")
+            if started is None:
+                continue
+            finished = entry.get("table_finished")
+            end = finished if (entry.get("done") and finished is not None) else now
+            entry["elapsed_seconds"] = round(max(0.0, end - started), 3)
+
     def _progress_phase(self, base: float, weight: float, stage: str, **extra) -> None:
         """Emit progress as a weighted mix across the overall pipeline."""
         pct = min(100, max(0, int(base + weight)))
         if self.progress_callback:
+            table_progress = extra.get("table_progress")
+            if table_progress:
+                self._stamp_elapsed(table_progress)
             data = {"percent": pct, "stage": stage, **extra}
             self.progress_callback(pct, stage, data=data)
 
