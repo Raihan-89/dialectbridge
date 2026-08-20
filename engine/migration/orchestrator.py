@@ -111,13 +111,17 @@ def _is_fk_or_check(stmt: str) -> bool:
 
 class MigrationOrchestrator:
     def __init__(self, source, target, copy_data: bool = True, reset_target: bool = False,
-                 progress_callback=None, cancel_check=None):
+                 progress_callback=None, cancel_check=None, parallel_workers: int = 1):
         self.source = source
         self.target = target
         self.copy_data = copy_data
         self.reset_target = reset_target
         self.progress_callback = progress_callback
         self.cancel_check = cancel_check
+        # 1 keeps the original single-connection loop. Higher values copy that
+        # many tables at once in worker processes; the caller decides because
+        # only it knows whether the connectors can be rebuilt in a child.
+        self.parallel_workers = max(1, int(parallel_workers or 1))
         self._table_progress: dict = {}
         self._source_objects: set[str] = set()
 
@@ -263,6 +267,11 @@ class MigrationOrchestrator:
                                      current_table=table_name, current_table_rows=rows_so_far,
                                      current_table_total=total_expected,
                                      table_progress=self._table_progress)
+
+            if self.parallel_workers > 1 and total_to_copy > 1 and self._copy_tables_parallel(
+                report, tables_to_copy, _on_table_batch
+            ):
+                tables_to_copy = []          # handled by the worker pool
 
             for idx, table in enumerate(tables_to_copy, 1):
                 self._check_cancelled()
@@ -488,12 +497,66 @@ class MigrationOrchestrator:
                 for retry_stmt in retry_stmts:
                     self._apply(report, "table", retry_stmt, object_name=table.name)
 
-    def _copy_table(self, report: MigrationReport, table, on_batch=None) -> None:
-        started = monotonic()
-        mover = DataMigration(self.source, self.target, table, progress_callback=on_batch)
-        result = mover.run()
+    def _copy_tables_parallel(self, report: MigrationReport, tables, on_batch) -> bool:
+        """Copy every table across a process pool.
+
+        Returns True when the pool handled the tables, False when the caller
+        should fall back to the sequential loop. A failure to *start* the pool
+        is never fatal — the migration simply proceeds as it always did.
+        """
+        from engine.migration.parallel_copy import (
+            ParallelCopyUnavailable, copy_tables,
+        )
+
+        total = len(tables)
+        for index, table in enumerate(tables, 1):
+            self._table_progress[table.name] = {
+                "index": index, "rows_copied": 0, "done": False,
+                "table_started": monotonic(),
+            }
+
+        def _progress(table_name, rows_so_far, batch_rows, total_expected):
+            entry = self._table_progress.setdefault(table_name, {})
+            entry["rows_copied"] = rows_so_far
+            entry["current_batch"] = batch_rows
+            if total_expected is not None:
+                entry["total_rows"] = total_expected
+
+        def _done(table_name, result, error):
+            self._check_cancelled()
+            entry = self._table_progress.setdefault(table_name, {})
+            entry["done"] = True
+            entry["table_finished"] = monotonic()
+            if error is not None:
+                result = {"rows_copied": 0, "rows_failed": 0, "errors": [error]}
+            entry["rows_copied"] = result["rows_copied"]
+            self._record_copy_result(report, table_name, result,
+                                     entry.get("table_started", monotonic()))
+            finished = sum(1 for v in self._table_progress.values() if v.get("done"))
+            self._progress_phase(
+                35, (finished / max(total, 1)) * 40,
+                f"Copied {finished}/{total} tables",
+                tables_copied=finished, total_tables=total,
+                current_table=table_name, current_table_rows=entry["rows_copied"],
+                table_progress=self._table_progress,
+            )
+
+        try:
+            copy_tables(self.source, self.target, tables,
+                        self.parallel_workers, _progress, _done)
+        except ParallelCopyUnavailable as exc:
+            logger.warning("Parallel copy unavailable (%s) — using a single connection", exc)
+            for entry in self._table_progress.values():
+                entry["done"] = False
+            return False
+        logger.info("Parallel copy finished tables=%d workers=%d", total, self.parallel_workers)
+        return True
+
+    def _record_copy_result(self, report: MigrationReport, table_name: str,
+                            result: dict, started: float) -> None:
+        """Fold one table's copy summary into the report (shared by both paths)."""
         obj = ObjectResult(
-            kind="data", name=table.name,
+            kind="data", name=table_name,
             status="success" if not result["errors"] else "failed",
             rows_copied=result["rows_copied"], rows_failed=result["rows_failed"],
             detail="; ".join(result["errors"][:3]),
@@ -502,13 +565,18 @@ class MigrationOrchestrator:
         if obj.status == "failed":
             logger.error(
                 "Table copy failed table=%s rows_copied=%d rows_failed=%d error=%s",
-                table.name, obj.rows_copied, obj.rows_failed, obj.detail,
+                table_name, obj.rows_copied, obj.rows_failed, obj.detail,
             )
         else:
             logger.info(
                 "Table copied table=%s rows=%d duration_seconds=%.1f",
-                table.name, obj.rows_copied, monotonic() - started,
+                table_name, obj.rows_copied, monotonic() - started,
             )
+
+    def _copy_table(self, report: MigrationReport, table, on_batch=None) -> None:
+        started = monotonic()
+        mover = DataMigration(self.source, self.target, table, progress_callback=on_batch)
+        self._record_copy_result(report, table.name, mover.run(), started)
 
     def _missing_source_dependency(self, message: str) -> str | None:
         """Return the referenced object when the failure is caused by something

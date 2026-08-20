@@ -97,9 +97,14 @@ class MSSQLConnector(DatabaseConnector):
         last_key: tuple | None = None
 
         def _convert(rows):
-            """Repair bigint columns some TDS drivers return as raw bytes."""
+            """Repair bigint columns some TDS drivers return as raw bytes.
+
+            When no column can need repair the driver's rows are handed on
+            untouched — rebuilding every row into a fresh list cost one
+            allocation per row for no benefit.
+            """
             if not int_positions:
-                return [list(row) for row in rows]
+                return rows
             out = []
             for row in rows:
                 row = list(row)

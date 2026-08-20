@@ -5,11 +5,16 @@ Builds live connectors from saved DatabaseConnection records, runs the
 MigrationOrchestrator, and turns its report into plain dicts for storage
 and the API.
 """
+import logging
+import os
+
 from engine.connectors.base import ConnectorError
 from engine.connectors import build_connector
 from engine.migration.orchestrator import MigrationOrchestrator
 from engine.translators.sql_builder import build_database_ddl
 from .models import DatabaseConnection, MigrationError, MigrationJob
+
+logger = logging.getLogger("dialectbridge.migration")
 
 
 def connector_for(connection: DatabaseConnection):
@@ -34,9 +39,26 @@ def test_connection(connection: DatabaseConnection) -> dict:
         connector.close()
 
 
+def _default_copy_workers() -> int:
+    """How many tables to copy at once.
+
+    Row building and COPY formatting are CPU-bound Python, so worker processes
+    scale nearly linearly while threads do not. Half the cores (capped at 4)
+    leaves headroom for the two database servers, which usually share the box.
+    """
+    override = os.environ.get("DIALECTBRIDGE_COPY_WORKERS")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            logger.warning("Ignoring invalid DIALECTBRIDGE_COPY_WORKERS=%r", override)
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
 def run_migration(source: DatabaseConnection, target: DatabaseConnection,
                   copy_data: bool = True, reset_target: bool = False,
-                  progress_callback=None, cancel_check=None) -> dict:
+                  progress_callback=None, cancel_check=None,
+                  parallel_workers: int | None = None) -> dict:
     """Run a full migration and return the serialized report dict.
 
     ``cancel_check`` is a zero-arg callable returning True when the user
@@ -44,10 +66,12 @@ def run_migration(source: DatabaseConnection, target: DatabaseConnection,
     """
     source_conn = connector_for(source)
     target_conn = connector_for(target)
+    workers = _default_copy_workers() if parallel_workers is None else parallel_workers
     try:
         report = MigrationOrchestrator(
             source_conn, target_conn, copy_data=copy_data, reset_target=reset_target,
             progress_callback=progress_callback, cancel_check=cancel_check,
+            parallel_workers=workers,
         ).run()
         return report.to_dict()
     finally:

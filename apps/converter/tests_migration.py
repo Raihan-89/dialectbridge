@@ -442,3 +442,70 @@ class CopyStreamRenderingTests(SimpleTestCase):
             out.append(chunk)
         self.assertEqual("".join(out), expected)
         self.assertEqual(stream.rows_read, 900)
+
+
+class ParallelCopyTests(SimpleTestCase):
+    """Copying tables in worker processes must stay strictly optional: any
+    connector that cannot be rebuilt in a child falls back to the original
+    single-connection loop rather than failing the migration."""
+
+    def test_connector_spec_rejects_a_connector_it_cannot_rebuild(self):
+        from engine.migration.parallel_copy import ParallelCopyUnavailable, connector_spec
+        with self.assertRaises(ParallelCopyUnavailable):
+            connector_spec(_FakeConnector({}, dialect="tsql"))
+
+    def test_connector_spec_captures_real_connection_parameters(self):
+        from engine.migration.parallel_copy import connector_spec
+        connector = PostgresConnector(host="h", port=5432, database="d",
+                                      user="u", password="p")
+        module, qualname, host, port, database, user, password = connector_spec(connector)
+        self.assertEqual((module, qualname), ("engine.connectors.postgres", "PostgresConnector"))
+        self.assertEqual((host, port, database, user, password), ("h", 5432, "d", "u", "p"))
+
+    def test_unusable_connectors_fall_back_to_the_sequential_copy(self):
+        source = _FakeConnector({"dbo.a": [(1, "x")], "dbo.b": [(2, "y")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+
+        report = MigrationOrchestrator(source, target, copy_data=True,
+                                       parallel_workers=4).run()
+
+        self.assertTrue(report.success)
+        self.assertEqual({r.name for r in report.data_results}, {"dbo.a", "dbo.b"})
+        self.assertEqual(sum(r.rows_copied for r in report.data_results), 2)
+
+    def test_default_worker_count_is_bounded_and_overridable(self):
+        from apps.converter.migration_service import _default_copy_workers
+        self.assertGreaterEqual(_default_copy_workers(), 1)
+        self.assertLessEqual(_default_copy_workers(), 4)
+        with patch.dict("os.environ", {"DIALECTBRIDGE_COPY_WORKERS": "7"}):
+            self.assertEqual(_default_copy_workers(), 7)
+        with patch.dict("os.environ", {"DIALECTBRIDGE_COPY_WORKERS": "nonsense"}):
+            self.assertLessEqual(_default_copy_workers(), 4)
+
+    def test_a_single_worker_keeps_the_original_sequential_path(self):
+        source = _FakeConnector({"dbo.a": [(1, "x")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        orchestrator = MigrationOrchestrator(source, target, copy_data=True)
+        self.assertEqual(orchestrator.parallel_workers, 1)
+        with patch.object(orchestrator, "_copy_tables_parallel") as parallel:
+            orchestrator.run()
+        parallel.assert_not_called()
+
+    def test_worker_failure_is_reported_against_the_table_not_raised(self):
+        """A crash inside a worker must surface as a failed table."""
+        source = _FakeConnector({"dbo.a": [(1, "x")], "dbo.b": [(2, "y")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        orchestrator = MigrationOrchestrator(source, target, copy_data=True,
+                                             parallel_workers=2)
+
+        def _fake_copy(src, tgt, tables, workers, on_progress, on_done):
+            for table in tables:
+                on_done(table.name, None, "ConnectorError: boom")
+
+        with patch("engine.migration.parallel_copy.copy_tables", _fake_copy):
+            report = orchestrator.run()
+
+        self.assertFalse(report.success)
+        failed = [r for r in report.data_results if r.status == "failed"]
+        self.assertEqual(len(failed), 2)
+        self.assertIn("boom", failed[0].detail)
