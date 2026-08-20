@@ -96,6 +96,20 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
             and not declared_return_columns and len(declared_tables) == 1):
         return_table_name, declared_return_columns, start, end = declared_tables[0]
         body = body[:start] + body[end:]
+    else:
+        # PostgreSQL has no SQL Server table variables. They are local to the
+        # routine invocation, which maps cleanly to transaction-local temp
+        # tables. Replace the balanced declaration before line parsing so it
+        # cannot be mistaken for a scalar variable of type TABLE.
+        for table_name, columns, start, end in reversed(declared_tables):
+            column_sql = ", ".join(
+                f'"{column_name}" {data_type}'
+                for column_name, data_type in columns
+            )
+            replacement = (
+                f"CREATE TEMP TABLE {table_name} ({column_sql}) ON COMMIT DROP;"
+            )
+            body = body[:start] + replacement + body[end:]
 
     params, param_warns = _parse_params(param_text, "tsql")
     warnings.extend(param_warns)
@@ -1296,9 +1310,10 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
         if all_handled:
             return None
 
-    # DECLARE @x TABLE (...) — table variable declaration (skip, must be converted to temp table)
+    # A malformed/unparseable table declaration must not be emitted as a
+    # scalar variable. Balanced declarations are converted before this stage.
     if re.match(r"^DECLARE\s+@[\w]+\s+TABLE\s*\(", line, re.IGNORECASE):
-        warnings.append("Table variable declaration — ensure a CREATE TEMP TABLE precedes it")
+        warnings.append("Table variable declaration could not be parsed safely")
         return None
 
     # SET @x = expr
@@ -1364,22 +1379,23 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
     if m:
         return f"PERFORM pg_sleep({_delay_to_seconds(m.group(1))});"
 
-    # result-returning SELECT -> RETURN QUERY
+    # SELECT fields INTO #temp FROM ... creates the temporary table in T-SQL.
+    # PostgreSQL expresses the same operation as CREATE TEMP TABLE ... AS.
+    select_into = re.match(
+        r"^SELECT\s+(.*?)\s+INTO\s+\[?#([\w\d_]+)\]?\s*(.*)$",
+        line, re.IGNORECASE | re.DOTALL,
+    )
+    if select_into:
+        select_list, table_name, tail = select_into.groups()
+        query = f"SELECT {select_list} {tail}".strip()
+        return f"CREATE TEMP TABLE {table_name} ON COMMIT DROP AS {_expr(query)};"
+
+    # result-returning SELECT -> RETURN QUERY. This must follow SELECT INTO,
+    # which creates a table rather than returning a result set.
     if returns_set and re.match(r"^SELECT\b", line, re.IGNORECASE) and not re.match(r"^SELECT\s+INTO\b", line, re.IGNORECASE):
         return f"RETURN QUERY {_expr(line)};"
-
-    # SELECT ... INTO #temp / INSERT INTO #temp
-    if re.match(r"^SELECT\s+.*\s+INTO\s+(\[?#[\w\d_]+\]?)", line, re.IGNORECASE | re.DOTALL):
-        tmp = re.search(r"\bINTO\s+\[?#([\w\d_]+)\]?", line, re.IGNORECASE)
-        line = re.sub(r"\bINTO\s+\[?#([\w\d_]+)\]?", r"INTO \1", line, flags=re.IGNORECASE)
-        if tmp and f"Temp table '{tmp.group(1).lower()}'" not in warnings:
-            warnings.append(f"Temp table '{tmp.group(1).lower()}' — ensure CREATE TEMP TABLE precedes it")
-        return _expr(line) + ";"
     if re.match(r"^INSERT\s+INTO\s+\[?#[\w\d_]+\]?", line, re.IGNORECASE):
-        tmp = re.search(r"\[?#([\w\d_]+)\]?", line)
         line = re.sub(r"\[?#([\w\d_]+)\]?", r"\1", line)
-        if tmp and f"Temp table '{tmp.group(1).lower()}'" not in warnings:
-            warnings.append(f"Temp table '{tmp.group(1).lower()}' — ensure CREATE TEMP TABLE precedes it")
         return _expr(line) + ";"
 
     # EXEC(SQL) or EXECUTE(SQL) — dynamic SQL execution

@@ -943,6 +943,45 @@ END
         self.assertIn("CREATE TEMP TABLE Temp ();", conv)
         self.assertNotIn("();;", conv)
 
+    def test_table_variable_becomes_transaction_local_temp_table(self):
+        proc = """
+CREATE PROCEDURE dbo.BuildReport
+AS
+BEGIN
+    DECLARE @WorkDays TABLE
+    (
+        [WorkId] int NOT NULL,
+        [Amount] decimal(18,2) NULL
+    );
+    INSERT INTO @WorkDays (WorkId, Amount) VALUES (1, 10.50);
+END
+"""
+        conv, warnings = translate_routine(proc, source="procedure", target="postgres")
+
+        self.assertIn(
+            'CREATE TEMP TABLE WorkDays ("WorkId" INTEGER, "Amount" NUMERIC(18,2)) ON COMMIT DROP;',
+            conv,
+        )
+        self.assertIn("INSERT INTO WorkDays", conv)
+        self.assertFalse(any("Table variable" in warning for warning in warnings), warnings)
+
+    def test_select_into_hash_table_becomes_create_temp_table_as(self):
+        proc = """
+CREATE PROCEDURE dbo.BuildReport
+AS
+BEGIN
+    SELECT WorkId, Amount INTO #WageDetails FROM dbo.Payments;
+    SELECT * FROM #WageDetails;
+END
+"""
+        conv, warnings = translate_routine(proc, source="procedure", target="postgres")
+
+        self.assertIn(
+            "CREATE TEMP TABLE WageDetails ON COMMIT DROP AS SELECT WorkId, Amount FROM dbo.Payments;",
+            conv,
+        )
+        self.assertFalse(any("Temp table" in warning for warning in warnings), warnings)
+
     def test_table_function_never_emits_invalid_returns_placeholder(self):
         fn = """
 CREATE FUNCTION dbo.ListProducts()
