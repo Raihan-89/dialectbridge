@@ -1015,6 +1015,22 @@ END
         self.assertNotIn("DECLARE @t_ctry", conv)
         self.assertFalse(any("Type 'TABLE'" in warning for warning in warnings), warnings)
 
+    def test_table_function_rewrites_insert_values_without_into(self):
+        fn = """
+CREATE FUNCTION dbo.sfPBI_SEA_DBrd(@ctry int)
+RETURNS @t_ctry TABLE ([country_id] int)
+AS
+BEGIN
+    INSERT @t_ctry VALUES (@ctry);
+    RETURN;
+END
+"""
+        conv, warnings = translate_routine(fn, source="function", target="postgres")
+
+        self.assertIsNotNone(conv, warnings)
+        self.assertIn("RETURN QUERY SELECT ctry;", conv)
+        self.assertNotIn("INSERT t_ctry", conv)
+
     def test_multiline_if_condition_with_comment(self):
         fn = """
 CREATE PROCEDURE dbo.sp_Check(@id int)
@@ -2063,6 +2079,23 @@ END""",
         self.assertNotIn("SET ANSI_NULLS", statements[0])
         self.assertNotIn("SET QUOTED_IDENTIFIER", statements[0])
         self.assertIn("RAISE NOTICE 'changed';", statements[0])
+
+    def test_tsql_ddl_trigger_converts_eventdata_set_assignment(self):
+        db = self._base_tsql()
+        db.triggers = [Trigger(
+            name="tr_MStran_droptable", table=None, timing="AFTER",
+            events=["DROP_TABLE"],
+            definition=(
+                "CREATE TRIGGER tr_MStran_droptable ON DATABASE FOR DROP_TABLE "
+                "AS BEGIN DECLARE @EventData xml; SET @EventData = EVENTDATA(); END"
+            ),
+            is_ddl=True, ddl_scope="database",
+        )]
+
+        statements, _warnings = build_database_ddl(db, "postgres")
+
+        self.assertIn("EventData := TG_TAG;", statements[0])
+        self.assertNotIn("set EventData=TG_TAG", statements[0])
 
     def test_event_trigger_to_tsql_ddl_trigger(self):
         db = self._base_postgres()

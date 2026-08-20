@@ -4,6 +4,19 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 from pathlib import Path
+import re
+
+
+class ExcludeMigrationStatusPolls(logging.Filter):
+    """Keep browser progress polling out of the persistent application log."""
+
+    _status_request = re.compile(r'"GET /migrate/\d+/status/(?:\?[^ ]*)? HTTP/')
+
+    def filter(self, record):
+        return not (
+            record.name == "django.server"
+            and self._status_request.search(record.getMessage())
+        )
 
 
 class DailyFileHandler(logging.FileHandler):

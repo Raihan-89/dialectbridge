@@ -34,6 +34,7 @@ from engine.translators.procedure_translator import (
     _transform_plpgsql_body,
     _transform_tsql_body,
 )
+from engine.translators.sql_builder import convert_type
 from engine.translators.trigger_translator import _translate_raiseerror
 
 # PG event triggers whose WHEN TAG list is NOT captured by the extractor: map
@@ -93,13 +94,20 @@ def _tsql_ddl_trigger_to_pg(trigger: Trigger) -> tuple[str | None, list[str]]:
     def statement_fn(line, declared, warns, returns_set):
         return _ddl_statement(line, declared, warns, returns_set, warnings)
 
-    lines, body_warnings, _ = _transform_tsql_body(body, "trigger", False, statement_fn=statement_fn)
+    lines, body_warnings, declared = _transform_tsql_body(
+        body, "trigger", False, statement_fn=statement_fn,
+    )
     warnings.extend(body_warnings)
 
     fn_name = f"{trigger.name}_ddl_fn"
+    declaration = ""
+    if declared:
+        declaration = "DECLARE\n" + "\n".join(
+            f"    {name} {data_type};" for name, data_type in declared.items()
+        ) + "\n"
     function = (
         f"CREATE OR REPLACE FUNCTION {fn_name}() RETURNS event_trigger AS $$\n"
-        f"BEGIN\n" + "\n".join("    " + ln for ln in lines) + "\n"
+        f"{declaration}BEGIN\n" + "\n".join("    " + ln for ln in lines) + "\n"
         f"END;\n"
         f"$$ LANGUAGE plpgsql;"
     )
@@ -136,6 +144,25 @@ def _ddl_statement(line: str, declared: dict[str, str], warns: list[str],
                    returns_set: bool, ddl_warnings: list[str]) -> str | None:
     stripped = line.strip()
     upper = stripped.upper()
+    # SQL Server metadata often stores the declaration and first SET on one
+    # physical line. Pull declarations into the function's DECLARE section
+    # before translating the remaining statement.
+    while True:
+        declaration = re.match(
+            r"^DECLARE\s+@?([A-Za-z_]\w*)\s+(?:AS\s+)?([\w.]+(?:\s*\([^;]+?\))?)\s*;\s*(.*)$",
+            stripped,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not declaration:
+            break
+        data_type, warning = convert_type(declaration.group(2), "tsql", "postgres")
+        declared[declaration.group(1)] = data_type
+        if warning:
+            warns.append(warning)
+        stripped = declaration.group(3).strip()
+        if not stripped:
+            return None
+    upper = stripped.upper()
     # OBJECT_DEFINITION from replication/system DDL triggers can include
     # several SQL Server session options on the same physical line before the
     # real body statement. They are creation metadata, not executable logic.
@@ -171,6 +198,14 @@ def _ddl_statement(line: str, declared: dict[str, str], warns: list[str],
         )
     stmt = re.sub(r"EVENTDATA\s*\(\s*\)\.value\s*\([^)]*\)", "TG_TAG", stmt, flags=re.IGNORECASE)
     stmt = re.sub(r"EVENTDATA\s*\(\s*\)", "TG_TAG", stmt, flags=re.IGNORECASE)
+    # T-SQL SET assignments are PL/pgSQL assignments.  Leaving SET here makes
+    # PostgreSQL interpret the variable name as a configuration parameter.
+    stmt = re.sub(
+        r"^SET\s+@?([A-Za-z_]\w*)\s*=\s*(.+)$",
+        lambda match: f"{match.group(1)} := {match.group(2)}",
+        stmt,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     stmt = re.sub(r"^PRINT\s+", "RAISE NOTICE ", stmt, flags=re.IGNORECASE)
     stmt = _translate_raiseerror(stmt)
     stmt = _expr(stmt)

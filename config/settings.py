@@ -142,6 +142,11 @@ LOGGING = {
             'style': '{',
         },
     },
+    'filters': {
+        'exclude_migration_status_polls': {
+            '()': 'config.logging.ExcludeMigrationStatusPolls',
+        },
+    },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
@@ -156,6 +161,7 @@ LOGGING = {
             'encoding': 'utf-8',
             'formatter': 'standard',
             'level': 'INFO',
+            'filters': ['exclude_migration_status_polls'],
         },
     },
     'loggers': {

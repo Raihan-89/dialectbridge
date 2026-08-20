@@ -1225,9 +1225,6 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
         # names here corrupts SELECT aliases (Category -> dbo.Category).
         return text
 
-    masked, stash = _mask(text)
-    masked = _qualify_table_refs(masked, [t.name for t in tables], target)
-
     col_casing: dict[str, str] = {}
     for table in tables:
         for col in table.columns:
@@ -1242,7 +1239,7 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
         if canon and canon != col_name:
             return f'{prefix}"{canon}"'
         return m.group(0)
-    masked = re.sub(r'(?:(\w+)\.)"([A-Za-z_]\w*)"', _fix_quoted_col_casing, masked)
+    text = re.sub(r'(?:(\w+)\.)"([A-Za-z_]\w*)"', _fix_quoted_col_casing, text)
     # Also handle standalone quoted columns: "Age" -> "age"
     def _fix_standalone_quoted_casing(m):
         col_name = m.group(1)
@@ -1250,7 +1247,10 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
         if canon and canon != col_name:
             return f'"{canon}"'
         return m.group(0)
-    masked = re.sub(r'(?<![\w.])"([A-Za-z_]\w*)"(?![.\w(])', _fix_standalone_quoted_casing, masked)
+    text = re.sub(r'(?<![\w.])"([A-Za-z_]\w*)"(?![.\w(])', _fix_standalone_quoted_casing, text)
+
+    masked, stash = _mask(text)
+    masked = _qualify_table_refs(masked, [t.name for t in tables], target)
 
     # Bare references to a function's own parameters must stay unquoted so
     # PL/pgSQL resolves them as variables rather than ambiguous columns.

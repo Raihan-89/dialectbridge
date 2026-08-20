@@ -270,6 +270,14 @@ def _rewrite_return_table_writes(transformed: list[str], table_name: str,
         if match:
             output.append(f"RETURN QUERY {match.group(1)};")
             continue
+        values_match = re.match(
+            rf'^INSERT(?:\s+INTO)?\s+"?{target}"?\s*(?:\([^)]*\))?\s+'
+            rf'VALUES\s*\((.*)\);$',
+            statement, re.IGNORECASE | re.DOTALL,
+        )
+        if values_match:
+            output.append(f"RETURN QUERY SELECT {values_match.group(1)};")
+            continue
         if re.search(rf'\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?{target}"?\b',
                      statement, re.IGNORECASE):
             warnings.append(
