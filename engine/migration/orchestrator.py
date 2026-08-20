@@ -180,7 +180,7 @@ class MigrationOrchestrator:
             logger.warning("Schema conversion completed with %d warning(s)", len(conv_warnings))
 
         # ---- 3. apply structural DDL -----------------------------------------
-        self._progress_phase(20, 10, "Creating schemas, tables, and indexes",
+        self._progress_phase(20, 10, "Creating schemas and tables",
                              total_tables=total_tables)
         schemas = sorted({name.split(".")[0] for t in schema.tables for name in (t.name,)})
 
@@ -219,10 +219,13 @@ class MigrationOrchestrator:
                                  tables_created=idx, total_tables=total_tables)
             self._apply_table(report, schema, table)
 
-        structural = [s for s in ddl if _is_structural(s)]
-        for stmt in structural:
-            if not stmt.lstrip().upper().startswith("CREATE TABLE"):
-                self._apply(report, "index", stmt)
+        # Indexes are deliberately deferred until after COPY. Building them on
+        # empty tables and then dropping/recreating them around the load adds
+        # work and makes large migrations slower without improving safety.
+        deferred_indexes = [
+            stmt for stmt in ddl
+            if _is_structural(stmt) and not stmt.lstrip().upper().startswith("CREATE TABLE")
+        ]
 
         # ---- 4. copy data -----------------------------------------------------
         self._table_progress = {}
@@ -279,6 +282,20 @@ class MigrationOrchestrator:
                                      current_table=table.name,
                                      current_table_rows=self._table_progress[table.name]["rows_copied"],
                                      table_progress=self._table_progress)
+
+        # Build each index once, after bulk data loading.
+        if deferred_indexes:
+            self._progress_phase(75, 4, "Creating indexes after data load",
+                                 total_indexes=len(deferred_indexes))
+            for idx, stmt in enumerate(deferred_indexes, 1):
+                self._check_cancelled()
+                self._apply(report, "index", stmt)
+                if idx % 10 == 0 or idx == len(deferred_indexes):
+                    self._progress_phase(
+                        75, (idx / len(deferred_indexes)) * 4,
+                        f"Creating indexes {idx}/{len(deferred_indexes)}",
+                        indexes_created=idx, total_indexes=len(deferred_indexes),
+                    )
 
         # ---- 5. referential + object DDL ---------------------------------------
         self._progress_phase(75, 8, "Creating constraints, views, routines, and triggers",

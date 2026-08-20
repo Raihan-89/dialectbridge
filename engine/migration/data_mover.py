@@ -24,20 +24,33 @@ from engine.connectors.base import ConnectorError
 from engine.schema import Table
 
 _INT_TYPES = {"BIGINT", "INT", "SMALLINT", "TINYINT"}
+_WIDE_TYPE_MARKERS = ("BINARY", "IMAGE", "BYTEA", "TEXT", "NTEXT", "XML", "MAX")
+_DEFAULT_COPY_BATCH_SIZE = 25_000
+_WIDE_COPY_BATCH_SIZE = 5_000
 
 
 class DataMigration:
-    def __init__(self, source, target, table: Table, batch_size: int = 5000,
+    def __init__(self, source, target, table: Table, batch_size: int | None = None,
                  progress_callback=None):
         self.source = source
         self.target = target
         self.table = table
-        self.batch_size = batch_size
+        self.batch_size = batch_size or self._recommended_batch_size()
         self.progress_callback = progress_callback
         self.rows_copied = 0
         self.rows_skipped = 0
         self.rows_failed = 0
         self.errors: list[str] = []
+
+    def _recommended_batch_size(self) -> int:
+        """Use fewer round trips for narrow fact tables without allowing
+        image/LOB batches to consume excessive memory."""
+        has_wide_values = any(
+            any(marker in column.data_type.upper() for marker in _WIDE_TYPE_MARKERS)
+            for column in self.table.columns
+            if not column.is_computed
+        )
+        return _WIDE_COPY_BATCH_SIZE if has_wide_values else _DEFAULT_COPY_BATCH_SIZE
 
     # ------------------------------------------------------------------
     def run(self) -> dict:

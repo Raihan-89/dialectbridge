@@ -12,8 +12,9 @@ from django.test import SimpleTestCase
 from engine.connectors.base import ConnectorError
 from engine.connectors.mssql import MSSQLConnector
 from engine.connectors.postgres import PostgresConnector
+from engine.migration.data_mover import DataMigration
 from engine.migration.orchestrator import MigrationOrchestrator
-from engine.schema import Column, Constraint, Database, Table
+from engine.schema import Column, Constraint, Database, Index, Table
 from engine.translators.sql_builder import build_table_ddl
 
 
@@ -66,7 +67,8 @@ class PostgresConnectorPaginationTests(SimpleTestCase):
         cursor.__enter__ = Mock(return_value=cursor)
         cursor.__exit__ = Mock(return_value=False)
 
-        def consume_copy(_sql, stream):
+        def consume_copy(_sql, stream, size):
+            self.assertEqual(size, 1024 * 1024)
             while chunk := stream.read(7):
                 copied_chunks.append(chunk)
 
@@ -106,6 +108,13 @@ class PostgresConnectorPaginationTests(SimpleTestCase):
         self.assertIn('"DisplayName" VARCHAR(200)', statements[0])
         self.assertNotIn("GENERATED ALWAYS", statements[0])
         self.assertFalse(computed.is_computed)
+
+    def test_copy_batch_size_is_large_for_narrow_tables_and_bounded_for_lobs(self):
+        narrow = Table("dbo.Attendance", [Column("Id", "BIGINT"), Column("Day", "DATE")])
+        wide = Table("dbo.Attachments", [Column("Id", "BIGINT"), Column("Payload", "VARBINARY(MAX)")])
+
+        self.assertEqual(DataMigration(Mock(), Mock(), narrow).batch_size, 25_000)
+        self.assertEqual(DataMigration(Mock(), Mock(), wide).batch_size, 5_000)
 
     def test_composite_key_uses_tuple_pagination_and_real_column_positions(self):
         connector = PostgresConnector("host", 5432, "db", "user", "password")
@@ -244,6 +253,19 @@ class _FakeTsqlResetTarget(_FakeConnector):
 
 
 class MigrationPipelineSmokeTests(SimpleTestCase):
+    def test_secondary_indexes_are_created_after_bulk_data_load(self):
+        source = _FakeConnector({"dbo.users": [(1, "a"), (2, "b")]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.tables[0].indexes = [Index("IX_users_payload", ["payload"])]
+        source.extract_schema = Mock(return_value=schema)
+        target = _FakeConnector({}, dialect="postgres")
+
+        MigrationOrchestrator(source, target, copy_data=True).run()
+
+        insert_position = next(i for i, sql in enumerate(target.executed) if sql.startswith("INSERT"))
+        index_position = next(i for i, sql in enumerate(target.executed) if sql.startswith("CREATE INDEX"))
+        self.assertLess(insert_position, index_position)
+
     def test_full_pipeline_copies_rows_and_verifies_counts(self):
         source = _FakeConnector({"dbo.users": [(1, "a"), (2, "b"), (3, "c")]}, dialect="tsql")
         target = _FakeConnector({}, dialect="postgres")

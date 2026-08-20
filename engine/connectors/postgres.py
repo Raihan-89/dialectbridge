@@ -34,6 +34,7 @@ class _CopyTextStream(io.TextIOBase):
         self._rows = (row for batch in rows for row in batch)
         self._escape = escape
         self._pending = ""
+        self._offset = 0
         self.rows_read = 0
 
     def readable(self) -> bool:
@@ -43,19 +44,33 @@ class _CopyTextStream(io.TextIOBase):
         if size == 0:
             return ""
         if size < 0:
-            chunks = [self._pending]
+            chunks = [self._pending[self._offset:]]
             self._pending = ""
+            self._offset = 0
             for row in self._rows:
                 chunks.append(self._line(row))
             return "".join(chunks)
 
-        while len(self._pending) < size:
+        chunks = []
+        remaining = size
+        while remaining:
+            available = len(self._pending) - self._offset
+            if available:
+                take = min(remaining, available)
+                chunks.append(self._pending[self._offset:self._offset + take])
+                self._offset += take
+                remaining -= take
+                if self._offset < len(self._pending):
+                    break
+                self._pending = ""
+                self._offset = 0
+                continue
             try:
-                self._pending += self._line(next(self._rows))
+                self._pending = self._line(next(self._rows))
+                self._offset = 0
             except StopIteration:
                 break
-        chunk, self._pending = self._pending[:size], self._pending[size:]
-        return chunk
+        return "".join(chunks)
 
     def _line(self, row) -> str:
         self.rows_read += 1
@@ -213,6 +228,7 @@ class PostgresConnector(DatabaseConnector):
                 cur.copy_expert(
                     f"COPY {tbl} ({col_list}) FROM STDIN",
                     stream,
+                    size=1024 * 1024,
                 )
         except psycopg2.Error as exc:
             raise ConnectorError(f"PostgreSQL COPY failed: {exc}") from exc
