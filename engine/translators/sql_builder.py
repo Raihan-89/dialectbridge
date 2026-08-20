@@ -1064,6 +1064,11 @@ def _translate_top(text: str) -> str:
     out = []
     pos = 0
     for m in re.finditer(r"\bSELECT\s+(?:(DISTINCT)\s+)?TOP\s*(\(\d+\)|\d+)\b", text, re.IGNORECASE):
+        if m.start() < pos:
+            # Already inside the body of an enclosing SELECT TOP, which is
+            # rewritten (recursively) below. Re-emitting it here duplicated
+            # that whole span of SQL into the output.
+            continue
         out.append(text[pos:m.start()])
         count = m.group(2).strip().strip("()")
         distinct = m.group(1)
@@ -1071,7 +1076,8 @@ def _translate_top(text: str) -> str:
         end = _select_end(after)
         body = after[:end]
         prefix = "SELECT DISTINCT" if distinct else "SELECT"
-        out.append(f"{prefix} {body} LIMIT {count}")
+        # Recurse so a `SELECT TOP 1` in a scalar subquery is rewritten too.
+        out.append(f"{prefix} {_translate_top(body)} LIMIT {count}")
         pos = m.end() + end
     out.append(text[pos:])
     return "".join(out)
@@ -1393,12 +1399,21 @@ def _mask(text: str) -> tuple[str, list[str]]:
         return f"\x01{len(stash) - 1}\x01"
 
     text = re.sub(r"'([^']*)'", _s1, text)
-    # Quoted identifiers stay visible: the column rewriter needs to read the
-    # table qualifier in `"dbo"."tm_Bomas".intPayamid` to resolve the column's
-    # real casing. They are safe because every rewrite rejects a `"` neighbour.
-    # Only quoted identifiers that are *not* schema objects (delimited aliases,
-    # spaces in them) are hidden below.
-    text = re.sub(r'"[^"]*[^"\w][^"]*"', _s2, text)
+    # Quoted identifiers are scanned as whole `"..."` tokens and only *then*
+    # judged, so the scan can never straddle the gap between two of them.
+    # Matching on content instead (`"[^"]*[^"\w][^"]*"`) paired the closing
+    # quote of one identifier with the opening quote of the next and masked
+    # the SQL in between — silently swallowing already-masked string literals.
+    def _s2_ident(m):
+        body = m.group(0)[1:-1]
+        if body and re.fullmatch(r"\w+", body):
+            # A plain identifier stays visible: the column rewriter reads the
+            # qualifier in `"dbo"."tm_Bomas".intPayamid` to resolve its casing.
+            return m.group(0)
+        stash.append(m.group(0))
+        return f"\x01{len(stash) - 1}\x01"
+
+    text = re.sub(r'"[^"]*"', _s2_ident, text)
     # Column/table aliases introduced by `AS` are local to the statement and
     # must never be rewritten as qualified identifiers (they aren't schema
     # objects). Masked before the table-ref rewrite below.

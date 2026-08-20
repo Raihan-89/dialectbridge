@@ -49,6 +49,9 @@ def _routine_error_context(sql: str, max_len: int = 80) -> str:
 # T-SQL -> PL/pgSQL
 # ---------------------------------------------------------------------------
 
+_SPT_VALUES_RE = re.compile(r"\bspt_values\b", re.IGNORECASE)
+
+
 def _tsql_to_plpgsql(sql: str, tables: list | None = None,
                      user_types: list | None = None) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
@@ -57,6 +60,17 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     if not sql.strip():
         return None, ["Routine definition is empty — object may be encrypted or inaccessible"]
+
+    # `master..spt_values` is a SQL Server internal numbers table. Routines
+    # built on it are the dynamic-SQL + PIVOT report generators, which have no
+    # PostgreSQL form at all. Emitting a guessed translation would compile but
+    # never run correctly, so the routine is reported for manual rewrite.
+    if _SPT_VALUES_RE.search(sql):
+        return None, [
+            "references master..spt_values (a SQL Server internal numbers "
+            "table) — this routine builds a dynamic PIVOT and has no "
+            "PostgreSQL equivalent; rewrite it by hand using generate_series()"
+        ]
 
     # ---- header -----------------------------------------------------------
     header_match = re.search(
@@ -613,6 +627,7 @@ _STMT_START_RE = re.compile(
 )
 _SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
 _SET_SESSION_OPTION_RE = re.compile(r"^SET\s+\w+(?:\s+\w+)*\s+(?:ON|OFF)\s*;?\s*$", re.IGNORECASE)
+_SET_VARIABLE_RE = re.compile(r"^SET\s+@\w+\s*=", re.IGNORECASE)
 _SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT|UNION|INTERSECT|EXCEPT)\b", re.IGNORECASE)
 
 
@@ -1070,6 +1085,11 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             elif first_word == "SET" and _SET_SESSION_OPTION_RE.match(line):
                 # `SET NOCOUNT OFF` after an UPDATE ... SET is a new statement,
                 # never a continuation of the UPDATE's SET clause.
+                flush()
+            elif first_word == "SET" and _SET_VARIABLE_RE.match(line):
+                # `SET @id = SCOPE_IDENTITY()` after an UPDATE/INSERT is a new
+                # statement — the @ sigil makes it a variable assignment, never
+                # a continuation of that statement's SET clause.
                 flush()
             elif first_word == "SET" and not _SET_START_EXCEPT.match(buf[0].lstrip()):
                 flush()
@@ -1631,7 +1651,7 @@ def _replace_concat(text: str) -> str:
 # genuine syntax is never rewritten.
 _BARE_ALIAS_KEYWORDS = "year month day hour minute second array within without"
 _BARE_ALIAS_RE = re.compile(
-    rf'(?<=[\w)"])\s+(?P<alias>{_BARE_ALIAS_KEYWORDS.replace(" ", "|")})\s*(?=,|\bFROM\b|$)',
+    rf'(?<=[\w)"])(?<!\bAS)\s+(?P<alias>{_BARE_ALIAS_KEYWORDS.replace(" ", "|")})\s*(?=,|\bFROM\b|$)',
     re.IGNORECASE,
 )
 

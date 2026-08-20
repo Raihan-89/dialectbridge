@@ -2491,3 +2491,96 @@ class RealWorldMigrationRegressionTests(TestCase):
             "END")
         self.assertNotIn(";WITH", out)
         self.assertIn("WITH dsc AS (SELECT 1 AS a) SELECT a FROM dsc WHERE a = id;", out)
+
+    def test_string_literals_survive_identifier_masking(self):
+        """The quoted-identifier mask matched the SQL *between* two quoted
+        identifiers, swallowing already-masked string literals and leaving bare
+        stash indices behind (`else '0'` became `else 2`). That corrupted data,
+        not just syntax, and left the body's dollar-quoting unterminated."""
+        proc = Routine(name="dbo.p", kind="procedure", definition=(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "CREATE TABLE #TempBen ([IPName] varchar(40), [StateName] varchar(40))\n"
+            "select case when a.Status>=3 then a.rate else '0' end as ExchangeRate,\n"
+            "COALESCE((select x from y),'Contact Admin') as WageStatus\n"
+            "from dbo.tm_States a\nEND"))
+        db = Database(name="P", dialect="tsql", tables=[
+            Table(name="dbo.tm_States", columns=[Column("intStateid", "int"),
+                                                 Column("StateName", "varchar(50)")]),
+        ], procedures=[proc])
+        sql = next(s for s in build_database_ddl(db, "postgres")[0] if "PROCEDURE" in s)
+        self.assertIn("else '0' end", sql)
+        self.assertIn("'Contact Admin'", sql)
+        self.assertNotIn('""', sql)
+        self.assertNotIn("\x00", sql)
+        self.assertNotIn("\x01", sql)
+        self.assertEqual(sql.count("$$"), 2)
+
+    def test_delimited_alias_with_a_space_is_left_untouched(self):
+        view = View(name="dbo.v", definition='SELECT s.StateName AS "State Name" FROM dbo.tm_States s')
+        db = Database(name="P", dialect="tsql", views=[view], tables=[
+            Table(name="dbo.tm_States", columns=[Column("StateName", "varchar(50)")])])
+        sql = next(s for s in build_database_ddl(db, "postgres")[0] if "VIEW" in s)
+        self.assertIn('AS "State Name"', sql)
+        self.assertNotIn('""', sql)
+
+    def test_line_comment_keeps_its_literal_and_does_not_eat_the_query(self):
+        view = View(name="dbo.v", definition=(
+            "select a.intIP\nfrom dbo.t a\nwhere a.Status='Present'\n"
+            "--and a.intWorkActivityId like '1033'\nand a.intIP > 0"))
+        db = Database(name="P", dialect="tsql", views=[view], tables=[
+            Table(name="dbo.t", columns=[Column("intIP", "int"), Column("Status", "varchar(20)")])])
+        sql = next(s for s in build_database_ddl(db, "postgres")[0] if "VIEW" in s)
+        self.assertIn("'1033'", sql)
+        self.assertIn("'Present'", sql)
+        self.assertIn("\n", sql)          # newlines kept so -- ends at the line
+
+    def test_set_variable_after_insert_or_update_is_a_new_statement(self):
+        """`SET @id = SCOPE_IDENTITY()` was glued onto the preceding
+        INSERT/UPDATE because that statement has a SET clause of its own."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @w int AS BEGIN\n"
+            "Declare @ids as int\n"
+            "insert into tr_Funds (intWorklId) values(@w)\n"
+            "set @ids=@@IDENTITY\n"
+            "insert into tr_Invoice(invoiceid) values(@ids)\nEND")
+        self.assertIn("values(w);", out)
+        self.assertIn("ids := LASTVAL();", out)
+
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p @r int OUTPUT AS BEGIN\n"
+            "Update td_Rate Set WageRate = 1 Where id = 2\n"
+            "set @r = 0\nEND")
+        self.assertIn("Where id = 2;", out)
+        self.assertIn("r := 0;", out)
+
+    def test_alias_keyword_repair_does_not_double_an_existing_as(self):
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "select UPPER(CASE m WHEN 1 THEN 'January' END) as Month, w.Year from t w\nEND")
+        self.assertNotIn("as AS", out)
+        self.assertIn("as Month", out)
+
+    def test_nested_select_top_is_not_duplicated(self):
+        """An outer SELECT TOP consumed a span that still matched again, so the
+        inner subquery was emitted twice and produced `LIMIT 10000SELECT ...`."""
+        out = self._routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "INSERT INTO #Temp\n"
+            "SELECT DISTINCT TOP 10000 v.id,\n"
+            "(SELECT TOP 1 COUNT(p.id) from t2 as p where p.a='x') AS PreseCnt\n"
+            "from v1 v\nEND")
+        self.assertEqual(out.count("PreseCnt"), 1)
+        self.assertEqual(out.count("LIMIT 1)"), 1)
+        self.assertIn("LIMIT 10000", out)
+        self.assertNotIn("10000SELECT", out)
+
+    def test_spt_values_routine_is_reported_instead_of_mistranslated(self):
+        """master..spt_values drives dynamic-SQL PIVOT reports that have no
+        PostgreSQL form; a guessed translation would compile but never run."""
+        converted, warnings = translate_routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "SELECT Date=DATEADD(day,number,@S) INTO #D FROM master..spt_values WHERE type='p'\n"
+            "END", source="procedure", target="postgres")
+        self.assertIsNone(converted)
+        self.assertIn("spt_values", warnings[0])
+        self.assertIn("generate_series", warnings[0])
