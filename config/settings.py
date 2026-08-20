@@ -131,9 +131,9 @@ MAILERS = {
 }
 
 
-# Application logging is intentionally limited to migration lifecycle events,
-# warnings, and failures. Rotating files prevent long-running installations
-# from growing the log directory without bound.
+# Application and Django lifecycle events are written below the project root.
+# Rotating files prevent long-running installations from growing the log
+# directory without bound.
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -160,6 +160,11 @@ LOGGING = {
         },
     },
     'loggers': {
+        'django': {
+            'handlers': ['console', 'application_file'],
+            'level': 'INFO',
+            'propagate': False,
+        },
         'dialectbridge': {
             'handlers': ['console', 'application_file'],
             'level': 'INFO',
