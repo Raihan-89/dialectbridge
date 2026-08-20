@@ -83,12 +83,19 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
         ret_match = re.search(r"RETURNS\s+(.+?)\s*(?:WITH\b|AS\b|BEGIN\b|RETURN\b)", sql, re.IGNORECASE | re.DOTALL)
         if ret_match:
             returns = ret_match.group(1).strip()
+    return_table_name, declared_return_columns = _parse_tsql_table_return(returns)
 
     # ---- body -------------------------------------------------------------
     body = _extract_tsql_body(sql)
     if body is None:
         ctx = _routine_error_context(sql[header_match.end():])
         return None, [f"Could not extract routine body — found: {ctx}"]
+
+    declared_tables = _extract_tsql_table_declarations(body)
+    if (kind == "FUNCTION" and "table" in returns.lower()
+            and not declared_return_columns and len(declared_tables) == 1):
+        return_table_name, declared_return_columns, start, end = declared_tables[0]
+        body = body[:start] + body[end:]
 
     params, param_warns = _parse_params(param_text, "tsql")
     warnings.extend(param_warns)
@@ -126,6 +133,11 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     transformed, t_warns, declared = _transform_tsql_body(body, kind, has_result_select)
     warnings.extend(t_warns)
 
+    if return_table_name and declared_return_columns:
+        transformed = _rewrite_return_table_writes(
+            transformed, return_table_name, warnings,
+        )
+
     # Comparisons against BIT/BOOLEAN columns (col = 1) are invalid in
     # PostgreSQL (boolean = integer) — rewrite to true/false.
     if tables:
@@ -133,7 +145,7 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     if kind == "FUNCTION":
         if returns.lower().strip() == "table" or "table" in returns.lower():
-            result_columns = _infer_result_columns(transformed, tables)
+            result_columns = declared_return_columns or _infer_result_columns(transformed, tables)
             if not result_columns:
                 return None, warnings + [
                     "Table-valued function result columns could not be inferred safely — manual conversion required"
@@ -180,6 +192,91 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
     return converted, warnings
+
+
+def _parse_tsql_table_return(returns: str) -> tuple[str | None, list[tuple[str, str]]]:
+    """Parse ``RETURNS @result TABLE (col type, ...)`` from a multi-statement TVF."""
+    match = re.match(
+        r'^@?([A-Za-z_]\w*)\s+TABLE\s*\((.*)\)\s*$',
+        returns.strip(), re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None, []
+
+    return match.group(1), _parse_tsql_table_columns(match.group(2))
+
+
+def _parse_tsql_table_columns(definition: str) -> list[tuple[str, str]]:
+    columns: list[tuple[str, str]] = []
+    for item in _split_args_balanced(definition):
+        column = re.match(
+            rf'^\s*(?:\[([^]]+)\]|"([^"]+)"|([A-Za-z_]\w*))\s+({_TSQL_TYPE_RE})',
+            item, re.IGNORECASE | re.DOTALL,
+        )
+        if not column:
+            return []
+        name = column.group(1) or column.group(2) or column.group(3)
+        source_type = column.group(4).strip()
+        target_type, _warning = convert_type(source_type, "tsql", "postgres")
+        if target_type is None:
+            return []
+        columns.append((name, target_type))
+    return columns
+
+
+def _extract_tsql_table_declarations(body: str) -> list[tuple[str, list[tuple[str, str]], int, int]]:
+    """Find balanced ``DECLARE @name TABLE (...)`` definitions in a body."""
+    declarations = []
+    pattern = re.compile(r"\bDECLARE\s+@([A-Za-z_]\w*)\s+TABLE\s*\(", re.IGNORECASE)
+    for match in pattern.finditer(body):
+        open_paren = match.end() - 1
+        depth, in_string, index = 1, False, open_paren + 1
+        while index < len(body) and depth:
+            char = body[index]
+            if in_string:
+                if char == "'":
+                    if index + 1 < len(body) and body[index + 1] == "'":
+                        index += 1
+                    else:
+                        in_string = False
+            elif char == "'":
+                in_string = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            index += 1
+        if depth:
+            continue
+        columns = _parse_tsql_table_columns(body[open_paren + 1:index - 1])
+        if columns:
+            end = index
+            while end < len(body) and body[end] in " \t;":
+                end += 1
+            declarations.append((match.group(1), columns, match.start(), end))
+    return declarations
+
+
+def _rewrite_return_table_writes(transformed: list[str], table_name: str,
+                                 warnings: list[str]) -> list[str]:
+    """Turn inserts into a SQL Server TVF return variable into RETURN QUERY."""
+    output: list[str] = []
+    target = re.escape(table_name)
+    for statement in transformed:
+        match = re.match(
+            rf'^INSERT\s+INTO\s+"?{target}"?\s*(?:\([^)]*\))?\s+(SELECT\b.*);$',
+            statement, re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            output.append(f"RETURN QUERY {match.group(1)};")
+            continue
+        if re.search(rf'\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"?{target}"?\b',
+                     statement, re.IGNORECASE):
+            warnings.append(
+                f"Return table '@{table_name}' contains a non-SELECT write that requires manual review"
+            )
+        output.append(statement)
+    return output
 
 
 def _procedure_result_cursors(transformed: list[str]) -> tuple[list[str], list[str]]:

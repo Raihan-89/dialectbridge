@@ -959,6 +959,62 @@ RETURN (SELECT ProductID, ProductName FROM dbo.ProductMaster)
         else:
             self.assertTrue(any("manual conversion required" in warning for warning in warnings))
 
+    def test_multistatement_table_function_uses_declared_return_schema(self):
+        fn = """
+CREATE FUNCTION dbo.sfPBI_SEA_DBrd(@ctry int)
+RETURNS @t_ctry TABLE
+(
+    [state_id] int NOT NULL,
+    [state_name] nvarchar(100) NULL,
+    [amount] decimal(18,2) NULL
+)
+AS
+BEGIN
+    INSERT INTO @t_ctry (state_id, state_name, amount)
+    SELECT StateId, StateName, Amount FROM dbo.ProductMaster;
+    RETURN;
+END
+"""
+        conv, warnings = translate_routine(
+            fn, source="function", target="postgres", tables=self._db().tables,
+        )
+
+        self.assertIsNotNone(conv, warnings)
+        self.assertIn(
+            'RETURNS TABLE("state_id" INTEGER, "state_name" VARCHAR(100), "amount" NUMERIC(18,2))',
+            conv,
+        )
+        self.assertIn("RETURN QUERY SELECT", conv)
+        self.assertNotIn("INSERT INTO t_ctry", conv)
+        self.assertFalse(any("manual conversion required" in warning for warning in warnings), warnings)
+
+    def test_table_function_uses_single_body_table_declaration_as_return_schema(self):
+        fn = """
+CREATE FUNCTION dbo.sfPBI_SEA_DBrd(@ctry int)
+RETURNS TABLE
+AS
+BEGIN
+    DECLARE @t_ctry TABLE
+    (
+        [state_id] int,
+        [state_name] nvarchar(100),
+        [amount] decimal(18,2)
+    );
+    INSERT INTO @t_ctry
+    SELECT StateId, StateName, Amount FROM dbo.ProductMaster;
+    RETURN;
+END
+"""
+        conv, warnings = translate_routine(
+            fn, source="function", target="postgres", tables=self._db().tables,
+        )
+
+        self.assertIsNotNone(conv, warnings)
+        self.assertIn('RETURNS TABLE("state_id" INTEGER, "state_name" VARCHAR(100)', conv)
+        self.assertIn("RETURN QUERY SELECT", conv)
+        self.assertNotIn("DECLARE @t_ctry", conv)
+        self.assertFalse(any("Type 'TABLE'" in warning for warning in warnings), warnings)
+
     def test_multiline_if_condition_with_comment(self):
         fn = """
 CREATE PROCEDURE dbo.sp_Check(@id int)
