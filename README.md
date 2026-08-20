@@ -92,11 +92,11 @@ python manage.py test
 
 ### Application logs
 
-Application, migration, API, and Django framework events are written to
-`logs/dialectbridge.log` under the project directory. The file rotates at
-10 MB, with up to five backups retained (`dialectbridge.log.1` through
-`dialectbridge.log.5`). The `logs/` directory is created automatically when
-Django starts, and generated log files are excluded from Git.
+Application, migration, API, and Django framework events are written to a
+date-named file such as `logs/dialectbridge-2026-08-20.log`. A new file is
+opened automatically after midnight, and the latest 30 daily files are
+retained in the same folder. The `logs/` directory is created automatically
+when Django starts, and generated log files are excluded from Git.
 
 ---
 

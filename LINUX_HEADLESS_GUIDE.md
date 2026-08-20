@@ -651,5 +651,5 @@ python manage.py test
 - **Use `jq`** for readable output. Without it, JSON comes back as a single unformatted line.
 - **Pipe converted SQL to a file:** add `| jq -r '.converted_sql' > output.sql` to the convert command.
 - **The API is synchronous for migrations.** If your migration takes hours, use the web-initiated background path (via SSH tunnel) or wrap the API call with `nohup`.
-- **Log file** is at `logs/dialectbridge.log` -- check it when things go wrong.
+- **Log files** are at `logs/dialectbridge-YYYY-MM-DD.log` -- check the dated file when things go wrong.
 - **SQLite database** (`db.sqlite3`) stores all portal data (connections, history, reports). Back it up regularly.

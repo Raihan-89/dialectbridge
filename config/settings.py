@@ -131,9 +131,8 @@ MAILERS = {
 }
 
 
-# Application and Django lifecycle events are written below the project root.
-# Rotating files prevent long-running installations from growing the log
-# directory without bound.
+# Application and Django lifecycle events are written to one date-named file
+# per local calendar day below the project root.
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -150,10 +149,10 @@ LOGGING = {
             'level': 'INFO',
         },
         'application_file': {
-            'class': 'logging.handlers.RotatingFileHandler',
-            'filename': LOG_DIR / 'dialectbridge.log',
-            'maxBytes': 10 * 1024 * 1024,
-            'backupCount': 5,
+            'class': 'config.logging.DailyFileHandler',
+            'directory': LOG_DIR,
+            'filename_prefix': 'dialectbridge',
+            'backupCount': 30,
             'encoding': 'utf-8',
             'formatter': 'standard',
             'level': 'INFO',
