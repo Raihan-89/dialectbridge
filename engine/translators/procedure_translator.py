@@ -39,6 +39,20 @@ def _strip_sql_comments(sql: str) -> str:
     return sql
 
 
+def _blank_literals(sql: str) -> str:
+    """Blank the contents of single-quoted literals, keeping their quotes.
+
+    Lets a keyword scan see only real SQL, so text that merely appears inside a
+    string is never mistaken for the construct itself. The result is the same
+    length as the input, so match offsets stay valid against the original.
+    """
+    return re.sub(
+        r"'(?:[^']|'')*'",
+        lambda m: "'" + " " * (len(m.group(0)) - 2) + "'",
+        sql,
+    )
+
+
 def _routine_error_context(sql: str, max_len: int = 80) -> str:
     """Return a truncated first line of the definition for error messages."""
     first = sql.strip().split("\n")[0].strip()[:max_len]
@@ -95,11 +109,14 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     # other FOR XML usage. Finding one convertible occurrence is not licence to
     # emit the rest: every FOR XML must sit inside a convertible span, or the
     # untranslated ones reach PostgreSQL as `syntax error at or near "xml"`.
-    if _FOR_XML_RE.search(sql):
+    # Literals are blanked (length-preserving, so offsets still line up) so a
+    # routine that only mentions 'FOR XML' inside a string is not rejected.
+    scannable = _blank_literals(sql)
+    if _FOR_XML_RE.search(scannable):
         convertible = [m.span() for m in _XML_PATH_AGG_RE.finditer(sql)]
         if any(
             not any(start <= m.start() and m.end() <= end for start, end in convertible)
-            for m in _FOR_XML_RE.finditer(sql)
+            for m in _FOR_XML_RE.finditer(scannable)
         ):
             return None, [
                 "uses FOR XML, which PostgreSQL has no equivalent for — only the "
@@ -267,6 +284,23 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     footer = "$$ LANGUAGE plpgsql;"
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
+
+    # Final safety net. The pre-scan above decides convertibility from the
+    # *shape* of the STUFF(... FOR XML PATH('')) call, but the actual rewrite
+    # (functions._xml_path_to_string_agg) is stricter — it also needs a
+    # `separator + value` expression it can split. A call the pre-scan accepted
+    # and the rewriter then declined used to reach PostgreSQL verbatim and fail
+    # with `syntax error at or near "xml"`. Trusting the emitted text instead of
+    # the prediction closes that gap for every FOR XML shape, present or future.
+    # Literals are blanked first so a routine that merely *mentions* 'FOR XML'
+    # in a string or comment is not rejected for it.
+    if _FOR_XML_RE.search(_blank_literals(_strip_sql_comments(converted))):
+        return None, warnings + [
+            "uses a FOR XML construct that could not be rewritten as string_agg "
+            "(only `STUFF((SELECT sep + col ... FOR XML PATH('')), 1, n, '')` "
+            "converts) — rewrite the XML generation by hand"
+        ]
+
     return converted, warnings
 
 

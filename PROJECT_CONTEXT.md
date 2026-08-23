@@ -182,10 +182,32 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
 
 ### 6. `engine/migration/data_mover.py` — Data copy
 
-- Reads every source row in 5,000-row batches. Tables with a PK use lexicographic keyset pagination (including composite keys and keys that are not the leading selected columns); keyless tables use a single streaming cursor rather than stopping after the first batch. `int_columns` identifies integer values that some TDS drivers return as raw bytes.
-- Builds target INSERTs with quoted identifiers + `%s` placeholders, executed with driver parameter binding — values round-trip exactly, no string interpolation of user data.
+- Reads every source row in adaptive batches — 25,000 rows normally, 5,000 when the table has wide/LOB columns (`BINARY`/`IMAGE`/`BYTEA`/`TEXT`/`XML`/`MAX`). Tables with a PK use lexicographic keyset pagination (including composite keys and keys that are not the leading selected columns); keyless tables use a single streaming cursor rather than stopping after the first batch. `int_columns` identifies integer values that some TDS drivers return as raw bytes.
+- **PostgreSQL targets bulk-load through `COPY`** (`PostgresConnector.copy_to_table` + the `_CopyTextStream` renderer), which is 10-50x faster than INSERT on large tables. Non-PG targets fall back to batched INSERTs built with quoted identifiers + `%s` placeholders and driver parameter binding — either way, values round-trip exactly with no string interpolation of user data.
+- A background **prefetch thread** (`_prefetch`, depth 2) overlaps the source read with the target write, so a table costs about as long as its slower half instead of the sum of both.
+- Non-unique target indexes are dropped before the load and recreated afterwards (`drop_indexes` / `recreate_indexes`), cutting index-maintenance overhead during bulk insert.
 - Identity columns populated explicitly so PK values match source; table identity/sequence re-seeded past the highest value afterward.
 - If a batch insert fails, falls back row-by-row to isolate the broken row(s).
+
+### 7. `engine/migration/parallel_copy.py` — Process-based parallel copy
+
+Row building and COPY formatting are CPU-bound Python and hold the GIL, so copying tables on
+*threads* measured **slower** than serial (0.44x on a 3-way test); worker **processes** measured
+2.86x. `copy_tables()` spawns a `spawn`-context `multiprocessing.Pool`, rebuilds a connector pair
+inside each worker from a `connector_spec()` tuple, and streams per-batch progress back to the
+parent through a queue drained by a pump thread. The module is deliberately additive: the
+orchestrator keeps its sequential loop and only reaches for the pool when `parallel_workers > 1`
+and the connectors can be rebuilt — anything unexpected raises `ParallelCopyUnavailable` and falls
+back to serial rather than failing a migration. Worker count defaults to `min(4, cpu_count // 2)`
+(`migration_service._default_copy_workers`), overridable with `DIALECTBRIDGE_COPY_WORKERS`.
+
+### 8. Cancellation
+
+`MigrationOrchestrator` takes a `cancel_check` callable and calls `_check_cancelled()` at every
+phase boundary and every table/statement, raising `MigrationCancelledError`. The web layer sets
+`MigrationJob.cancel_requested` from `/migrate/<pk>/cancel/`; the background runner's
+`cancel_check` polls that flag. Cancellation is therefore cooperative — it halts at the next
+checkpoint, not instantly.
 
 ---
 
@@ -255,7 +277,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **260 tests**; `python manage.py check` reports no issues.
+Current verification: `venv/bin/python manage.py test` runs **243 tests** (2026-08-24); `manage.py check` reports no issues.
 
 ---
 

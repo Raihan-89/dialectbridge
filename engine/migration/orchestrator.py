@@ -680,8 +680,23 @@ class MigrationOrchestrator:
             )
 
 
+_PG_TRIGGER_BUNDLE_RE = re.compile(
+    r"RETURNS\s+TRIGGER\b.*?\bCREATE\s+TRIGGER\b", re.IGNORECASE | re.DOTALL
+)
+_PG_TRIGGER_NAME_RE = re.compile(
+    r"\bCREATE\s+TRIGGER\s+(?:\"([^\"]+)\"|\[([^\]]+)\]|([\w$]+))", re.IGNORECASE
+)
+
+
 def _object_kind(stmt: str) -> str:
     upper = stmt.lstrip().upper()
+    # A migrated DML trigger is emitted as one statement holding both the
+    # trigger function and the CREATE TRIGGER that binds it. It starts with
+    # CREATE OR REPLACE FUNCTION, so matching on the leading keyword alone
+    # filed every trigger under "function" and the report showed no triggers
+    # at all — the objects migrated, but looked missing.
+    if _PG_TRIGGER_BUNDLE_RE.search(stmt):
+        return "trigger"
     for kind in ("CREATE OR ALTER VIEW", "CREATE OR REPLACE VIEW", "CREATE VIEW",
                  "CREATE MATERIALIZED VIEW", "CREATE OR REPLACE FUNCTION",
                  "CREATE FUNCTION", "CREATE OR REPLACE PROCEDURE", "CREATE PROCEDURE",
@@ -706,6 +721,12 @@ def _object_kind(stmt: str) -> str:
 
 
 def _name_from_stmt(stmt: str) -> str:
+    # For the function+CREATE TRIGGER bundle, report the trigger's own name
+    # rather than the generated `<trigger>_fn` helper the reader never asked for.
+    if _PG_TRIGGER_BUNDLE_RE.search(stmt):
+        match = _PG_TRIGGER_NAME_RE.search(stmt)
+        if match:
+            return next(g for g in match.groups() if g)
     # grab the first identifier after CREATE <kind>
     m = __import__("re").match(
         r"^\s*CREATE(?:\s+OR\s+(?:ALTER|REPLACE))?\s+"

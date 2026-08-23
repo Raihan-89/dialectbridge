@@ -8,6 +8,7 @@ import re
 import threading
 
 from engine.connectors.base import ConnectorError
+from engine.migration import orchestrator as orchestrator_module
 from engine.migration.orchestrator import MigrationCancelledError
 from engine.schema import (
     CheckConstraint, Column, Constraint, Database, Index, PartitionChild, Permission,
@@ -3037,3 +3038,73 @@ class SecondRoundMigrationFailureTests(TestCase):
             "END"
         )
         self.assertIsNotNone(converted)
+
+
+class ThirdRoundMigrationFailureTests(TestCase):
+    """Regressions for the failures reported from the PBW_SNSOP_RO migration."""
+
+    def test_unconvertible_for_xml_is_reported_not_emitted(self):
+        """A STUFF(... FOR XML PATH('')) the rewriter cannot split must not ship.
+
+        The shape guard accepted this call because it *looks* like the
+        string-aggregation idiom, but the rewriter needs a `separator + value`
+        expression and declines a bare column list. The routine then reached
+        PostgreSQL with `for xml path('')` intact and failed with
+        `syntax error at or near "xml"`.
+        """
+        converted, warnings = translate_routine(
+            "CREATE FUNCTION dbo.f() RETURNS varchar(100) AS BEGIN RETURN "
+            "stuff((select cast(x as varchar(10)) from t group by x "
+            "for xml path('')),1,1,''); END",
+            "tsql", "postgres",
+        )
+        self.assertIsNone(converted)
+        self.assertTrue(any("FOR XML" in w for w in warnings), warnings)
+
+    def test_convertible_for_xml_idiom_still_converts(self):
+        converted, _ = translate_routine(
+            "CREATE FUNCTION dbo.f() RETURNS varchar(100) AS BEGIN RETURN "
+            "stuff((select ', '+n from t for xml path('')),1,2,''); END",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertNotIn("xml", converted.lower())
+        self.assertIn("string_agg", converted)
+
+    def test_migrated_trigger_is_reported_as_a_trigger(self):
+        """The function+CREATE TRIGGER bundle must not be filed under "function".
+
+        Triggers migrate as one statement that *starts* with CREATE OR REPLACE
+        FUNCTION, so the report listed them as functions named `<trigger>_fn`
+        and showed no triggers at all — they looked like they had gone missing.
+        """
+        stmt = (
+            "CREATE OR REPLACE FUNCTION trg_Audit_fn() RETURNS TRIGGER AS $$\n"
+            "BEGIN RETURN NEW; END;\n$$ LANGUAGE plpgsql;\n\n"
+            "CREATE TRIGGER trg_Audit AFTER UPDATE ON dbo.T "
+            "FOR EACH ROW EXECUTE FUNCTION trg_Audit_fn();"
+        )
+        self.assertEqual(orchestrator_module._object_kind(stmt), "trigger")
+        self.assertEqual(orchestrator_module._name_from_stmt(stmt), "trg_Audit")
+
+    def test_plain_function_is_still_reported_as_a_function(self):
+        stmt = (
+            "CREATE OR REPLACE FUNCTION f() RETURNS INTEGER AS $$\n"
+            "BEGIN RETURN 1; END;\n$$ LANGUAGE plpgsql;"
+        )
+        self.assertEqual(orchestrator_module._object_kind(stmt), "function")
+        self.assertEqual(orchestrator_module._name_from_stmt(stmt), "f")
+
+    def test_event_trigger_is_still_reported_as_a_trigger(self):
+        stmt = "CREATE EVENT TRIGGER t ON ddl_command_start EXECUTE FUNCTION f();"
+        self.assertEqual(orchestrator_module._object_kind(stmt), "trigger")
+
+    def test_for_xml_mentioned_only_in_a_literal_still_converts(self):
+        """The guard scans SQL, not strings — a routine that merely prints the
+        words 'FOR XML' must not be rejected for it."""
+        converted, warnings = translate_routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN select 'FOR XML PATH note' as n; END",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertFalse(warnings, warnings)
