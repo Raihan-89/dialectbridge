@@ -720,3 +720,39 @@ class DeclinedObjectTests(SimpleTestCase):
         self.assertTrue(report.success)
         self.assertEqual(report.summary["schema_failed"], 0)
         self.assertEqual(report.summary["objects_declined"], 1)
+
+
+class LongIdentifierReconciliationTests(SimpleTestCase):
+    """A name over PostgreSQL's 63-byte limit is not a missing object.
+
+    The DDL builder shortens such names with a hash suffix, so the object on
+    the target no longer carries its SQL Server name. Comparing the full name
+    reported a perfectly migrated routine as missing from the target.
+    """
+
+    LONG = "getAttendanceReportNewReportMultipleWagesPayConnectTeamwithPaymentdatesAlternatesAPI"
+
+    def test_truncated_routine_is_recognised_on_the_target(self):
+        from engine.translators.sql_builder import pg_ident
+
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.procedures = [Routine(name=f"dbo.{self.LONG}", kind="procedure",
+                                     definition=f"CREATE PROCEDURE dbo.{self.LONG} AS SELECT 1")]
+        source.extract_schema = Mock(return_value=schema)
+        target = _InventoryTarget([
+            ("table", "dbo.users"),
+            ("procedure", f"dbo.{pg_ident(self.LONG)}"),
+        ])
+
+        report = MigrationOrchestrator(source, target, copy_data=False).run()
+
+        self.assertEqual(report.summary["objects_missing"], 0,
+                         [r.to_dict() for r in report.schema_results if r.status != "success"])
+        self.assertTrue(report.success)
+
+    def test_verification_pairs_a_truncated_name_with_its_source(self):
+        from apps.converter.verification_service import _key
+        from engine.translators.sql_builder import pg_ident
+
+        self.assertEqual(_key(f"dbo.{self.LONG}"), _key(f"public.{pg_ident(self.LONG)}"))

@@ -25,7 +25,7 @@ from time import monotonic
 
 from engine.connectors.base import ConnectorError
 from engine.migration.data_mover import DataMigration
-from engine.translators.sql_builder import build_database_ddl
+from engine.translators.sql_builder import build_database_ddl, pg_ident
 
 _PRE_DATA_PREFIXES = ("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX",
                       "ALTER TABLE")
@@ -128,12 +128,20 @@ def _migrated_schemas(schema) -> list[str]:
 
 
 def _object_key(name: str) -> str:
-    """Return a case-insensitive bare object name without SQL delimiters."""
+    """Return a case-insensitive bare object name without SQL delimiters.
+
+    Names longer than PostgreSQL's 63-byte identifier limit are folded through
+    the same truncation the DDL builder applies, so a source object and the
+    shortened object actually created on the target resolve to one key. Without
+    this a long-named routine looked absent from the target and was reported
+    missing even though it had migrated perfectly.
+    """
     bare = re.split(r"\s*\.\s*", name)[-1].strip()
     if len(bare) >= 2 and ((bare[0] == "[" and bare[-1] == "]")
                            or (bare[0] == '"' and bare[-1] == '"')):
         bare = bare[1:-1]
-    return bare.replace("]]", "]").replace('""', '"').casefold()
+    bare = bare.replace("]]", "]").replace('""', '"')
+    return pg_ident(bare).casefold()
 
 
 class MigrationCancelledError(Exception):

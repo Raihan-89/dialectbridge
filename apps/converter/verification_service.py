@@ -11,6 +11,8 @@ from itertools import zip_longest
 from typing import Callable
 from uuid import UUID
 
+from engine.translators.sql_builder import pg_ident
+
 from .migration_service import connector_for
 
 
@@ -66,8 +68,14 @@ SECTION_LABELS = {
 
 
 def _key(name: str) -> str:
-    """Match migrated objects despite dbo/public and identifier-case changes."""
-    return name.rsplit(".", 1)[-1].strip('[]"').casefold()
+    """Match migrated objects despite dbo/public and identifier-case changes.
+
+    PostgreSQL truncates identifiers at 63 bytes, so a longer SQL Server name
+    is created there under a shortened, hash-suffixed form. Folding both sides
+    through the same truncation keeps that object paired instead of reporting
+    it as missing on one side and unexpected on the other.
+    """
+    return pg_ident(name.rsplit(".", 1)[-1].strip('[]"').strip()).casefold()
 
 
 def _simple(items, detail: Callable) -> dict:

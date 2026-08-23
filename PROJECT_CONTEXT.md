@@ -124,6 +124,12 @@ Deliberate ordering choices:
   only an object that vanished with no explanation is recorded as `failed`. When the target cannot be
   inventoried (unknown dialect, refused catalog query, a connector that returns
   nothing) the pass is skipped rather than reporting phantom losses.
+- **Object identity is truncation-aware.** PostgreSQL caps identifiers at 63
+  bytes, so a longer SQL Server name is created there in the shortened,
+  hash-suffixed form `pg_ident()` produces. Reconciliation and the Verify
+  page's pairing both fold names through the same truncation, so a long-named
+  routine or view is recognised as migrated instead of appearing missing on one
+  side and unexpected on the other.
 - **A missing relation is confirmed against the live source** before the report
   blames it. `_missing_source_dependency` first checks the extracted inventory,
   then probes the source itself (`OBJECT_ID()` / `to_regclass()`, cached per
@@ -279,7 +285,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **254 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test` runs **256 tests**; `python manage.py check` reports no issues.
 
 ---
 
