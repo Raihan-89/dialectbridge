@@ -91,6 +91,7 @@ class View:
     definition: str
     is_materialized: bool = False
     indexes: list[Index] = field(default_factory=list)
+    columns: list[Column] = field(default_factory=list)
 
 
 @dataclass
@@ -250,6 +251,10 @@ def _view_to_dict(v: View) -> dict:
         "definition": v.definition,
         "is_materialized": v.is_materialized,
         "indexes": [_index_to_dict(i) for i in v.indexes],
+        "columns": [
+            {"name": c.name, "data_type": c.data_type, "nullable": c.nullable}
+            for c in v.columns
+        ],
     }
 
 

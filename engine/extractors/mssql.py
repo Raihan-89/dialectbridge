@@ -173,6 +173,14 @@ WHERE i.object_id = OBJECT_ID(%s)
 ORDER BY i.name, ic.key_ordinal
 """
 
+_VIEW_COLUMNS_SQL = """
+SELECT c.name, ty.name, c.max_length, c.precision, c.scale, c.is_nullable
+FROM sys.columns c
+JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID(%s)
+ORDER BY c.column_id
+"""
+
 _PROCEDURES_SQL = """
 SELECT OBJECT_SCHEMA_NAME(object_id) + '.' + name, OBJECT_DEFINITION(object_id)
 FROM sys.procedures
@@ -580,6 +588,17 @@ def _extract_views(conn, database: Database) -> list[View]:
     views: list[View] = []
     for name, definition in conn.fetch(_VIEWS_SQL):
         view = View(name=name, definition=definition or "")
+        try:
+            view.columns = [
+                Column(row[0], _rebuild_type(row[1], row[2], row[3], row[4], None),
+                       nullable=bool(row[5]))
+                for row in conn.fetch(_VIEW_COLUMNS_SQL, (name,))
+            ]
+        except Exception as exc:
+            database.warnings.append(
+                f"Columns for view '{name}' could not be inspected (query failed: {exc}) — "
+                "a compatibility view cannot be generated if needed"
+            )
         if name.lower() in indexed_names:
             try:
                 index_rows = conn.fetch(_VIEW_INDEX_SQL, (name,))

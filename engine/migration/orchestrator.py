@@ -133,6 +133,7 @@ class MigrationOrchestrator:
         self.parallel_workers = max(1, int(parallel_workers or 1))
         self._table_progress: dict = {}
         self._source_objects: set[str] = set()
+        self._view_fallbacks: dict[str, object] = {}
 
     def _check_cancelled(self) -> None:
         if self.cancel_check is not None and self.cancel_check():
@@ -204,6 +205,7 @@ class MigrationOrchestrator:
                           schema.procedures, schema.sequences, schema.synonyms)
             for obj in group
         }
+        self._view_fallbacks = {_object_key(view.name): view for view in schema.views}
 
         report.warnings.extend(schema.warnings)
         if schema.warnings:
@@ -387,6 +389,12 @@ class MigrationOrchestrator:
             if prior_warning in report.warnings:
                 report.warnings.remove(prior_warning)
             self._apply(report, "view", stmt)
+            if report.schema_results and report.schema_results[-1].status == "skipped":
+                skipped = report.schema_results.pop()
+                skipped_warning = f"View '{skipped.name}': {skipped.detail}"
+                if skipped_warning in report.warnings:
+                    report.warnings.remove(skipped_warning)
+                self._apply_view_compatibility(report, skipped.name)
 
         # ---- 6. verify ----------------------------------------------------------
         total_verify = len(schema.tables)
@@ -436,6 +444,35 @@ class MigrationOrchestrator:
         return report
 
     # ------------------------------------------------------------------
+    def _apply_view_compatibility(self, report: MigrationReport, name: str) -> None:
+        from engine.translators.sql_builder import build_view_compatibility_ddl
+
+        view = self._view_fallbacks.get(_object_key(name))
+        stmt, warnings = build_view_compatibility_ddl(
+            view, self.target.dialect, "tsql"
+        ) if view is not None else (None, ["View metadata was unavailable"])
+        report.warnings.extend(warnings)
+        if not stmt:
+            report.schema_results.append(ObjectResult(
+                kind="view", name=name, status="failed", detail="; ".join(warnings),
+            ))
+            return
+        try:
+            self.target.execute(stmt)
+        except ConnectorError as exc:
+            report.schema_results.append(ObjectResult(
+                kind="view", name=name, status="failed",
+                detail=f"Compatibility view creation failed: {exc}; Statement: {stmt}"[:4000],
+            ))
+            return
+        detail = (
+            "Created as a dependency-free compatibility view with the exact "
+            "source column names and data types"
+        )
+        report.schema_results.append(ObjectResult(kind="view", name=name, detail=detail))
+        report.warnings.append(f"View '{name}': {detail}")
+        logger.warning("Compatibility view created name=%s", name)
+
     def _reset_tsql_target(self, schemas: list[str]) -> None:
         """Drop user objects in the given T-SQL schemas so a re-run is clean.
 

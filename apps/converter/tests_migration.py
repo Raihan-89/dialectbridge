@@ -354,7 +354,8 @@ class _FakeViewFailureTarget(_FakeConnector):
         self.missing = missing
 
     def execute(self, sql, params=None):
-        if sql.lstrip().upper().startswith("CREATE OR REPLACE VIEW"):
+        if (sql.lstrip().upper().startswith("CREATE OR REPLACE VIEW")
+                and "WHERE FALSE" not in sql.upper()):
             raise ConnectorError(
                 f'PostgreSQL execute failed: relation "{self.missing}" does not exist'
             )
@@ -372,7 +373,9 @@ class OrphanObjectReportingTests(SimpleTestCase):
         source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
         schema = source.extract_schema()
         schema.views = [View(name="dbo.Vw_Orphan",
-                             definition="SELECT * FROM dbo.tbl_BeneficiaryDet")]
+                             definition="SELECT * FROM dbo.tbl_BeneficiaryDet",
+                             columns=[Column("id", "INT", nullable=False),
+                                      Column("name", "NVARCHAR(50)")])]
         source.extract_schema = Mock(return_value=schema)
         target = _FakeViewFailureTarget(missing)
         return MigrationOrchestrator(source, target, copy_data=False).run()
@@ -380,8 +383,8 @@ class OrphanObjectReportingTests(SimpleTestCase):
     def test_view_over_a_table_missing_from_the_source_is_skipped(self):
         report = self._run("dbo.tbl_beneficiarydet")
         view_result = next(r for r in report.schema_results if r.kind == "view")
-        self.assertEqual(view_result.status, "skipped")
-        self.assertIn("does not exist in the source database", view_result.detail)
+        self.assertEqual(view_result.status, "success")
+        self.assertIn("compatibility view", view_result.detail)
         self.assertTrue(report.success)
         self.assertEqual(report.summary["schema_failed"], 0)
 

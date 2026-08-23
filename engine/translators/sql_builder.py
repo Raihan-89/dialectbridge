@@ -647,6 +647,25 @@ def build_view_ddl(view: View, target: str, source: str, tables: list | None = N
     return [stmt], []
 
 
+def build_view_compatibility_ddl(view: View, target: str, source: str) -> tuple[str | None, list[str]]:
+    """Preserve a view's public column contract when a dependency is absent."""
+    if target != "postgres" or not view.columns:
+        return None, [f"View '{view.name}' has no inspectable output columns"]
+    expressions, warnings = [], []
+    for column in view.columns:
+        target_type, warning = convert_type(column.data_type, source, target)
+        if warning:
+            warnings.append(f"View '{view.name}' column '{column.name}': {warning}")
+        expressions.append(
+            f"CAST(NULL AS {target_type or 'TEXT'}) AS {_qident(column.name, target)}"
+        )
+    return (
+        f"CREATE OR REPLACE VIEW {_qident(view.name, target)} AS SELECT "
+        + ", ".join(expressions) + " WHERE FALSE",
+        warnings,
+    )
+
+
 def build_function_ddl(fn: Routine, target: str, tables: list | None = None,
                        user_types: list | None = None) -> tuple[list[str], list[str]]:
     from engine.translators.procedure_translator import translate_routine
