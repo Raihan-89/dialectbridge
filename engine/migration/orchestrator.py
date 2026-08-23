@@ -37,6 +37,22 @@ _MISSING_RELATION_RE = re.compile(
 )
 
 
+def format_duration(seconds: float | None) -> str:
+    """Render a copy duration for the report tables ('—' when unknown)."""
+    if seconds is None:
+        return "—"
+    seconds = max(0.0, float(seconds))
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m {rest:02d}s"
+
+
 class MigrationCancelledError(Exception):
     """Raised when a cancellation was requested while the migration runs."""
 
@@ -49,6 +65,7 @@ class ObjectResult:
     detail: str = ""
     rows_copied: int = 0
     rows_failed: int = 0
+    duration_seconds: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +75,8 @@ class ObjectResult:
             "detail": self.detail,
             "rows_copied": self.rows_copied,
             "rows_failed": self.rows_failed,
+            "duration_seconds": self.duration_seconds,
+            "duration_display": format_duration(self.duration_seconds),
         }
 
 
@@ -267,6 +286,8 @@ class MigrationOrchestrator:
 
         # ---- 4. copy data -----------------------------------------------------
         self._table_progress = {}
+        copy_started = monotonic()
+        copy_elapsed = 0.0
         if self.copy_data:
             tables_to_copy = schema.all_tables_in_dependency_order()
             total_to_copy = len(tables_to_copy)
@@ -326,6 +347,8 @@ class MigrationOrchestrator:
                                      current_table_rows=self._table_progress[table.name]["rows_copied"],
                                      table_progress=self._table_progress)
 
+            copy_elapsed = monotonic() - copy_started
+
         # Build each index once, after bulk data loading.
         if deferred_indexes:
             self._progress_phase(75, 4, "Creating indexes after data load",
@@ -360,6 +383,10 @@ class MigrationOrchestrator:
                                      objects_applied=idx, total_objects=len(remaining_stmts))
 
         # ---- 6. verify ----------------------------------------------------------
+        # The per-table copy time is only known here; the live progress payload
+        # that carried it is gone once the job finishes, so it is folded into
+        # the stored report and stays visible on the report page afterwards.
+        copy_times = {r.name: r.duration_seconds for r in report.data_results}
         total_verify = len(schema.tables)
         for idx, table in enumerate(schema.tables, 1):
             self._check_cancelled()
@@ -376,11 +403,14 @@ class MigrationOrchestrator:
             except ConnectorError as exc:
                 logger.warning("Target row-count verification failed table=%s error=%s", table.name, exc)
                 tgt_count = None
+            copied = copy_times.get(table.name)
             report.verification.append({
                 "table": table.name,
                 "source_rows": src_count,
                 "target_rows": tgt_count,
                 "match": src_count == tgt_count,
+                "duration_seconds": copied,
+                "duration_display": format_duration(copied),
             })
 
         report.finished_at = _now()
@@ -394,6 +424,10 @@ class MigrationOrchestrator:
             "triggers": len(schema.triggers),
             "rows_copied": sum(r.rows_copied for r in report.data_results),
             "rows_failed": sum(r.rows_failed for r in report.data_results),
+            # Wall-clock span of the copy phase. Summing the per-table times
+            # would overcount by the worker count when tables copy in parallel.
+            "data_seconds": round(copy_elapsed, 2),
+            "data_duration": format_duration(copy_elapsed) if self.copy_data else "—",
             "schema_failed": sum(1 for r in report.schema_results if r.status == "failed"),
             "data_failed": sum(1 for r in report.data_results if r.status == "failed"),
             "warnings": len(report.warnings),
@@ -577,11 +611,13 @@ class MigrationOrchestrator:
     def _record_copy_result(self, report: MigrationReport, table_name: str,
                             result: dict, started: float) -> None:
         """Fold one table's copy summary into the report (shared by both paths)."""
+        elapsed = round(max(0.0, monotonic() - started), 2)
         obj = ObjectResult(
             kind="data", name=table_name,
             status="success" if not result["errors"] else "failed",
             rows_copied=result["rows_copied"], rows_failed=result["rows_failed"],
             detail="; ".join(result["errors"][:3]),
+            duration_seconds=elapsed,
         )
         report.data_results.append(obj)
         if obj.status == "failed":
@@ -592,7 +628,7 @@ class MigrationOrchestrator:
         else:
             logger.info(
                 "Table copied table=%s rows=%d duration_seconds=%.1f",
-                table_name, obj.rows_copied, monotonic() - started,
+                table_name, obj.rows_copied, elapsed,
             )
 
     def _copy_table(self, report: MigrationReport, table, on_batch=None) -> None:

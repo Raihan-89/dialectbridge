@@ -113,7 +113,7 @@ Deliberate ordering choices:
 - **`reset_target` option** (destructive, user opts in): PostgreSQL drops the target schemas `CASCADE`; SQL Server instead drops FKs, then tables, then views/procedures/functions/triggers inside the affected schemas (owner schemas like `dbo` cannot themselves be dropped). Re-runs are then clean.
 - **PostgreSQL `search_path`** is set to the migrated schemas so views/routines that reference tables by bare name still resolve.
 
-The report (`MigrationReport`) contains per-object results (kind, name, status, detail, rows copied/failed), a row-count verification table, warnings, and a summary. This is stored as JSON on `MigrationJob.report`. An optional progress callback reports the major phases (extract, convert, structural DDL, data copy, objects, verification and report persistence) to the web job.
+The report (`MigrationReport`) contains per-object results (kind, name, status, detail, rows copied/failed, copy duration), a row-count verification table, warnings, and a summary. This is stored as JSON on `MigrationJob.report`. An optional progress callback reports the major phases (extract, convert, structural DDL, data copy, objects, verification and report persistence) to the web job.
 
 ---
 
@@ -255,7 +255,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **239 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test` runs **260 tests**; `python manage.py check` reports no issues.
 
 ---
 

@@ -87,6 +87,7 @@
             <div><span class="label">Rows copied</span> {{ job.report.summary.rows_copied }}</div>
             <div><span class="label">Rows failed</span> {{ job.report.summary.rows_failed }}</div>
             <div><span class="label">Schema failures</span> {{ job.report.summary.schema_failed }}</div>
+            {% if job.report.summary.data_duration %}<div><span class="label">Data copy time</span> {{ job.report.summary.data_duration }}</div>{% endif %}
         </div>
 
         <h3>Verification (row counts)</h3>
@@ -98,6 +99,7 @@
                         <th>Table</th>
                         <th>Source</th>
                         <th>Target</th>
+                        <th>Time taken</th>
                         <th>Match</th>
                     </tr>
                 </thead>
@@ -107,6 +109,7 @@
                         <td class="mono">{{ v.table }}</td>
                         <td>{{ v.source_rows }}</td>
                         <td>{{ v.target_rows }}</td>
+                        <td class="mono">{{ v.duration_display|default:"—" }}</td>
                         <td>{% if v.match %}<span class="badge badge-ok">✓ Match</span>{% else %}<span class="badge badge-fail">✕ Mismatch</span>{% endif %}</td>
                     </tr>
                     {% endfor %}
@@ -157,6 +160,7 @@
                         <th>Table</th>
                         <th>Copied</th>
                         <th>Failed</th>
+                        <th>Time taken</th>
                         <th>Detail</th>
                     </tr>
                 </thead>
@@ -170,6 +174,7 @@
                         <td class="mono">{{ r.name }}</td>
                         <td>{{ r.rows_copied }}</td>
                         <td>{% if r.rows_failed %}<span class="badge badge-fail">{{ r.rows_failed }}</span>{% else %}{{ r.rows_failed }}{% endif %}</td>
+                        <td class="mono">{{ r.duration_display|default:"—" }}</td>
                         <td>{% if r.detail %}<span class="badge badge-fail" style="white-space:normal;">{{ r.detail }}</span>{% else %}—{% endif %}</td>
                     </tr>
                     {% endfor %}
