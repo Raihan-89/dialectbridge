@@ -37,6 +37,15 @@ _MISSING_RELATION_RE = re.compile(
 )
 
 
+def _object_key(name: str) -> str:
+    """Return a case-insensitive bare object name without SQL delimiters."""
+    bare = re.split(r"\s*\.\s*", name)[-1].strip()
+    if len(bare) >= 2 and ((bare[0] == "[" and bare[-1] == "]")
+                           or (bare[0] == '"' and bare[-1] == '"')):
+        bare = bare[1:-1]
+    return bare.replace("]]", "]").replace('""', '"').casefold()
+
+
 class MigrationCancelledError(Exception):
     """Raised when a cancellation was requested while the migration runs."""
 
@@ -190,7 +199,7 @@ class MigrationOrchestrator:
             return report
 
         self._source_objects = {
-            obj.name.rsplit(".", 1)[-1].lower()
+            _object_key(obj.name)
             for group in (schema.tables, schema.views, schema.functions,
                           schema.procedures, schema.sequences, schema.synonyms)
             for obj in group
@@ -613,7 +622,7 @@ class MigrationOrchestrator:
         if not match:
             return None
         reference = match.group(1)
-        if reference.rsplit(".", 1)[-1].lower() in self._source_objects:
+        if _object_key(reference) in self._source_objects:
             return None
         return reference
 

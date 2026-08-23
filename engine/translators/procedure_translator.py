@@ -96,7 +96,14 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     # emit the rest: every FOR XML must sit inside a convertible span, or the
     # untranslated ones reach PostgreSQL as `syntax error at or near "xml"`.
     if _FOR_XML_RE.search(sql):
-        convertible = [m.span() for m in _XML_PATH_AGG_RE.finditer(sql)]
+        # A permissive STUFF span can stretch from one STUFF call to a later
+        # XML clause in a large routine.  Such a span is only safe when it
+        # contains exactly the single FOR XML occurrence it will translate.
+        convertible = []
+        for match in _XML_PATH_AGG_RE.finditer(sql):
+            span = match.span()
+            if len(list(_FOR_XML_RE.finditer(sql, *span))) == 1:
+                convertible.append(span)
         if any(
             not any(start <= m.start() and m.end() <= end for start, end in convertible)
             for m in _FOR_XML_RE.finditer(sql)
@@ -267,7 +274,60 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     footer = "$$ LANGUAGE plpgsql;"
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
+    lexical_error = _plpgsql_lexical_error(converted)
+    if lexical_error:
+        return None, warnings + [
+            f"Generated PL/pgSQL is incomplete ({lexical_error}) — the routine "
+            "was not executed; review the original T-SQL definition"
+        ]
     return converted, warnings
+
+
+def _plpgsql_lexical_error(sql: str) -> str | None:
+    """Detect unterminated literals/delimiters before PostgreSQL executes SQL."""
+    depth = 0
+    i = 0
+    while i < len(sql):
+        if sql.startswith("$$", i):
+            i += 2
+            continue
+        ch = sql[i]
+        if ch == "'":
+            end = i + 1
+            while end < len(sql):
+                if sql[end] == "'":
+                    if end + 1 < len(sql) and sql[end + 1] == "'":
+                        end += 2
+                        continue
+                    break
+                end += 1
+            if end >= len(sql):
+                return "unterminated string literal"
+            i = end + 1
+            continue
+        if ch == '"':
+            end = i + 1
+            while end < len(sql):
+                if sql[end] == '"':
+                    if end + 1 < len(sql) and sql[end + 1] == '"':
+                        end += 2
+                        continue
+                    break
+                end += 1
+            if end >= len(sql):
+                return "unterminated quoted identifier"
+            i = end + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return "unmatched closing parenthesis"
+        i += 1
+    if depth:
+        return "unbalanced parentheses"
+    return None
 
 
 def _ambiguous_variable_warnings(routine: str, params: list[tuple[str, str, bool]],

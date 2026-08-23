@@ -3017,6 +3017,25 @@ class SecondRoundMigrationFailureTests(TestCase):
         self.assertIsNone(converted)
         self.assertIn("FOR XML", warnings[0])
 
+    def test_stuff_span_cannot_hide_a_second_for_xml_clause(self):
+        converted, warnings = self._convert(
+            "CREATE FUNCTION dbo.f() RETURNS int AS BEGIN\n"
+            "  SELECT STUFF((SELECT ', ' + Name FROM Tags FOR XML PATH('')), 1, 2, '')\n"
+            "  SELECT Name FROM OtherTags FOR XML PATH('')\n"
+            "  RETURN 1\nEND"
+        )
+        self.assertIsNone(converted)
+        self.assertIn("FOR XML", warnings[0])
+
+    def test_malformed_generated_body_is_not_sent_to_postgres(self):
+        converted, warnings = self._convert(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "  SELECT ISNULL(Latitude, 'unterminated) FROM t\n"
+            "END"
+        )
+        self.assertIsNone(converted)
+        self.assertTrue(any("incomplete" in warning for warning in warnings))
+
     # -- sp_generate_merge: SQL Server metadata scripting is not portable ----
     def test_sql_server_metadata_routines_are_reported_not_guessed(self):
         converted, warnings = self._convert(

@@ -392,6 +392,17 @@ class OrphanObjectReportingTests(SimpleTestCase):
         self.assertEqual(view_result.status, "failed")
         self.assertFalse(report.success)
 
+    def test_bracketed_source_table_name_is_recognised_as_present(self):
+        source = _FakeConnector({"[dbo].[tbl_BeneficiaryDet]": [(1,)]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.views = [View(name="dbo.v", definition="SELECT * FROM dbo.tbl_BeneficiaryDet")]
+        source.extract_schema = Mock(return_value=schema)
+        target = _FakeViewFailureTarget("dbo.tbl_beneficiarydet")
+        report = MigrationOrchestrator(source, target, copy_data=False).run()
+        view_result = next(r for r in report.schema_results if r.kind == "view")
+        self.assertEqual(view_result.status, "failed")
+        self.assertNotIn("does not exist in the source database", view_result.detail)
+
 
 class CopyStreamRenderingTests(SimpleTestCase):
     """The COPY TEXT renderer is the hot path of every migration; these pin the
