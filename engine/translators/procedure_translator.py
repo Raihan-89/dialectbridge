@@ -91,12 +91,21 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     # PostgreSQL at all. Emitting a guessed translation produced thousands of
     # lines of SQL that could never compile; report them for a manual rewrite
     # instead (the same contract as the spt_values guard above).
-    if _FOR_XML_RE.search(sql) and not _XML_PATH_AGG_RE.search(sql):
-        return None, [
-            "uses FOR XML, which PostgreSQL has no equivalent for — only the "
-            "FOR XML PATH('') string-aggregation idiom is converted "
-            "(to string_agg); rewrite the remaining XML generation by hand"
-        ]
+    # A routine may mix the convertible STUFF(... FOR XML PATH('')) idiom with
+    # other FOR XML usage. Finding one convertible occurrence is not licence to
+    # emit the rest: every FOR XML must sit inside a convertible span, or the
+    # untranslated ones reach PostgreSQL as `syntax error at or near "xml"`.
+    if _FOR_XML_RE.search(sql):
+        convertible = [m.span() for m in _XML_PATH_AGG_RE.finditer(sql)]
+        if any(
+            not any(start <= m.start() and m.end() <= end for start, end in convertible)
+            for m in _FOR_XML_RE.finditer(sql)
+        ):
+            return None, [
+                "uses FOR XML, which PostgreSQL has no equivalent for — only the "
+                "FOR XML PATH('') string-aggregation idiom is converted "
+                "(to string_agg); rewrite the remaining XML generation by hand"
+            ]
 
     unportable = sorted({
         match.group(1).upper()

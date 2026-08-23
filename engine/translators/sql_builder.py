@@ -1551,6 +1551,14 @@ def _mask(text: str) -> tuple[str, list[str]]:
         stash.append(m.group(0))
         return f"\x01{len(stash) - 1}\x01"
 
+    # A quoted identifier may legitimately contain an apostrophe
+    # (`"Beneficiary's name"`). It has to be hidden *before* the string-literal
+    # pass below, otherwise that pass pairs the apostrophe with the next real
+    # literal quote and masks all the SQL in between — the table and column
+    # references inside that span then stayed unqualified, PostgreSQL folded
+    # them to lower case, and the whole view failed with "relation does not
+    # exist".
+    text = re.sub(r'"[^"\n]*\'[^"\n]*"', _s2, text)
     text = re.sub(r"'([^']*)'", _s1, text)
     # Quoted identifiers are scanned as whole `"..."` tokens and only *then*
     # judged, so the scan can never straddle the gap between two of them.

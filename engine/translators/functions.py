@@ -23,6 +23,11 @@ def _find_calls(text: str):
     a call such as ``ISNULL(x, '(')`` was matched with the wrong end offset and
     ``_rewrite_calls`` spliced its replacement over unrelated SQL, silently
     deleting text (an unterminated literal further along the statement).
+
+    Delimited identifiers are skipped whole for the same reason: an apostrophe
+    inside ``[Beneficiary's name]`` / ``"Beneficiary's name"`` is part of the
+    name, not the start of a literal, and reading it as one made the scanner
+    run to the next unrelated quote and miss every call in between.
     """
     i = 0
     n = len(text)
@@ -30,6 +35,9 @@ def _find_calls(text: str):
         ch = text[i]
         if ch == "'":
             i = _skip_string(text, i)
+            continue
+        if ch == '"' or ch == "[":
+            i = _skip_delimited(text, i)
             continue
         m = re.match(_IDENT, text[i:])
         if m:
@@ -47,6 +55,9 @@ def _find_calls(text: str):
                     if c == "'":
                         end = _skip_string(text, end)
                         continue
+                    if c == '"' or c == "[":
+                        end = _skip_delimited(text, end)
+                        continue
                     if c == "(":
                         depth += 1
                     elif c == ")":
@@ -61,6 +72,17 @@ def _find_calls(text: str):
             i = j
         else:
             i += 1
+
+
+def _skip_delimited(text: str, i: int) -> int:
+    """Return the index just past the delimited identifier starting at ``i``.
+
+    ``[Order's Total]`` and ``"Order's Total"`` are one identifier each, so the
+    apostrophe they contain must not be treated as a string delimiter.
+    """
+    closing = "]" if text[i] == "[" else '"'
+    end = text.find(closing, i + 1)
+    return len(text) if end == -1 else end + 1
 
 
 def _skip_string(text: str, i: int) -> int:
@@ -93,6 +115,13 @@ def _split_args(arg_string: str) -> list[str]:
         elif ch == "'":
             in_str = True
             cur.append(ch)
+        elif ch == '"' or ch == "[":
+            # One delimited identifier: an apostrophe inside it is part of the
+            # name and must not open a literal.
+            end = _skip_delimited(arg_string, i)
+            cur.append(arg_string[i:end])
+            i = end
+            continue
         elif ch in "([":
             depth += 1
             cur.append(ch)
