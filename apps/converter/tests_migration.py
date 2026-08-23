@@ -14,7 +14,7 @@ from engine.connectors.mssql import MSSQLConnector
 from engine.connectors.postgres import PostgresConnector
 from engine.migration.data_mover import DataMigration
 from engine.migration.orchestrator import MigrationOrchestrator
-from engine.schema import Column, Constraint, Database, Index, Table, View
+from engine.schema import Column, Constraint, Database, Index, Routine, Table, View
 from engine.translators.sql_builder import build_table_ddl
 
 
@@ -617,6 +617,7 @@ class ObjectReconciliationTests(SimpleTestCase):
 
         missing = [r for r in report.schema_results
                    if r.status == "failed" and "Vw_Vanished" in r.name]
+        # No warning explains it, so it is a genuine failure, not a decline.
         self.assertEqual(len(missing), 1, [r.to_dict() for r in report.schema_results])
         self.assertIn("Missing from the target database", missing[0].detail)
         self.assertFalse(report.success)
@@ -689,3 +690,33 @@ class SourceDependencyProbeTests(SimpleTestCase):
         for _ in range(3):
             orchestrator._missing_source_dependency('relation "dbo.gone" does not exist')
         self.assertEqual(orchestrator.source.fetchone.call_count, 1)
+
+
+class DeclinedObjectTests(SimpleTestCase):
+    """An object the engine refused to convert is a skip, not a failure.
+
+    Routines built on constructs the translator will not guess at (dynamic SQL
+    report generators, unconvertible FOR XML) never reach the target. They are
+    already reported as warnings, so the reconciliation pass must not restate
+    them as migration failures — that turned a clean run into 19 red errors for
+    objects that had never migrated in the first place.
+    """
+
+    def _report(self):
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.procedures = [Routine(name="dbo.getAttendanceReport", kind="procedure",
+                                     definition="CREATE PROCEDURE dbo.getAttendanceReport AS "
+                                                "SELECT * FROM master..spt_values")]
+        source.extract_schema = Mock(return_value=schema)
+        target = _InventoryTarget([("table", "dbo.users")])
+        return MigrationOrchestrator(source, target, copy_data=False).run()
+
+    def test_declined_routine_is_skipped_and_keeps_the_run_successful(self):
+        report = self._report()
+        result = next(r for r in report.schema_results if r.name == "dbo.getAttendanceReport")
+        self.assertEqual(result.status, "skipped", result.detail)
+        self.assertIn("Reported cause:", result.detail)
+        self.assertTrue(report.success)
+        self.assertEqual(report.summary["schema_failed"], 0)
+        self.assertEqual(report.summary["objects_declined"], 1)

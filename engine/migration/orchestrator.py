@@ -536,6 +536,10 @@ class MigrationOrchestrator:
             "objects_missing": sum(
                 1 for r in report.schema_results if r.detail.startswith(_MISSING_IN_TARGET)
             ),
+            "objects_declined": sum(
+                1 for r in report.schema_results
+                if r.status == "skipped" and r.detail.startswith(_MISSING_IN_TARGET)
+            ),
         }
         logger.info(
             "Migration finished status=%s rows_copied=%d rows_failed=%d warnings=%d duration_seconds=%.1f",
@@ -599,15 +603,22 @@ class MigrationOrchestrator:
                 if any(r.status in ("failed", "skipped") for r in existing):
                     continue          # already reported with its real reason
                 reason = self._missing_object_reason(report, name)
+                # A stated reason means the engine declined this object on
+                # purpose (an unconvertible construct it refuses to guess at)
+                # and already warned about it — that is a skip, not a failure.
+                # Only an object that vanished with no explanation at all is a
+                # genuine migration failure.
+                status = "skipped" if reason else "failed"
                 detail = _MISSING_IN_TARGET + (
                     f" {kind.title()} '{name}' is present in the source but was not found in "
                     f"the target after the migration."
                 )
                 if reason:
                     detail += f" Reported cause: {reason}"
-                logger.error("Object missing from target kind=%s name=%s", kind, name)
+                logger.warning("Object missing from target kind=%s name=%s status=%s",
+                               kind, name, status)
                 report.schema_results.append(ObjectResult(
-                    kind=kind, name=name, status="failed", detail=detail[:4000],
+                    kind=kind, name=name, status=status, detail=detail[:4000],
                 ))
                 report.warnings.append(f"{kind.title()} '{name}': {detail}"[:4000])
 

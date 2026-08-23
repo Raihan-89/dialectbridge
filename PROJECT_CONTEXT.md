@@ -117,8 +117,11 @@ Deliberate ordering choices:
   `pg_trigger`, or `sys.objects`) and records an explicit `failed` result for
   every source table/view/function/procedure/sequence/trigger/synonym the
   target does not hold. An object that disappeared without an error — a CREATE
-  that reported success but left nothing behind, a routine the builder dropped
-  with only a warning — can no longer pass unnoticed. When the target cannot be
+  that reported success but left nothing behind — can no longer pass unnoticed.
+  Severity follows intent: an object the engine **declined on purpose** (an
+  unconvertible construct it refuses to guess at) already carries a warning
+  explaining why, so it is recorded as `skipped` and the run still completes;
+  only an object that vanished with no explanation is recorded as `failed`. When the target cannot be
   inventoried (unknown dialect, refused catalog query, a connector that returns
   nothing) the pass is skipped rather than reporting phantom losses.
 - **A missing relation is confirmed against the live source** before the report
@@ -276,7 +279,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **253 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test` runs **254 tests**; `python manage.py check` reports no issues.
 
 ---
 
