@@ -51,6 +51,21 @@ def _routine_error_context(sql: str, max_len: int = 80) -> str:
 
 _SPT_VALUES_RE = re.compile(r"\bspt_values\b", re.IGNORECASE)
 
+# SQL Server metadata/scripting functions with no PostgreSQL counterpart. A
+# routine using one of these is a T-SQL admin script, not portable logic.
+_FOR_XML_RE = re.compile(r"\bFOR\s+XML\b", re.IGNORECASE)
+# The one FOR XML shape that does convert: STUFF(( ... FOR XML PATH('')), 1, n, '').
+_XML_PATH_AGG_RE = re.compile(
+    r"\bSTUFF\s*\(\s*\(\s*SELECT\b.*?\bFOR\s+XML\s+PATH\s*\(\s*N?''\s*\)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_TSQL_METADATA_API_RE = re.compile(
+    r"\b(QUOTENAME|PARSENAME|OBJECTPROPERTY|OBJECTPROPERTYEX|COLUMNPROPERTY|"
+    r"SERVERPROPERTY|DATABASEPROPERTYEX|INDEXPROPERTY|sp_executesql|"
+    r"fn_listextendedproperty)\s*\(",
+    re.IGNORECASE,
+)
+
 
 def _tsql_to_plpgsql(sql: str, tables: list | None = None,
                      user_types: list | None = None) -> tuple[str | None, list[str]]:
@@ -70,6 +85,28 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
             "references master..spt_values (a SQL Server internal numbers "
             "table) — this routine builds a dynamic PIVOT and has no "
             "PostgreSQL equivalent; rewrite it by hand using generate_series()"
+        ]
+
+    # Routines built on SQL Server's own metadata/scripting API cannot run on
+    # PostgreSQL at all. Emitting a guessed translation produced thousands of
+    # lines of SQL that could never compile; report them for a manual rewrite
+    # instead (the same contract as the spt_values guard above).
+    if _FOR_XML_RE.search(sql) and not _XML_PATH_AGG_RE.search(sql):
+        return None, [
+            "uses FOR XML, which PostgreSQL has no equivalent for — only the "
+            "FOR XML PATH('') string-aggregation idiom is converted "
+            "(to string_agg); rewrite the remaining XML generation by hand"
+        ]
+
+    unportable = sorted({
+        match.group(1).upper()
+        for match in _TSQL_METADATA_API_RE.finditer(sql)
+    })
+    if unportable:
+        return None, [
+            f"uses SQL Server-only metadata function(s) {', '.join(unportable)}, "
+            f"which have no PostgreSQL equivalent — this routine scripts SQL "
+            f"Server metadata and must be rewritten by hand"
         ]
 
     # ---- header -----------------------------------------------------------
@@ -685,6 +722,10 @@ _STMT_START_RE = re.compile(
     re.IGNORECASE,
 )
 _SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
+_BLOCK_KEYWORD_RE = re.compile(
+    r"^(BEGIN\s+TRY|BEGIN\s+CATCH|END\s+TRY|END\s+CATCH|BEGIN|END|ELSE)\s*;+\s*$",
+    re.IGNORECASE,
+)
 _MERGE_START_RE = re.compile(r"^MERGE\b", re.IGNORECASE)
 _MERGE_ACTION_RE = re.compile(r"^(?:UPDATE|INSERT|DELETE|WHEN|THEN|VALUES|SET|OUTPUT)$", re.IGNORECASE)
 _SET_SESSION_OPTION_RE = re.compile(r"^SET\s+\w+(?:\s+\w+)*\s+(?:ON|OFF)\s*;?\s*$", re.IGNORECASE)
@@ -1120,6 +1161,13 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
         # statement; they are documentation only and are dropped.
         if line.startswith("--"):
             continue
+        # T-SQL terminates block keywords with an optional semicolon
+        # (``END;``). Without stripping it the line was treated as an ordinary
+        # statement, so the block never closed and the whole routine came out
+        # unbalanced.
+        terminator = _BLOCK_KEYWORD_RE.match(line)
+        if terminator:
+            line = " ".join(terminator.group(1).split())
         upper = line.upper()
 
         # A completed single-statement then-branch is resolved by the next
@@ -1307,23 +1355,88 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
         flush()
     while waiting:
         _close_now()
-    if stack:
-        # A body whose BEGIN/END blocks do not balance used to be emitted
-        # truncated, which PostgreSQL rejects with "syntax error at end of
-        # input" and loses the whole routine. Close the still-open blocks so
-        # the routine at least compiles, and warn so the nesting is reviewed.
+
+    # A body whose blocks do not balance used to be emitted as-is, which
+    # PostgreSQL rejects ("syntax error at or near ELSE" / "at end of input")
+    # and loses the whole routine. Repair the emitted nesting instead.
+    out, repaired = _repair_block_structure(out)
+    if repaired:
         t_warns.append(
-            f"Unbalanced BEGIN/END blocks ({len(stack)} left open) — the missing "
-            f"block terminators were added automatically; review the converted nesting"
+            "Unbalanced BEGIN/END blocks — the missing block terminators were "
+            "added automatically; review the converted nesting"
         )
-        for entry in reversed(stack):
-            if isinstance(entry, tuple):
-                out.append("END IF;" if entry[0] == "if" else "END LOOP;")
-            else:
-                out.append("END;")
-        stack.clear()
 
     return out, t_warns, declared
+
+
+_EMITTED_IF_RE = re.compile(r"^IF\b.*\bTHEN$", re.IGNORECASE)
+_EMITTED_LOOP_RE = re.compile(r"^WHILE\b.*\bLOOP$", re.IGNORECASE)
+
+
+def _repair_block_structure(lines: list[str]) -> tuple[list[str], bool]:
+    """Insert the block terminators the emitted PL/pgSQL is missing.
+
+    PL/pgSQL requires ELSE / END IF to sit directly inside their IF. When the
+    T-SQL block engine loses an ``END`` the generated ELSE lands inside a still
+    open BEGIN block and PostgreSQL refuses the routine. This pass walks the
+    emitted lines and closes any BEGIN that stands between an ELSE / END IF and
+    its IF, then closes whatever is still open at the end. It only *inserts*
+    terminators, so already balanced output passes through untouched.
+    """
+    out: list[str] = []
+    stack: list[str] = []
+    changed = False
+
+    def _close_until(kind: str) -> None:
+        nonlocal changed
+        while stack and stack[-1] != kind:
+            if stack[-1] != "begin":
+                return
+            out.append("END;")
+            stack.pop()
+            changed = True
+
+    for line in lines:
+        # Statements rendered as one multi-line chunk are internally balanced.
+        if "\n" in line:
+            out.append(line)
+            continue
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        if upper == "ELSE":
+            _close_until("if")
+            out.append(line)
+        elif upper == "END IF;":
+            _close_until("if")
+            if stack and stack[-1] == "if":
+                stack.pop()
+            out.append(line)
+        elif upper == "END LOOP;":
+            _close_until("loop")
+            if stack and stack[-1] == "loop":
+                stack.pop()
+            out.append(line)
+        elif upper == "END;":
+            if stack:
+                stack.pop()
+            out.append(line)
+        elif upper == "BEGIN":
+            stack.append("begin")
+            out.append(line)
+        elif _EMITTED_IF_RE.match(stripped):
+            stack.append("if")
+            out.append(line)
+        elif _EMITTED_LOOP_RE.match(stripped):
+            stack.append("loop")
+            out.append(line)
+        else:
+            out.append(line)
+
+    for entry in reversed(stack):
+        out.append({"begin": "END;", "if": "END IF;"}.get(entry, "END LOOP;"))
+        changed = True
+    return out, changed
 
 
 def _contains_toplevel_keyword(text: str, word: str) -> bool:

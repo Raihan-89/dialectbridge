@@ -18,11 +18,19 @@ _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 def _find_calls(text: str):
     """Yield (start, end, name, arg_string) for every NAME(...) call.
 
-    Balanced-paren aware; returns outermost calls only.
+    Balanced-paren aware; returns outermost calls only. Parentheses inside
+    string literals are skipped: counting them desynchronised the scanner, so
+    a call such as ``ISNULL(x, '(')`` was matched with the wrong end offset and
+    ``_rewrite_calls`` spliced its replacement over unrelated SQL, silently
+    deleting text (an unterminated literal further along the statement).
     """
     i = 0
     n = len(text)
     while i < n:
+        ch = text[i]
+        if ch == "'":
+            i = _skip_string(text, i)
+            continue
         m = re.match(_IDENT, text[i:])
         if m:
             ident = m.group(0)
@@ -35,20 +43,38 @@ def _find_calls(text: str):
                 depth = 0
                 end = k
                 while end < n:
-                    if text[end] == "(":
+                    c = text[end]
+                    if c == "'":
+                        end = _skip_string(text, end)
+                        continue
+                    if c == "(":
                         depth += 1
-                    elif text[end] == ")":
+                    elif c == ")":
                         depth -= 1
                         if depth == 0:
                             break
                     end += 1
-                if depth == 0:
+                if depth == 0 and end < n:
                     yield i, end + 1, ident, text[k + 1:end]
                     i = end + 1
                     continue
             i = j
         else:
             i += 1
+
+
+def _skip_string(text: str, i: int) -> int:
+    """Return the index just past the single-quoted literal starting at ``i``."""
+    n = len(text)
+    i += 1
+    while i < n:
+        if text[i] == "'":
+            if i + 1 < n and text[i + 1] == "'":
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return n
 
 
 def _split_args(arg_string: str) -> list[str]:
@@ -206,7 +232,58 @@ def _stuff_to_overlay(args: str) -> str | None:
     if len(parts) != 4:
         return None
     text, start, length, repl = parts
+    # `STUFF((SELECT sep + col FROM t FOR XML PATH('')), 1, n, '')` is T-SQL's
+    # string-aggregation idiom, not a real STUFF: FOR XML concatenates and the
+    # STUFF trims the leading separator. PostgreSQL spells that string_agg.
+    aggregated = _xml_path_to_string_agg(text, start, repl)
+    if aggregated is not None:
+        return aggregated
+    if _FOR_XML_RE.search(text):
+        # Some other FOR XML shape — leave it untranslated so the routine-level
+        # guard reports it instead of emitting SQL that cannot compile.
+        return None
     return f"OVERLAY({text} PLACING {repl} FROM {start} FOR {length})"
+
+
+_FOR_XML_RE = re.compile(r"\bFOR\s+XML\b", re.IGNORECASE)
+_XML_PATH_SELECT_RE = re.compile(
+    r"^\(\s*SELECT\s+(?P<expr>.*?)\s+FROM\s+(?P<rest>.*?)"
+    r"\s+FOR\s+XML\s+PATH\s*\(\s*(?:N?'')\s*\)\s*\)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONCAT_CALL_RE = re.compile(r"^\s*CONCAT\s*\((?P<args>.*)\)\s*$", re.IGNORECASE | re.DOTALL)
+_LEADING_LITERAL_RE = re.compile(
+    r"^\s*(?P<sep>N?'(?:[^']|'')*'(?:\s*\+\s*[A-Za-z_]\w*\s*\([^()]*\))*)\s*\+\s*(?P<value>.+)$",
+    re.DOTALL,
+)
+
+
+def _xml_path_to_string_agg(text: str, start: str, replacement: str) -> str | None:
+    """Rewrite the FOR XML PATH('') concatenation idiom as string_agg()."""
+    match = _XML_PATH_SELECT_RE.match(text.strip())
+    if not match:
+        return None
+    # Only the "strip the leading separator" form maps cleanly.
+    if start.strip() != "1" or replacement.strip().lstrip("Nn") != "''":
+        return None
+    separator, value = _split_aggregate_expression(match.group("expr"))
+    if separator is None:
+        return None
+    return f"(SELECT string_agg({value}, {separator}) FROM {match.group('rest')})"
+
+
+def _split_aggregate_expression(expr: str) -> tuple[str | None, str | None]:
+    """Split `sep + col` / `CONCAT(sep, col)` into (separator, value)."""
+    concat = _CONCAT_CALL_RE.match(expr)
+    if concat:
+        parts = _split_args(concat.group("args"))
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+        return None, None
+    literal = _LEADING_LITERAL_RE.match(expr)
+    if literal:
+        return literal.group("sep").strip(), literal.group("value").strip()
+    return None, None
 
 
 def _convert_to_cast(args: str) -> str | None:
@@ -301,6 +378,34 @@ def _overlay_to_stuff(args: str) -> str | None:
     return f"STUFF({text}, {start}, {length}, {repl})"
 
 
+# T-SQL CHAR(n) returns the character with code n; PostgreSQL spells that
+# chr(n). CHAR is also a *type* name, so the rewrite only fires where a value
+# is expected — never after AS/:: (a cast) or after an identifier (a column
+# declaration such as `b CHAR(1)`).
+_CHAR_CALL_RE = re.compile(r"\bN?CHAR\s*\(\s*(\d+)\s*\)", re.IGNORECASE)
+_VALUE_CONTEXT_WORDS = frozenset(
+    "select then else return when and or not like set values by case "
+    "concat coalesce isnull print raise exception notice union all".split()
+)
+
+
+def _translate_char_calls(text: str) -> str:
+    def _replace(match):
+        prefix = text[:match.start()].rstrip()
+        if not prefix:
+            return f"chr({match.group(1)})"
+        if prefix.endswith("::"):
+            return match.group(0)
+        if prefix[-1] in "(,+|=<>*/%-":
+            return f"chr({match.group(1)})"
+        word = re.search(r"([A-Za-z_]\w*)$", prefix)
+        if word and word.group(1).lower() in _VALUE_CONTEXT_WORDS:
+            return f"chr({match.group(1)})"
+        return match.group(0)
+
+    return _CHAR_CALL_RE.sub(_replace, text)
+
+
 def translate_functions(text: str, source: str, target: str) -> str:
     """Translate a small expression (no full statements) between dialects."""
     if source == "tsql" and target == "postgres":
@@ -336,6 +441,7 @@ def translate_functions(text: str, source: str, target: str) -> str:
         text = re.sub(r"\bCURRENT_TIMESTAMP\b", "CURRENT_TIMESTAMP", text, flags=re.I)
         text = re.sub(r"\bGETUTCDATE\s*\(\s*\)", "CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", text, flags=re.I)
         text = re.sub(r"\bSYSTEM_USER\b", "CURRENT_USER", text, flags=re.I)
+        text = _translate_char_calls(text)
         return text
     elif source == "postgres" and target == "tsql":
         text = _rewrite_calls(text, {

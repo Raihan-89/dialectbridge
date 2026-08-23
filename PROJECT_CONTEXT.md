@@ -250,11 +250,12 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
   - Connector robustness: legacy SQL Server skips optional catalogs, index probes tolerate missing columns, raw-bigint bytes coerced via `to_int()`.
   - Trigger header tolerance: `WITH EXECUTE AS`/`NOT FOR REPLICATION`; compact trigger bodies with `RAISERROR` → `RAISE EXCEPTION`.
   - Reported real-migration routine failures (`ReportedMigrationFailureTests`): `THROW n, 'msg, with commas', s` keeps the whole literal; a body opening directly with `AS BEGIN TRY` stays block-balanced; `INSERT @tablevar VALUES` gains its `INTO`; multi-line `DECLARE @a t, @b t` declares every variable; `IF (expr) IS NOT NULL` stays one condition; a multi-line `UPDATE ... SET` on an `ELSE` line stays one statement; `MERGE ... WHEN MATCHED THEN UPDATE` is never split; unbalanced bodies are auto-closed with a warning; routine parameters/locals are never rewritten into quoted column references.
+  - Second reported batch (`SecondRoundMigrationFailureTests`): `END;`/`BEGIN TRY;` written with a semicolon still close/open their block; a misplaced `ELSE` gets its missing `END;` from the block-repair pass; a `(` inside a string literal no longer desynchronises the call scanner (which silently deleted SQL); `CHAR(n)` becomes `chr(n)` in value position but stays a type after `AS`/in DDL; `STUFF((SELECT sep + col ... FOR XML PATH('')), 1, n, '')` becomes `string_agg`; other `FOR XML` shapes and SQL Server metadata scripting (`QUOTENAME`/`PARSENAME`/...) are reported for manual rewrite instead of guessed.
   - View dependencies (`ViewDependencyTests`): a view selecting from another view is schema-qualified and quoted, and is created after the view it depends on (cycles still emit every view).
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **225 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test` runs **239 tests**; `python manage.py check` reports no issues.
 
 ---
 

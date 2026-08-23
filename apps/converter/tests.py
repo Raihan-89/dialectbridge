@@ -15,7 +15,8 @@ from engine.schema import (
 )
 from engine.service import convert_sql, UnsupportedStatementTypeError
 from engine.translators.ddl_translator import convert_ddl
-from engine.translators.procedure_translator import translate_routine
+from engine.translators.functions import translate_functions
+from engine.translators.procedure_translator import _repair_block_structure, translate_routine
 from engine.translators.sql_builder import build_database_ddl, build_security_ddl, convert_type
 from engine.translators.trigger_translator import translate_trigger
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
@@ -2677,7 +2678,7 @@ class ReportedMigrationFailureTests(TestCase):
         converted, _ = self._convert(
             "CREATE PROCEDURE dbo.p @table_name varchar(776)\n"
             "AS\nBEGIN\n"
-            "  IF (PARSENAME(@table_name,3)) IS NOT NULL\n"
+            "  IF (COALESCE(@table_name, NULL)) IS NOT NULL\n"
             "  BEGIN\n"
             "    RETURN\n"
             "  END\n"
@@ -2889,3 +2890,150 @@ class RoutineVariableShadowingTests(TestCase):
             "AS\nBEGIN\n  SELECT SKU FROM @Products\nEND"
         )
         self.assertIn("INOUT result_cursor refcursor DEFAULT 'result_cursor'", procedure)
+
+
+class SecondRoundMigrationFailureTests(TestCase):
+    """Second batch of real-migration routine failures."""
+
+    def _convert(self, sql):
+        return translate_routine(sql, source="procedure", target="postgres")
+
+    @staticmethod
+    def _body(sql):
+        return sql.split("$$", 2)[1]
+
+    def _assert_balanced(self, sql):
+        body = self._body(sql)
+        opens = len(re.findall(r"(?m)^\s*(?:BEGIN|IF\b.*\bTHEN|WHILE\b.*\bLOOP)\s*$", body))
+        closes = len(re.findall(r"(?m)^\s*END(?:\s+IF|\s+LOOP)?;\s*$", body))
+        self.assertEqual(opens, closes, sql)
+
+    # -- UpsertMenu: `END;` was treated as a statement, never closing a block --
+    def test_block_terminators_written_with_a_semicolon_close_their_block(self):
+        converted, warnings = self._convert(
+            "CREATE PROCEDURE dbo.UpsertMenu @Name varchar(128)\n"
+            "AS\nBEGIN\n"
+            "    IF @Name IS NULL\n"
+            "    BEGIN\n"
+            "        THROW 50000, 'Name cannot be null.', 1;\n"
+            "    END;\n"
+            "    SELECT 1;\n"
+            "END;"
+        )
+        self.assertIn("END;\nEND IF;", converted)
+        self._assert_balanced(converted)
+        self.assertEqual(warnings, [])
+
+    def test_begin_try_written_with_a_semicolon_still_opens_a_block(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"
+            "  BEGIN TRY;\n    SELECT 1\n  END TRY;\n"
+            "  BEGIN CATCH;\n    SELECT 2\n  END CATCH;\n"
+            "END"
+        )
+        self.assertIn("EXCEPTION WHEN OTHERS THEN", converted)
+        self._assert_balanced(converted)
+
+    # -- sp_InsUpdIPUserCreation: ELSE emitted inside a still-open BEGIN ------
+    def test_misplaced_else_gets_the_missing_block_terminator(self):
+        repaired, changed = _repair_block_structure([
+            "IF (a <> '') THEN", "BEGIN",
+            "IF EXISTS (SELECT 1) THEN", "BEGIN", "OPEN c FOR SELECT 1;", "END;",
+            "ELSE", "BEGIN", "UPDATE t SET a=1;", "END;",
+            "END IF;",
+            "ELSE", "BEGIN", "OPEN d FOR SELECT 2;", "END;",
+            "END IF;",
+        ])
+        self.assertTrue(changed)
+        self.assertEqual(repaired[repaired.index("END IF;") + 1], "END;")
+        self.assertEqual(repaired.count("END;"), 4)
+
+    def test_already_balanced_output_is_left_untouched(self):
+        lines = ["IF a THEN", "BEGIN", "x := 1;", "END;", "ELSE", "BEGIN", "y := 2;", "END;", "END IF;"]
+        repaired, changed = _repair_block_structure(list(lines))
+        self.assertFalse(changed)
+        self.assertEqual(repaired, lines)
+
+    def test_multi_line_statements_are_treated_as_opaque(self):
+        lines = ["BEGIN", "IF pg_trigger_depth() = 1 THEN\nUPDATE t SET a=1;\nEND IF;", "END;"]
+        repaired, changed = _repair_block_structure(list(lines))
+        self.assertFalse(changed)
+        self.assertEqual(repaired, lines)
+
+    # -- getAllBeneficiaryPayments: a '(' inside a literal ate surrounding SQL -
+    def test_parenthesis_inside_a_string_literal_does_not_corrupt_the_statement(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"
+            "  SELECT isnull(a,'(none)') AS x, isnull(b,'') AS y FROM t\n"
+            "END"
+        )
+        self.assertIn("COALESCE(a,'(none)')", converted)
+        self.assertIn("COALESCE(b,'')", converted)
+        self.assertEqual(converted.count("'") % 2, 0)
+
+    def test_isnull_after_a_literal_paren_is_still_translated(self):
+        self.assertEqual(
+            translate_functions("isnull(a,'(') , isnull(b,'')", "tsql", "postgres"),
+            "COALESCE(a,'(') , COALESCE(b,'')",
+        )
+
+    # -- sfPBI_SEA_DBrd: CHAR(n) is a function, not a type, in value position -
+    def test_char_in_value_position_becomes_chr(self):
+        self.assertEqual(
+            translate_functions("concat(', ' + char(10), x)", "tsql", "postgres"),
+            "concat(', ' + chr(10), x)",
+        )
+
+    def test_char_as_a_type_is_left_alone(self):
+        for text in ("CAST(x AS CHAR(10))", "CREATE TEMP TABLE t (a CHAR(10))",
+                     "DECLARE @b CHAR(1)"):
+            self.assertEqual(translate_functions(text, "tsql", "postgres"), text)
+
+    # -- sfPBI_SEA_DBrd: FOR XML PATH('') is string aggregation --------------
+    def test_for_xml_path_idiom_becomes_string_agg(self):
+        converted, warnings = self._convert(
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"
+            "  SELECT STUFF((SELECT ', ' + Name FROM Tags FOR XML PATH('')), 1, 2, '') AS Names\n"
+            "END"
+        )
+        self.assertIsNotNone(converted, warnings)
+        self.assertIn("string_agg(Name, ', ')", converted)
+        self.assertNotIn("FOR XML", converted)
+
+    def test_for_xml_path_with_concat_separator_becomes_string_agg(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"
+            "  SELECT STUFF((SELECT concat(', ', Name) FROM Tags FOR XML PATH('')), 1, 2, '') AS N\n"
+            "END"
+        )
+        self.assertIn("string_agg(Name, ', ')", converted)
+
+    def test_other_for_xml_shapes_are_reported_not_guessed(self):
+        converted, warnings = self._convert(
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"
+            "  SELECT Name FROM Tags FOR XML AUTO\n"
+            "END"
+        )
+        self.assertIsNone(converted)
+        self.assertIn("FOR XML", warnings[0])
+
+    # -- sp_generate_merge: SQL Server metadata scripting is not portable ----
+    def test_sql_server_metadata_routines_are_reported_not_guessed(self):
+        converted, warnings = self._convert(
+            "CREATE PROCEDURE dbo.sp_generate_merge @table_name varchar(776)\n"
+            "AS\nBEGIN\n"
+            "  IF (PARSENAME(@table_name,3)) IS NOT NULL RETURN\n"
+            "  SET @out = QUOTENAME(@table_name)\n"
+            "END"
+        )
+        self.assertIsNone(converted)
+        self.assertIn("PARSENAME", warnings[0])
+        self.assertIn("QUOTENAME", warnings[0])
+
+    def test_ordinary_routines_are_not_caught_by_the_metadata_guard(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p @id int\nAS\nBEGIN\n"
+            "  SELECT name FROM t WHERE id = @id\n"
+            "END"
+        )
+        self.assertIsNotNone(converted)
