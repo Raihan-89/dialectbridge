@@ -649,10 +649,30 @@ def build_view_ddl(view: View, target: str, source: str, tables: list | None = N
 
 def build_view_compatibility_ddl(view: View, target: str, source: str) -> tuple[str | None, list[str]]:
     """Preserve a view's public column contract when a dependency is absent."""
-    if target != "postgres" or not view.columns:
-        return None, [f"View '{view.name}' has no inspectable output columns"]
-    expressions, warnings = [], []
-    for column in view.columns:
+    if target != "postgres":
+        return None, [f"View '{view.name}' has no PostgreSQL compatibility form"]
+    warnings: list[str] = []
+    columns = list(view.columns or ())
+    if not columns:
+        # sys.columns cannot describe a view SQL Server can no longer bind
+        # (its base table is gone and the view was written as SELECT *). The
+        # select list still names the output, so the view keeps its identity
+        # instead of being dropped from the migration entirely.
+        derived = _view_select_list_columns(view.definition or "")
+        if derived:
+            columns = [Column(name, "TEXT") for name in derived]
+            warnings.append(
+                f"View '{view.name}': output columns were read from its SELECT list because "
+                f"the source catalog could not describe them; every column is typed TEXT"
+            )
+    if not columns:
+        columns = [Column("placeholder", "TEXT")]
+        warnings.append(
+            f"View '{view.name}': no output columns could be determined; a single-column "
+            f"placeholder view was created so the object still exists on the target"
+        )
+    expressions = []
+    for column in columns:
         target_type, warning = convert_type(column.data_type, source, target)
         if warning:
             warnings.append(f"View '{view.name}' column '{column.name}': {warning}")
@@ -664,6 +684,118 @@ def build_view_compatibility_ddl(view: View, target: str, source: str) -> tuple[
         + ", ".join(expressions) + " WHERE FALSE",
         warnings,
     )
+
+
+def _view_select_list_columns(definition: str) -> list[str]:
+    """Best-effort output column names taken from a view's top-level SELECT list.
+
+    Returns [] when the list cannot be named unambiguously (a ``SELECT *``, an
+    unaliased expression), because a wrong column name is worse than none.
+    """
+    body = re.search(r"\bAS\s+(SELECT\b.*)$", definition or "", re.IGNORECASE | re.DOTALL)
+    text = (body.group(1) if body else definition or "").strip()
+    if not re.match(r"SELECT\b", text, re.IGNORECASE):
+        return []
+    text = text[len("SELECT"):]
+    text = re.sub(r"^\s*(?:ALL|DISTINCT)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*TOP\s*\(?\s*\d+\s*\)?(?:\s+PERCENT)?(?:\s+WITH\s+TIES)?",
+                  "", text, flags=re.IGNORECASE)
+
+    depth = 0
+    end = len(text)
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            i = _skip_literal(text, i)
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth < 0:
+                end = i
+                break
+        elif depth == 0 and _is_word_at(text, i, "FROM"):
+            end = i
+            break
+        i += 1
+    items, current, depth = [], [], 0
+    for ch in text[:end]:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if "".join(current).strip():
+        items.append("".join(current))
+
+    names: list[str] = []
+    for item in items:
+        name = _select_item_name(item)
+        if not name:
+            return []
+        names.append(name)
+    return names
+
+
+def _skip_literal(text: str, i: int) -> int:
+    i += 1
+    while i < len(text):
+        if text[i] == "'":
+            if i + 1 < len(text) and text[i + 1] == "'":
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return i
+
+
+def _is_word_at(text: str, i: int, word: str) -> bool:
+    if text[i:i + len(word)].upper() != word:
+        return False
+    before = text[i - 1] if i else " "
+    after = text[i + len(word):i + len(word) + 1] or " "
+    return not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_")
+
+
+def _select_item_name(item: str) -> str | None:
+    """Name a single select-list item, or None when it cannot be named safely."""
+    item = item.strip().rstrip(",").strip()
+    if not item or item.endswith("*"):
+        return None
+    # expr AS alias
+    alias = re.search(r"\bAS\s+(\[[^\]]+\]|\"[^\"]+\"|[A-Za-z_]\w*)\s*$", item, re.IGNORECASE)
+    if alias is None:
+        # alias = expr  (the T-SQL column-alias assignment form)
+        alias = re.match(r"\s*(\[[^\]]+\]|\"[^\"]+\"|[A-Za-z_]\w*)\s*=(?!=)", item)
+    if alias is None and _IDENT_PATH_RE.fullmatch(item):
+        # a bare (possibly qualified) column reference names itself
+        alias = _IDENT_PATH_RE.fullmatch(item)
+        name = alias.group("last")
+    elif alias is None:
+        return None
+    else:
+        name = alias.group(1)
+    name = name.strip()
+    if name.startswith("[") or name.startswith('"'):
+        name = name[1:-1]
+    if not name or name.upper() in _SQL_KEYWORDS_UPPER:
+        return None
+    return name
+
+
+_IDENT_PATH_RE = re.compile(
+    r"\s*(?:(?:\[[^\]]+\]|\"[^\"]+\"|[A-Za-z_]\w*)\s*\.\s*)*"
+    r"(?P<last>\[[^\]]+\]|\"[^\"]+\"|[A-Za-z_]\w*)\s*"
+)
+
+_SQL_KEYWORDS_UPPER = {"FROM", "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "JOIN",
+                       "NULL", "END", "ELSE", "THEN", "CASE", "AND", "OR", "NOT"}
 
 
 def build_function_ddl(fn: Routine, target: str, tables: list | None = None,

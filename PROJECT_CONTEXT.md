@@ -102,10 +102,31 @@ extract source schema
   -> copy data table-by-table (identity preserved, sequences re-seeded)
   -> apply referential DDL (FKs/checks) + views/functions/procs/triggers + security
   -> verify (compare row counts source vs target)
+  -> reconcile (ask the target which objects it actually holds)
   -> produce a per-object report
 ```
 
 Deliberate ordering choices:
+
+- **Target schemas are created for every migrated object**, not only for the
+  ones that own tables — a view, routine, trigger, sequence, type or synonym in
+  a schema without tables used to fail with `schema ... does not exist` after
+  the whole data copy had already run.
+- **Reconciliation is the last phase.** Row counts only prove the data landed;
+  the reconciliation pass queries the target catalog (`pg_class`/`pg_proc`/
+  `pg_trigger`, or `sys.objects`) and records an explicit `failed` result for
+  every source table/view/function/procedure/sequence/trigger/synonym the
+  target does not hold. An object that disappeared without an error — a CREATE
+  that reported success but left nothing behind, a routine the builder dropped
+  with only a warning — can no longer pass unnoticed. When the target cannot be
+  inventoried (unknown dialect, refused catalog query, a connector that returns
+  nothing) the pass is skipped rather than reporting phantom losses.
+- **A missing relation is confirmed against the live source** before the report
+  blames it. `_missing_source_dependency` first checks the extracted inventory,
+  then probes the source itself (`OBJECT_ID()` / `to_regclass()`, cached per
+  reference). Only an object that is absent from both is called stale; anything
+  the source still holds is reported as a genuine migration failure with the
+  original error, instead of being quietly replaced by a placeholder.
 
 - **FKs applied AFTER the data copy** so parent/child insert order never matters.
 - **Check constraints applied after data** so the migration doesn't fail on data that already satisfies the constraint in the source.
@@ -255,7 +276,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **239 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test` runs **253 tests**; `python manage.py check` reports no issues.
 
 ---
 
@@ -266,6 +287,13 @@ Current verification: `python manage.py test` runs **239 tests**; `python manage
 - Manual-review types are **flagged with warnings, never silently converted**.
 - Trigger translation is best-effort: statement-level vs row-level semantics and multi-row `FROM inserted/deleted` patterns produce warnings for manual review.
 - DDL trigger translation is best-effort: PostgreSQL event triggers cannot reconstruct the rich `EVENTDATA()` XML (approximated by `TG_TAG`), and the reverse direction only captures the firing point, so the tag set is reconstructed conservatively with a warning.
+- Views whose base tables no longer exist in SQL Server (real databases keep
+  them long after the table was dropped) cannot be recreated as real views on
+  PostgreSQL. They are preserved as **dependency-free compatibility views** with
+  the source's exact column names and types, so the target's object inventory
+  still matches. Column names come from `sys.columns`; when SQL Server can no
+  longer describe the view, they are read from its SELECT list, and failing that
+  a single-column placeholder view is created — a view is never lost.
 - Synonyms map to PostgreSQL views for table/view targets; procedure/function synonyms are surfaced as warnings. On the reverse leg, the wrapper views created this way are recognised (single-table, all-columns view) and skipped with a warning — the SQL Server target is expected to already hold the original synonym, so they are never recreated as views.
 - SQL Server table types are represented as PostgreSQL composite types; TVP routine parameters become arrays expanded with `unnest()`. Reverse migration restores the composite definition as `CREATE TYPE ... AS TABLE`, the array as a `READONLY` TVP, and `unnest()` row sources as table-parameter reads. General enums, scalar composite uses and CLR types still require review.
 - Only `GRANT` permissions are ported; `DENY`/`REVOKE` are surfaced as warnings (SQL Server's deny-everything and per-object permission model has no clean PostgreSQL equivalent).

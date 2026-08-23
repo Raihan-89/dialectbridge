@@ -3068,3 +3068,51 @@ class SecondRoundMigrationFailureTests(TestCase):
             "END"
         )
         self.assertIsNotNone(converted)
+
+
+class ViewCompatibilityFallbackTests(TestCase):
+    """A view whose base table is gone still has to reach the target.
+
+    Real SQL Server databases keep views long after their tables were dropped.
+    The view cannot be recreated as-is, but losing it would change the target's
+    object inventory, so its public column contract is preserved instead.
+    """
+
+    def test_catalog_columns_are_used_when_available(self):
+        from engine.translators.sql_builder import build_view_compatibility_ddl
+
+        view = View(name="dbo.Vw_Wage", definition="CREATE VIEW dbo.Vw_Wage AS SELECT * FROM gone")
+        view.columns = [Column("BenId", "INT"), Column("Amount", "DECIMAL(19,4)")]
+
+        stmt, _ = build_view_compatibility_ddl(view, "postgres", "tsql")
+
+        self.assertIn('CAST(NULL AS INTEGER) AS "BenId"', stmt)
+        self.assertIn('CAST(NULL AS NUMERIC(19,4)) AS "Amount"', stmt)
+        self.assertTrue(stmt.rstrip().endswith("WHERE FALSE"))
+
+    def test_select_list_names_the_columns_when_the_catalog_cannot(self):
+        from engine.translators.sql_builder import build_view_compatibility_ddl
+
+        view = View(
+            name="dbo.Vw_Wage",
+            definition=("CREATE VIEW dbo.Vw_Wage AS SELECT b.BenId AS BeneficiaryId, "
+                        "Total = SUM(w.Amount), w.PaidOn FROM dbo.gone b"),
+        )
+
+        stmt, warnings = build_view_compatibility_ddl(view, "postgres", "tsql")
+
+        self.assertIn('"BeneficiaryId"', stmt)
+        self.assertIn('"Total"', stmt)
+        self.assertIn('"PaidOn"', stmt)
+        self.assertTrue(any("SELECT list" in w for w in warnings))
+
+    def test_an_unnameable_view_still_becomes_a_placeholder_view(self):
+        from engine.translators.sql_builder import build_view_compatibility_ddl
+
+        view = View(name="dbo.Vw_Star", definition="CREATE VIEW dbo.Vw_Star AS SELECT * FROM dbo.gone")
+
+        stmt, warnings = build_view_compatibility_ddl(view, "postgres", "tsql")
+
+        self.assertIsNotNone(stmt)
+        self.assertIn('CREATE OR REPLACE VIEW "dbo"."Vw_Star"', stmt)
+        self.assertTrue(any("placeholder" in w for w in warnings))

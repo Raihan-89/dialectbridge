@@ -37,6 +37,96 @@ _MISSING_RELATION_RE = re.compile(
 )
 
 
+_MISSING_IN_TARGET = "Missing from the target database:"
+
+# Source attribute -> the kind used in the report -> the target kinds that can
+# legitimately satisfy it. A T-SQL procedure may land as a PostgreSQL procedure
+# or function, and a synonym is migrated as a wrapper view.
+_RECONCILED_KINDS = (
+    ("tables", "table", ("table",)),
+    ("views", "view", ("view",)),
+    ("synonyms", "view", ("view", "synonym")),
+    ("functions", "function", ("function", "procedure")),
+    ("procedures", "procedure", ("procedure", "function")),
+    ("sequences", "sequence", ("sequence",)),
+    ("triggers", "trigger", ("trigger",)),
+)
+
+_TARGET_INVENTORY_SQL = {
+    "postgres": """
+SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'view'
+                      WHEN 'S' THEN 'sequence' ELSE 'table' END AS kind,
+       n.nspname || '.' || c.relname AS name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+UNION ALL
+SELECT CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
+       n.nspname || '.' || p.proname
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+UNION ALL
+SELECT 'trigger', t.tgname FROM pg_trigger t WHERE NOT t.tgisinternal
+UNION ALL
+SELECT 'trigger', e.evtname FROM pg_event_trigger e
+""",
+    "tsql": """
+SELECT CASE o.type
+           WHEN 'U' THEN 'table' WHEN 'V' THEN 'view' WHEN 'P' THEN 'procedure'
+           WHEN 'TR' THEN 'trigger' WHEN 'SO' THEN 'sequence' WHEN 'SN' THEN 'synonym'
+           ELSE 'function' END AS kind,
+       OBJECT_SCHEMA_NAME(o.object_id) + '.' + o.name AS name
+FROM sys.objects o
+WHERE o.is_ms_shipped = 0
+  AND o.type IN ('U', 'V', 'P', 'TR', 'SO', 'SN', 'FN', 'IF', 'TF', 'AF', 'FS', 'FT')
+""",
+}
+
+
+def _schema_of(name: str) -> str:
+    """Return the schema part of a qualified object name ('' when unqualified)."""
+    parts = re.split(r"\s*\.\s*", (name or "").strip())
+    if len(parts) < 2:
+        return ""
+    schema = parts[-2].strip()
+    if len(schema) >= 2 and ((schema[0] == "[" and schema[-1] == "]")
+                             or (schema[0] == '"' and schema[-1] == '"')):
+        schema = schema[1:-1]
+    return schema
+
+
+def _split_object_name(name: str) -> list[str]:
+    """Split a qualified name into its undelimited parts."""
+    parts = []
+    for part in re.split(r"\s*\.\s*", (name or "").strip()):
+        part = part.strip()
+        if len(part) >= 2 and ((part[0] == "[" and part[-1] == "]")
+                               or (part[0] == '"' and part[-1] == '"')):
+            part = part[1:-1]
+        parts.append(part.replace("]]", "]").replace('""', '"'))
+    return [p for p in parts if p]
+
+
+def _migrated_schemas(schema) -> list[str]:
+    """Every schema that holds a migrated object, not just the ones with tables.
+
+    Views, routines, triggers, sequences, types and synonyms can live in a
+    schema that owns no table at all. Creating schemas from the table list
+    alone left those objects with nowhere to be created, and the CREATE failed
+    with "schema ... does not exist" after the whole data copy had run.
+    """
+    names: set[str] = set()
+    for group in (schema.tables, schema.views, schema.functions, schema.procedures,
+                  schema.sequences, schema.synonyms, schema.types, schema.triggers):
+        for obj in group:
+            found = _schema_of(getattr(obj, "name", ""))
+            if found:
+                names.add(found)
+    return sorted(names)
+
+
 def _object_key(name: str) -> str:
     """Return a case-insensitive bare object name without SQL delimiters."""
     bare = re.split(r"\s*\.\s*", name)[-1].strip()
@@ -134,6 +224,7 @@ class MigrationOrchestrator:
         self._table_progress: dict = {}
         self._source_objects: set[str] = set()
         self._view_fallbacks: dict[str, object] = {}
+        self._source_lookup_cache: dict[str, bool] = {}
 
     def _check_cancelled(self) -> None:
         if self.cancel_check is not None and self.cancel_check():
@@ -231,7 +322,7 @@ class MigrationOrchestrator:
         # ---- 3. apply structural DDL -----------------------------------------
         self._progress_phase(20, 10, "Creating schemas and tables",
                              total_tables=total_tables)
-        schemas = sorted({name.split(".")[0] for t in schema.tables for name in (t.name,)})
+        schemas = _migrated_schemas(schema)
 
         # Optional destructive reset: drop the target objects we are about to
         # recreate so a previous run does not collide. The user opts in.
@@ -420,6 +511,14 @@ class MigrationOrchestrator:
                 "match": src_count == tgt_count,
             })
 
+        # ---- 7. reconcile ------------------------------------------------------
+        # Verification above only counts rows. Ask the target which objects it
+        # actually holds so an object that vanished without an error — a view
+        # whose CREATE reported success but left nothing behind, a routine the
+        # builder dropped with only a warning — can never pass unnoticed.
+        self._progress_phase(98, 1, "Reconciling migrated objects against the target")
+        self._reconcile_objects(report, schema)
+
         report.finished_at = _now()
         report.success = not any(r.status == "failed" for r in report.schema_results + report.data_results)
         report.summary = {
@@ -434,6 +533,9 @@ class MigrationOrchestrator:
             "schema_failed": sum(1 for r in report.schema_results if r.status == "failed"),
             "data_failed": sum(1 for r in report.data_results if r.status == "failed"),
             "warnings": len(report.warnings),
+            "objects_missing": sum(
+                1 for r in report.schema_results if r.detail.startswith(_MISSING_IN_TARGET)
+            ),
         }
         logger.info(
             "Migration finished status=%s rows_copied=%d rows_failed=%d warnings=%d duration_seconds=%.1f",
@@ -442,6 +544,72 @@ class MigrationOrchestrator:
         )
         self._progress(98, "Saving migration report")
         return report
+
+    # ------------------------------------------------------------------
+    def _target_inventory(self) -> dict[str, set[str]] | None:
+        """What the target database actually holds, keyed by object kind.
+
+        Returns None when the target cannot answer (unknown dialect, catalog
+        query refused, or a connector that does not implement fetch) so the
+        reconciliation is skipped instead of reporting phantom losses.
+        """
+        sql = _TARGET_INVENTORY_SQL.get(self.target.dialect)
+        if not sql:
+            return None
+        try:
+            rows = self.target.fetch(sql)
+        except Exception as exc:
+            logger.warning("Target object inventory unavailable error=%s", exc)
+            return None
+        if not rows:
+            return None
+        inventory: dict[str, set[str]] = {}
+        for row in rows:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                return None       # not the inventory shape — do not guess
+            kind, name = row
+            if not name:
+                continue
+            inventory.setdefault(str(kind), set()).add(_object_key(str(name)))
+        return inventory or None
+
+    @staticmethod
+    def _missing_object_reason(report: MigrationReport, obj_name: str) -> str:
+        """Find the warning that already explains why an object never landed."""
+        key = _object_key(obj_name)
+        for warning in report.warnings:
+            if key in warning.casefold():
+                return warning
+        return ""
+
+    def _reconcile_objects(self, report: MigrationReport, schema) -> None:
+        inventory = self._target_inventory()
+        if inventory is None:
+            return
+        for attr, kind, target_kinds in _RECONCILED_KINDS:
+            for obj in getattr(schema, attr, None) or ():
+                name = getattr(obj, "name", "")
+                if not name:
+                    continue
+                key = _object_key(name)
+                if any(key in inventory.get(target_kind, ()) for target_kind in target_kinds):
+                    continue
+                existing = [r for r in report.schema_results
+                            if r.kind == kind and _object_key(r.name) == key]
+                if any(r.status in ("failed", "skipped") for r in existing):
+                    continue          # already reported with its real reason
+                reason = self._missing_object_reason(report, name)
+                detail = _MISSING_IN_TARGET + (
+                    f" {kind.title()} '{name}' is present in the source but was not found in "
+                    f"the target after the migration."
+                )
+                if reason:
+                    detail += f" Reported cause: {reason}"
+                logger.error("Object missing from target kind=%s name=%s", kind, name)
+                report.schema_results.append(ObjectResult(
+                    kind=kind, name=name, status="failed", detail=detail[:4000],
+                ))
+                report.warnings.append(f"{kind.title()} '{name}': {detail}"[:4000])
 
     # ------------------------------------------------------------------
     def _apply_view_compatibility(self, report: MigrationReport, name: str) -> None:
@@ -681,7 +849,39 @@ class MigrationOrchestrator:
         reference = match.group(1)
         if _object_key(reference) in self._source_objects:
             return None
+        # The extracted inventory is the fast answer, but it can be incomplete
+        # (a catalog query the server refused, an object outside the extracted
+        # set). Ask the source itself before declaring the reference stale, so
+        # the report never blames the source for an engine-side gap.
+        if self._exists_in_source(reference):
+            return None
         return reference
+
+    def _exists_in_source(self, reference: str) -> bool:
+        """True when the live source database still holds *reference*.
+
+        Returns False when the object is genuinely gone **and** when the source
+        cannot be asked — the caller only uses this to upgrade a "missing in
+        the extracted schema" verdict, never to invent a dependency.
+        """
+        cached = self._source_lookup_cache.get(reference)
+        if cached is not None:
+            return cached
+        exists = False
+        try:
+            if self.source.dialect == "tsql":
+                probe = ".".join(
+                    f"[{part}]" for part in _split_object_name(reference)
+                )
+                row = self.source.fetchone("SELECT OBJECT_ID(%s)", (probe,))
+            else:
+                row = self.source.fetchone("SELECT to_regclass(%s)", (reference,))
+            exists = bool(row and row[0] is not None)
+        except Exception as exc:                          # never fail a migration on a probe
+            logger.debug("Source existence probe failed reference=%s error=%s", reference, exc)
+            exists = False
+        self._source_lookup_cache[reference] = exists
+        return exists
 
     def _apply(self, report: MigrationReport, kind: str, stmt: str, object_name: str | None = None) -> None:
         name = object_name or _name_from_stmt(stmt)
@@ -693,7 +893,8 @@ class MigrationOrchestrator:
             if missing:
                 detail = (
                     f"References '{missing}', which does not exist in the source "
-                    f"database — the object was skipped"
+                    f"database either — the source object is already invalid there, "
+                    f"so it cannot be recreated as-is"
                 )
                 logger.warning("Schema object skipped kind=%s name=%s reason=%s", kind, name, detail)
                 report.schema_results.append(

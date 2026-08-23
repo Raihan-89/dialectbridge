@@ -573,3 +573,119 @@ class TableDurationReportingTests(SimpleTestCase):
         progress = {"dbo.a": {"rows_copied": 0}}
         MigrationOrchestrator._stamp_elapsed(progress)
         self.assertNotIn("elapsed_seconds", progress["dbo.a"])
+
+
+class _InventoryTarget(_FakeConnector):
+    """PostgreSQL target that reports exactly which objects it ended up with."""
+
+    def __init__(self, inventory):
+        super().__init__({}, dialect="postgres")
+        self.inventory = inventory
+
+    def fetch(self, sql, params=None):
+        if "pg_class" in sql:
+            return list(self.inventory)
+        return []
+
+
+class ObjectReconciliationTests(SimpleTestCase):
+    """Nothing may go missing without the report saying so.
+
+    A view whose CREATE reported success but left nothing behind used to
+    disappear from the migration entirely: no failure, no warning, one fewer
+    view on the target. The reconciliation pass asks the target what it holds
+    and fails the run for anything the source had and the target does not.
+    """
+
+    def _source(self):
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.views = [
+            View(name="dbo.Vw_Present", definition="CREATE VIEW dbo.Vw_Present AS SELECT id FROM dbo.users"),
+            View(name="dbo.Vw_Vanished", definition="CREATE VIEW dbo.Vw_Vanished AS SELECT id FROM dbo.users"),
+        ]
+        source.extract_schema = Mock(return_value=schema)
+        return source
+
+    def test_object_missing_from_the_target_is_reported_as_failed(self):
+        target = _InventoryTarget([
+            ("table", "dbo.users"),
+            ("view", "dbo.Vw_Present"),
+        ])
+
+        report = MigrationOrchestrator(self._source(), target, copy_data=False).run()
+
+        missing = [r for r in report.schema_results
+                   if r.status == "failed" and "Vw_Vanished" in r.name]
+        self.assertEqual(len(missing), 1, [r.to_dict() for r in report.schema_results])
+        self.assertIn("Missing from the target database", missing[0].detail)
+        self.assertFalse(report.success)
+        self.assertEqual(report.summary["objects_missing"], 1)
+
+    def test_objects_present_on_the_target_are_left_alone(self):
+        target = _InventoryTarget([
+            ("table", "dbo.users"),
+            ("view", "dbo.Vw_Present"),
+            ("view", "dbo.vw_vanished"),        # case-insensitive match
+        ])
+
+        report = MigrationOrchestrator(self._source(), target, copy_data=False).run()
+
+        self.assertTrue(report.success, [r.to_dict() for r in report.schema_results])
+        self.assertEqual(report.summary["objects_missing"], 0)
+
+    def test_a_target_that_cannot_be_inventoried_is_never_guessed_at(self):
+        # _FakeConnector.fetch returns [] for everything.
+        target = _FakeConnector({}, dialect="postgres")
+
+        report = MigrationOrchestrator(self._source(), target, copy_data=False).run()
+
+        self.assertEqual(report.summary["objects_missing"], 0)
+        self.assertTrue(report.success, [r.to_dict() for r in report.schema_results])
+
+
+class MigratedSchemaTests(SimpleTestCase):
+    """Schemas are created for every migrated object, not only for tables."""
+
+    def test_schema_holding_only_a_view_is_created(self):
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        schema = source.extract_schema()
+        schema.views = [View(name="reports.Vw_Only",
+                             definition="CREATE VIEW reports.Vw_Only AS SELECT id FROM dbo.users")]
+        source.extract_schema = Mock(return_value=schema)
+        target = _FakeConnector({}, dialect="postgres")
+
+        MigrationOrchestrator(source, target, copy_data=False).run()
+
+        created = [s for s in target.executed if s.startswith("CREATE SCHEMA")]
+        self.assertIn('CREATE SCHEMA IF NOT EXISTS "reports"', created)
+        self.assertIn('CREATE SCHEMA IF NOT EXISTS "dbo"', created)
+
+
+class SourceDependencyProbeTests(SimpleTestCase):
+    """A reference the extractor missed must not be blamed on the source."""
+
+    def _orchestrator(self, exists):
+        source = _FakeConnector({"dbo.users": [(1, "a")]}, dialect="tsql")
+        source.fetchone = Mock(return_value=(1234,) if exists else (None,))
+        orchestrator = MigrationOrchestrator(source, _FakeConnector({}, dialect="postgres"))
+        orchestrator._source_objects = {"users"}
+        return orchestrator
+
+    def test_reference_the_live_source_still_has_is_not_called_stale(self):
+        orchestrator = self._orchestrator(exists=True)
+        self.assertIsNone(orchestrator._missing_source_dependency(
+            'relation "dbo.tbl_beneficiarydet" does not exist'))
+
+    def test_reference_missing_everywhere_is_reported(self):
+        orchestrator = self._orchestrator(exists=False)
+        self.assertEqual(
+            orchestrator._missing_source_dependency('relation "dbo.tbl_beneficiarydet" does not exist'),
+            "dbo.tbl_beneficiarydet",
+        )
+
+    def test_probe_result_is_cached_per_reference(self):
+        orchestrator = self._orchestrator(exists=False)
+        for _ in range(3):
+            orchestrator._missing_source_dependency('relation "dbo.gone" does not exist')
+        self.assertEqual(orchestrator.source.fetchone.call_count, 1)
