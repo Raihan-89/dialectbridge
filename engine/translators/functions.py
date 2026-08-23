@@ -295,10 +295,64 @@ def _xml_path_to_string_agg(text: str, start: str, replacement: str) -> str | No
     # Only the "strip the leading separator" form maps cleanly.
     if start.strip() != "1" or replacement.strip().lstrip("Nn") != "''":
         return None
-    separator, value = _split_aggregate_expression(match.group("expr"))
+    expr = match.group("expr").strip()
+    distinct = bool(re.match(r"^DISTINCT\b", expr, re.IGNORECASE))
+    if distinct:
+        expr = re.sub(r"^DISTINCT\s+", "", expr, flags=re.IGNORECASE)
+    separator, value = _split_aggregate_expression(expr)
     if separator is None:
         return None
-    return f"(SELECT string_agg({value}, {separator}) FROM {match.group('rest')})"
+    rest = match.group("rest").strip()
+    # GROUP BY in this SQL Server idiom is used to de-duplicate the values
+    # before FOR XML concatenates them into one scalar. Keeping GROUP BY around
+    # PostgreSQL's aggregate would return several rows in a scalar subquery.
+    group_by = re.search(r"\s+GROUP\s+BY\s+.+$", rest, re.IGNORECASE | re.DOTALL)
+    if group_by:
+        rest = rest[:group_by.start()].rstrip()
+        distinct = True
+    distinct_sql = "DISTINCT " if distinct else ""
+    return f"(SELECT string_agg({distinct_sql}{value}, {separator}) FROM {rest})"
+
+
+def translate_bare_for_xml_path(text: str) -> str:
+    """Convert scalar ``(SELECT ... FOR XML PATH(''))`` aggregations.
+
+    STUFF-wrapped forms are handled by the normal call rewriter. This covers
+    the equally common unwrapped form used as a SELECT-list expression.
+    """
+    clause_re = re.compile(r"\bFOR\s+XML\s+PATH\s*\(\s*N?''\s*\)", re.IGNORECASE)
+    replacements: list[tuple[int, int, str]] = []
+    for clause in clause_re.finditer(text):
+        stack: list[int] = []
+        i = 0
+        while i < clause.start():
+            if text[i] == "'":
+                i = _skip_string(text, i)
+                continue
+            if text[i] == "(":
+                stack.append(i)
+            elif text[i] == ")" and stack:
+                stack.pop()
+            i += 1
+        if not stack:
+            continue
+        start = stack[-1]
+        if not re.match(r"\(\s*SELECT\b", text[start:clause.start()], re.IGNORECASE):
+            continue
+        if re.search(r"\bSTUFF\s*\(\s*$", text[:start], re.IGNORECASE):
+            continue
+        end = clause.end()
+        while end < len(text) and text[end].isspace():
+            end += 1
+        if end >= len(text) or text[end] != ")":
+            continue
+        candidate = text[start:end + 1]
+        converted = _xml_path_to_string_agg(candidate, "1", "''")
+        if converted is not None:
+            replacements.append((start, end + 1, converted))
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
 
 
 def _split_aggregate_expression(expr: str) -> tuple[str | None, str | None]:

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 
-from engine.translators.functions import translate_functions
+from engine.translators.functions import translate_bare_for_xml_path, translate_functions
 from engine.translators.sql_builder import convert_type, fix_boolean_predicates, _translate_top
 
 # A T-SQL type token: int, [int], decimal(18,2), [decimal](18,2), varchar(50),
@@ -75,6 +75,8 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     if not sql.strip():
         return None, ["Routine definition is empty — object may be encrypted or inaccessible"]
+
+    sql = translate_bare_for_xml_path(sql)
 
     # `master..spt_values` is a SQL Server internal numbers table. Routines
     # built on it are the dynamic-SQL + PIVOT report generators, which have no
@@ -274,6 +276,11 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     footer = "$$ LANGUAGE plpgsql;"
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
+    if _FOR_XML_RE.search(converted):
+        return None, warnings + [
+            "Generated PL/pgSQL still contains FOR XML — the routine was not "
+            "executed because PostgreSQL cannot parse SQL Server XML syntax"
+        ]
     lexical_error = _plpgsql_lexical_error(converted)
     if lexical_error:
         return None, warnings + [

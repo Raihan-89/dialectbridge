@@ -3008,6 +3008,18 @@ class SecondRoundMigrationFailureTests(TestCase):
         )
         self.assertIn("string_agg(Name, ', ')", converted)
 
+    def test_bare_for_xml_path_grouping_becomes_distinct_string_agg(self):
+        converted, warnings = self._convert(
+            "CREATE FUNCTION dbo.f() RETURNS varchar(max) AS BEGIN\n"
+            "  RETURN (SELECT ', ' + CAST(Vct_AgeGroup_ID AS varchar(10)) "
+            "FROM x GROUP BY MC_Inc_ID, Vct_AgeGroup_ID FOR XML PATH(''))\n"
+            "END"
+        )
+        self.assertIsNotNone(converted, warnings)
+        self.assertNotIn("FOR XML", converted.upper())
+        self.assertIn("string_agg(DISTINCT", converted)
+        self.assertNotIn("GROUP BY", converted.upper())
+
     def test_other_for_xml_shapes_are_reported_not_guessed(self):
         converted, warnings = self._convert(
             "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"

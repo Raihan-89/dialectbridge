@@ -359,14 +359,34 @@ class MigrationOrchestrator:
             self.target.execute("SET search_path = " + ", ".join(self.target.quote_ident(s) for s in schemas))
 
         remaining_stmts = [s for s in ddl if not _is_structural(s) and not _is_pre_table(s)]
+        deferred_views: list[str] = []
         for idx, stmt in enumerate(remaining_stmts, 1):
             self._check_cancelled()
             kind = "constraint" if _is_fk_or_check(stmt) else _object_kind(stmt)
             self._apply(report, kind, stmt)
+            if (kind == "view" and report.schema_results
+                    and report.schema_results[-1].status == "skipped"):
+                deferred_views.append(stmt)
             if idx % 10 == 0 or idx == len(remaining_stmts):
                 self._progress_phase(75, 8 + (idx / max(len(remaining_stmts), 1)) * 7,
                                      f"Applying objects {idx}/{len(remaining_stmts)}",
                                      objects_applied=idx, total_objects=len(remaining_stmts))
+
+        # A view may select from a table-valued function or another object
+        # created later in this phase. Retry only missing-relation skips after
+        # all routines/triggers/synonyms exist; genuine stale views remain
+        # skipped with the same diagnostic.
+        for stmt in deferred_views:
+            prior = report.schema_results.pop(
+                next(i for i in range(len(report.schema_results) - 1, -1, -1)
+                     if report.schema_results[i].kind == "view"
+                     and report.schema_results[i].name == _name_from_stmt(stmt)
+                     and report.schema_results[i].status == "skipped")
+            )
+            prior_warning = f"View '{prior.name}': {prior.detail}"
+            if prior_warning in report.warnings:
+                report.warnings.remove(prior_warning)
+            self._apply(report, "view", stmt)
 
         # ---- 6. verify ----------------------------------------------------------
         total_verify = len(schema.tables)
