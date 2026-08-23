@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework import status
 from unittest.mock import patch
 from datetime import timedelta
+import re
 import threading
 
 from engine.connectors.base import ConnectorError
@@ -2584,3 +2585,307 @@ class RealWorldMigrationRegressionTests(TestCase):
         self.assertIsNone(converted)
         self.assertIn("spt_values", warnings[0])
         self.assertIn("generate_series", warnings[0])
+
+
+class ReportedMigrationFailureTests(TestCase):
+    """Regressions for the routine/view failures captured on the Errors page
+    during a real PRODUCT -> product migration."""
+
+    def _convert(self, sql, tables=None):
+        converted, warnings = translate_routine(
+            sql, source="procedure", target="postgres", tables=tables,
+        )
+        self.assertIsNotNone(converted, warnings)
+        return converted, warnings
+
+    @staticmethod
+    def _balanced(sql):
+        """Every BEGIN/IF/LOOP opened in the body is closed again."""
+        body = sql.split("$$", 2)[1]
+        opens = len(re.findall(r"(?m)^\s*(?:BEGIN|IF\b.*\bTHEN|WHILE\b.*\bLOOP)\s*$", body))
+        closes = len(re.findall(r"(?m)^\s*END(?:\s+IF|\s+LOOP)?;\s*$", body))
+        return opens, closes
+
+    # -- UpsertMenu: THROW message truncated at the first comma ---------------
+    def test_throw_message_keeps_commas_inside_the_literal(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.UpsertMenu @name varchar(128)\n"
+            "AS\nBEGIN\n"
+            "  IF @name IS NULL\n"
+            "  BEGIN\n"
+            "    THROW 50000, 'Name, Url and Status are required', 1;\n"
+            "  END\n"
+            "END"
+        )
+        self.assertIn("RAISE EXCEPTION 'Name, Url and Status are required';", converted)
+        self.assertEqual(converted.count("'"), 2)
+
+    def test_throw_with_variable_message_becomes_a_format_argument(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p @msg varchar(200)\n"
+            "AS\nBEGIN\n  THROW 50000, @msg, 1;\nEND"
+        )
+        self.assertIn("RAISE EXCEPTION '%', msg;", converted)
+
+    # -- sp_Updatehelpdesk: AS BEGIN TRY consumed as the body wrapper --------
+    def test_body_opening_with_begin_try_stays_balanced(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.sp_Updatehelpdesk @int_fbid int\n"
+            "AS\n"
+            "BEGIN TRY\n"
+            "  update tm_Helpdesk set Modified_dt = GETDATE() where int_fbid = @int_fbid\n"
+            "  RETURN\n"
+            "END TRY\n"
+            "BEGIN CATCH\n"
+            "  RETURN\n"
+            "END CATCH"
+        )
+        self.assertIn("EXCEPTION WHEN OTHERS THEN", converted)
+        opens, closes = self._balanced(converted)
+        self.assertEqual(opens, closes, converted)
+
+    # -- sfPBI_SEA_DBrd: INSERT into a table variable lost its INTO ----------
+    def test_insert_into_a_table_variable_gets_the_into_keyword(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p @ctry int\n"
+            "AS\nBEGIN\n"
+            "  DECLARE @t_ctry TABLE (ctry_id int)\n"
+            "  IF @ctry > 0 insert @t_ctry values (@ctry)\n"
+            "END"
+        )
+        self.assertIn("insert INTO t_ctry values (ctry);", converted)
+        self.assertNotIn("insert t_ctry", converted)
+
+    # -- sp_generate_merge: multi-line DECLARE list split into a statement ---
+    def test_multi_line_declare_list_declares_every_variable(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.sp_gen\n"
+            "AS\nBEGIN\n"
+            "  DECLARE @Column_List varchar(8000),\n"
+            "    @Column_List_For_Update varchar(8000),\n"
+            "    @Column_Name varchar(128)\n"
+            "  SET @Column_List = ''\n"
+            "END"
+        )
+        self.assertIn("Column_List VARCHAR(8000);", converted)
+        self.assertIn("Column_List_For_Update VARCHAR(8000);", converted)
+        self.assertIn("Column_Name VARCHAR(128);", converted)
+        self.assertNotIn("Column_List_For_Update varchar(8000),", converted)
+
+    # -- sp_generate_merge: IF (expr) IS NOT NULL split into a branch body ---
+    def test_parenthesized_expression_followed_by_a_comparison_stays_a_condition(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p @table_name varchar(776)\n"
+            "AS\nBEGIN\n"
+            "  IF (PARSENAME(@table_name,3)) IS NOT NULL\n"
+            "  BEGIN\n"
+            "    RETURN\n"
+            "  END\n"
+            "END"
+        )
+        self.assertIn("IS NOT NULL THEN", converted)
+        self.assertNotIn("THEN IS NOT NULL", converted)
+
+    def test_single_statement_branch_on_a_parenthesized_condition_still_splits(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.p @x int\nAS\nBEGIN\n  IF (@x > 0) RETURN\nEND"
+        )
+        self.assertIn("IF (x > 0) THEN", converted)
+        self.assertIn("RETURN;", converted)
+
+    # -- InsUpdPaymentCycleDocDetails: multi-line UPDATE cut after column 1 --
+    def test_multi_line_update_on_an_else_line_is_one_statement(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.InsUpd @pc_year varchar(10), @d1 varchar(200), @d2 varchar(200)\n"
+            "AS\nBEGIN\n"
+            "IF NOT EXISTS(SELECT id from tbl_x where pc_year=@pc_year)\n"
+            "  INSERT INTO tbl_x(pc_year) values(@pc_year)\n"
+            "ELSE UPDATE tbl_x set d1=@d1,\n"
+            "  d2=@d2\n"
+            "  where pc_year=@pc_year\n"
+            "END"
+        )
+        self.assertIn("UPDATE tbl_x set d1=d1, d2=d2 where pc_year=pc_year;", converted)
+        self.assertNotIn("d1=d1,;", converted)
+
+    # -- UpsertMenu: MERGE actions split into standalone statements ----------
+    def test_merge_actions_are_not_split_into_separate_statements(self):
+        converted, _ = self._convert(
+            "CREATE PROCEDURE dbo.UpsertMenu @name varchar(128)\n"
+            "AS\nBEGIN\n"
+            "  MERGE INTO p2_menu_info AS target\n"
+            "  USING (VALUES (@name)) AS source(name)\n"
+            "  ON target.name LIKE source.name\n"
+            "  WHEN MATCHED THEN\n"
+            "    UPDATE SET name = source.name\n"
+            "  WHEN NOT MATCHED THEN\n"
+            "    INSERT (name) VALUES (source.name);\n"
+            "END"
+        )
+        self.assertNotIn("WHEN MATCHED THEN;", converted)
+        self.assertNotIn("WHEN NOT MATCHED THEN;", converted)
+        self.assertIn("WHEN MATCHED THEN UPDATE SET", converted)
+
+    # -- safety net: an unbalanced body still compiles -----------------------
+    def test_unbalanced_blocks_are_closed_and_warned_about(self):
+        converted, warnings = translate_routine(
+            "CREATE PROCEDURE dbo.p\n"
+            "AS\nBEGIN\n"
+            "  BEGIN TRY\n"
+            "    SELECT 1\n"
+            "  END TRY\n"
+            "  BEGIN CATCH\n"
+            "    SELECT 2\n"
+            "END",
+            source="procedure", target="postgres",
+        )
+        self.assertIsNotNone(converted)
+        opens, closes = self._balanced(converted)
+        self.assertEqual(opens, closes, converted)
+        self.assertTrue(any("Unbalanced BEGIN/END" in w for w in warnings), warnings)
+
+    # -- parameters must never be rewritten into column references ----------
+    def test_procedure_parameters_are_not_quoted_as_columns(self):
+        database = Database(name="PRODUCT", dialect="tsql")
+        database.tables = [Table(name="dbo.tm_Helpdesk", columns=[
+            Column(name="int_fbid", data_type="INT"),
+            Column(name="remarks", data_type="VARCHAR(250)"),
+        ])]
+        database.procedures = [Routine(
+            name="dbo.sp_Updatehelpdesk", kind="procedure",
+            definition=(
+                "CREATE PROCEDURE dbo.sp_Updatehelpdesk @int_fbid int, @remarks varchar(250)\n"
+                "AS\nBEGIN\n"
+                "  UPDATE tm_Helpdesk SET remarks = @remarks WHERE int_fbid = @int_fbid\n"
+                "END"
+            ),
+        )]
+        statements, warnings = build_database_ddl(database, "postgres")
+        procedure = next(s for s in statements if "PROCEDURE" in s)
+        self.assertIn("sp_Updatehelpdesk(int_fbid INTEGER, remarks VARCHAR(250))", procedure)
+        self.assertNotIn('"remarks" = "remarks"', procedure)
+        self.assertTrue(
+            any("share a name with a table column" in w for w in warnings), warnings,
+        )
+
+    def test_declared_locals_are_not_quoted_as_columns(self):
+        database = Database(name="PRODUCT", dialect="tsql")
+        database.tables = [Table(name="dbo.t", columns=[
+            Column(name="Total", data_type="INT"),
+        ])]
+        database.procedures = [Routine(
+            name="dbo.p", kind="procedure",
+            definition=("CREATE PROCEDURE dbo.p\nAS\nBEGIN\n"
+                        "  DECLARE @Total int\n"
+                        "  SET @Total = 1\n"
+                        "END"),
+        )]
+        statements, _ = build_database_ddl(database, "postgres")
+        procedure = next(s for s in statements if "PROCEDURE" in s)
+        self.assertIn("Total := 1;", procedure)
+        self.assertNotIn('"Total" := 1;', procedure)
+
+
+class ViewDependencyTests(TestCase):
+    """A view built on another view must be quoted and created after it."""
+
+    def _database(self):
+        database = Database(name="PRODUCT", dialect="tsql")
+        database.tables = [Table(name="dbo.tbl_Users", columns=[
+            Column(name="User_id", data_type="VARCHAR(40)"),
+        ])]
+        database.views = [
+            View(name="dbo.Vw_A", definition="CREATE VIEW dbo.Vw_A AS SELECT User_id FROM Vw_B"),
+            View(name="dbo.Vw_B", definition="CREATE VIEW dbo.Vw_B AS SELECT User_id FROM tbl_Users"),
+        ]
+        return database
+
+    def test_view_over_a_view_is_schema_qualified_and_quoted(self):
+        statements, _ = build_database_ddl(self._database(), "postgres")
+        view_a = next(s for s in statements if '"Vw_A"' in s)
+        self.assertIn('FROM "dbo"."Vw_B"', view_a)
+
+    def test_dependent_view_is_created_after_the_view_it_selects_from(self):
+        statements, _ = build_database_ddl(self._database(), "postgres")
+        order = [s for s in statements if s.lstrip().upper().startswith("CREATE OR REPLACE VIEW")]
+        self.assertLess(
+            next(i for i, s in enumerate(order) if '"Vw_B"' in s),
+            next(i for i, s in enumerate(order) if '"Vw_A"' in s),
+        )
+
+    def test_a_view_cycle_still_emits_every_view(self):
+        database = self._database()
+        database.views[1].definition = "CREATE VIEW dbo.Vw_B AS SELECT User_id FROM Vw_A"
+        statements, _ = build_database_ddl(database, "postgres")
+        views = [s for s in statements if s.lstrip().upper().startswith("CREATE OR REPLACE VIEW")]
+        self.assertEqual(len(views), 2)
+
+
+class RoutineVariableShadowingTests(TestCase):
+    """A routine variable that shares its name with a relation must stay a
+    variable: `@Products` next to the synonym `dbo.Products` was rewritten into
+    `"dbo"."Products"`, corrupting the procedure signature."""
+
+    def _database(self, definition):
+        database = Database(name="PRODUCT", dialect="tsql")
+        database.tables = [Table(name="dbo.ProductMaster", columns=[
+            Column(name="SKU", data_type="NVARCHAR(50)"),
+            Column(name="ProductName", data_type="NVARCHAR(200)"),
+        ])]
+        database.synonyms = [Synonym(name="dbo.Products", target_object="[dbo].[ProductMaster]",
+                                     target_kind="table")]
+        database.types = [UserType(name="dbo.ProductBulkType", kind="table_type", columns=[
+            Column(name="SKU", data_type="NVARCHAR(50)"),
+            Column(name="ProductName", data_type="NVARCHAR(200)"),
+        ])]
+        database.procedures = [Routine(name="dbo.sp_BulkInsertProducts", kind="procedure",
+                                       definition=definition)]
+        return database
+
+    def _procedure(self, definition):
+        statements, _ = build_database_ddl(self._database(definition), "postgres")
+        return next(s for s in statements if "sp_BulkInsertProducts" in s and "PROCEDURE" in s)
+
+    def test_table_valued_parameter_shadowing_a_synonym_keeps_its_name(self):
+        procedure = self._procedure(
+            "CREATE PROCEDURE dbo.sp_BulkInsertProducts\n"
+            "@Products dbo.ProductBulkType READONLY\n"
+            "AS\nBEGIN\n"
+            "  INSERT INTO dbo.ProductMaster (SKU, ProductName)\n"
+            "  SELECT p.SKU, p.ProductName FROM @Products p\n"
+            "END"
+        )
+        self.assertIn(
+            'sp_BulkInsertProducts(Products "dbo"."ProductBulkType"[]', procedure,
+        )
+        self.assertNotIn('"dbo"."Products"', procedure)
+        self.assertIn("FROM unnest(Products) AS p", procedure)
+
+    def test_scalar_parameter_shadowing_a_table_stays_a_variable(self):
+        procedure = self._procedure(
+            "CREATE PROCEDURE dbo.sp_BulkInsertProducts @ProductMaster nvarchar(50)\n"
+            "AS\nBEGIN\n"
+            "  INSERT INTO dbo.ProductMaster (SKU) VALUES (@ProductMaster)\n"
+            "END"
+        )
+        self.assertIn("sp_BulkInsertProducts(ProductMaster VARCHAR(50)", procedure)
+        self.assertIn("VALUES (ProductMaster)", procedure)
+
+    def test_schema_qualified_reference_to_the_shadowed_relation_is_still_quoted(self):
+        procedure = self._procedure(
+            "CREATE PROCEDURE dbo.sp_BulkInsertProducts @Products nvarchar(50)\n"
+            "AS\nBEGIN\n"
+            "  SELECT SKU FROM dbo.Products WHERE SKU = @Products\n"
+            "END"
+        )
+        # the synonym reference keeps its qualification, the parameter does not
+        self.assertIn('FROM "dbo"."Products"', procedure)
+        self.assertIn('= Products', procedure)
+
+    def test_parameter_defaults_inside_the_signature_survive_untouched(self):
+        procedure = self._procedure(
+            "CREATE PROCEDURE dbo.sp_BulkInsertProducts\n"
+            "@Products dbo.ProductBulkType READONLY\n"
+            "AS\nBEGIN\n  SELECT SKU FROM @Products\nEND"
+        )
+        self.assertIn("INOUT result_cursor refcursor DEFAULT 'result_cursor'", procedure)

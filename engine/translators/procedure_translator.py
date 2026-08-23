@@ -211,6 +211,8 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
         transformed, cursor_params = _procedure_result_cursors(transformed)
         param_list.extend(cursor_params)
 
+    warnings.extend(_ambiguous_variable_warnings(name, params, declared, tables))
+
     signature = ", ".join(param_list)
     if kind == "FUNCTION":
         header = f"CREATE OR REPLACE FUNCTION {name}({signature}) RETURNS {sig_returns} AS $$"
@@ -220,6 +222,33 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
     return converted, warnings
+
+
+def _ambiguous_variable_warnings(routine: str, params: list[tuple[str, str, bool]],
+                                declared: dict[str, str], tables: list | None) -> list[str]:
+    """Warn when a routine variable shares a name with a migrated column.
+
+    T-SQL keeps ``@Status`` and the column ``Status`` apart with the sigil.
+    PL/pgSQL has no sigil, so after conversion the bare name is ambiguous and
+    PostgreSQL rejects the reference at run time. The conversion cannot pick a
+    side safely, so the collision is reported instead of guessed.
+    """
+    if not tables:
+        return []
+    columns = {
+        column.name.lower()
+        for table in tables
+        for column in table.columns
+    }
+    names = [pname for pname, _type, _out in params] + list(declared)
+    clashing = sorted({n for n in names if n.lower() in columns}, key=str.lower)
+    if not clashing:
+        return []
+    return [
+        f"Routine '{routine}': variable(s) {', '.join(clashing)} share a name with a "
+        f"table column — PostgreSQL cannot tell the variable from the column, so "
+        f"qualify the column (or rename the parameter) before using this routine"
+    ]
 
 
 def _parse_tsql_table_return(returns: str) -> tuple[str | None, list[tuple[str, str]]]:
@@ -343,18 +372,28 @@ def _assemble_plpgsql(header: str, declared: dict[str, str], transformed: list[s
     return header + "\n" + "\n".join(body_lines) + "\n" + footer
 
 
+# ``AS BEGIN TRY`` opens an error-handling block, not the routine body. Treating
+# its BEGIN as the body wrapper shifted every block one level and consumed the
+# ``END`` of ``END CATCH`` as the routine's closing END.
+_BODY_BEGIN_RE = re.compile(
+    r"\bAS\s+BEGIN\b(?!\s*(?:TRY|CATCH|TRANSACTION|TRAN|WORK|DISTRIBUTED)\b)",
+    re.IGNORECASE,
+)
+_TRAILING_END_RE = re.compile(r"\bEND\b(?!\s*(?:TRY|CATCH)\b)", re.IGNORECASE)
+
+
 def _extract_tsql_body(sql: str) -> str | None:
     """Return the text between the trailing AS [BEGIN] ... final END."""
-    m = re.search(r"\bAS\s+BEGIN\b", sql, re.IGNORECASE)
+    m = _BODY_BEGIN_RE.search(sql)
     if not m:
-        # functions like inline TVF: AS RETURN (SELECT ...)
+        # functions like inline TVF: AS RETURN (SELECT ...); also procedures
+        # whose body opens directly with BEGIN TRY or a bare statement.
         m2 = re.search(r"\bAS\s+(.*)$", sql, re.IGNORECASE | re.DOTALL)
         return m2.group(1).strip() if m2 else None
     start = m.end()
-    # find matching final END (last occurrence of a standalone END)
+    # find matching final END (last standalone END that is not END TRY/CATCH)
     tail = sql[start:]
-    # The final "END" is the last word-boundary END at the end
-    end_matches = list(re.finditer(r"\bEND\b", tail, re.IGNORECASE))
+    end_matches = list(_TRAILING_END_RE.finditer(tail))
     if not end_matches:
         return None
     end_pos = end_matches[-1].start()
@@ -518,7 +557,8 @@ def _join_declares(declared: dict[str, str]) -> str:
 # on the same line without BEGIN/END).
 _IF_BODY_START = re.compile(
     r"\b(SET|RETURN|SELECT|UPDATE|DELETE|INSERT|PRINT|RAISERROR|THROW|"
-    r"BREAK|CONTINUE|WAITFOR|BEGIN|DECLARE|EXEC(?:UTE)?|MERGE|GOTO)\b",
+    r"BREAK|CONTINUE|WAITFOR|BEGIN|DECLARE|EXEC(?:UTE)?|MERGE|GOTO|"
+    r"COMMIT|ROLLBACK|TRUNCATE|CREATE|DROP|ALTER|WHILE|IF)\b",
     re.IGNORECASE,
 )
 
@@ -542,7 +582,14 @@ def _split_cond_body(rest: str) -> tuple[str, str]:
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return rest[: i + 1], rest[i + 1 :].strip()
+                tail = rest[i + 1:].strip()
+                # The text after a balanced group is only a branch body when it
+                # actually starts a statement. `IF (PARSENAME(@t,3)) IS NOT NULL`
+                # continues the *condition*, and splitting it emitted the
+                # nonsense `IF (...) THEN IS NOT NULL;`.
+                if tail and not _IF_BODY_START.match(tail):
+                    return rest, ""
+                return rest[: i + 1], tail
     return rest, ""
 
 
@@ -591,6 +638,18 @@ def _split_unparenthesized_cond(rest: str) -> tuple[str, str | None]:
     return rest, None
 
 
+def _declare_continues(line: str) -> bool:
+    """True when a ``DECLARE`` line continues onto the next one.
+
+    T-SQL declares several variables in one statement across many lines
+    (``DECLARE @a varchar(8000),`` / ``@b varchar(8000)``). Flushing on the
+    first line declared only ``@a`` and emitted the remaining declarations as
+    a bare statement, which PostgreSQL rejects.
+    """
+    stripped = line.rstrip().rstrip(";").rstrip()
+    return stripped.endswith(",") or _paren_delta(line) != 0
+
+
 def _paren_delta(text: str) -> int:
     """Net change in open-paren depth across ``text``, ignoring parens inside
     string literals and ``--`` line comments (brackets are identifiers in
@@ -626,6 +685,8 @@ _STMT_START_RE = re.compile(
     re.IGNORECASE,
 )
 _SET_START_EXCEPT = re.compile(r"^(?:UPDATE|INSERT|DELETE|MERGE)\b", re.IGNORECASE)
+_MERGE_START_RE = re.compile(r"^MERGE\b", re.IGNORECASE)
+_MERGE_ACTION_RE = re.compile(r"^(?:UPDATE|INSERT|DELETE|WHEN|THEN|VALUES|SET|OUTPUT)$", re.IGNORECASE)
 _SET_SESSION_OPTION_RE = re.compile(r"^SET\s+\w+(?:\s+\w+)*\s+(?:ON|OFF)\s*;?\s*$", re.IGNORECASE)
 _SET_VARIABLE_RE = re.compile(r"^SET\s+@\w+\s*=", re.IGNORECASE)
 _SELECT_START_EXCEPT = re.compile(r"^(?:WITH|INSERT|UNION|INTERSECT|EXCEPT)\b", re.IGNORECASE)
@@ -714,10 +775,18 @@ def _is_complete_tail(piece: str) -> bool:
     not dangle on a continuation token (``+``, ``,``, ``(``, ``=``, ...)."""
     if _paren_delta(piece) != 0:
         return False
-    tokens = piece.rstrip().strip().split()
+    stripped = piece.rstrip().rstrip(";").rstrip()
+    if not stripped:
+        return False
+    # A trailing operator/comma continues the statement even when it is glued
+    # to the preceding token (``set col = @col,``), which the token-level check
+    # below cannot see.
+    if stripped[-1] in ",+-*/%=(.":
+        return False
+    tokens = stripped.split()
     if not tokens:
         return False
-    return tokens[-1].rstrip(";").upper() not in _CONTINUATION_ENDINGS
+    return tokens[-1].upper() not in _CONTINUATION_ENDINGS
 
 
 def _case_open(text: str) -> bool:
@@ -1031,7 +1100,8 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             out.append("BEGIN")
         else:
             buf.append(piece)
-            if piece.endswith(";") or piece.upper().startswith("DECLARE ") or _is_complete_tail(piece):
+            declares = piece.upper().startswith("DECLARE ") and not _declare_continues(piece)
+            if piece.endswith(";") or declares or _is_complete_tail(piece):
                 flush()
 
     for raw_line in _join_balanced_lines(body):
@@ -1080,6 +1150,11 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
             # Don't flush if the current line is a continuation keyword (FROM, WHERE, UNION, etc.)
             if _CONTINUATION_KEYWORDS.match(first_word):
                 pass  # continue accumulating the current statement
+            elif _MERGE_START_RE.match(buf[0].lstrip()) and _MERGE_ACTION_RE.match(first_word):
+                # MERGE spells its actions with UPDATE / INSERT / DELETE after
+                # WHEN ... THEN. Those are clauses of the MERGE, not new
+                # statements — splitting there produced ``WHEN MATCHED THEN;``.
+                pass
             elif _STMT_START_RE.match(first_word):
                 flush()
             elif first_word == "SET" and _SET_SESSION_OPTION_RE.match(line):
@@ -1217,7 +1292,7 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
 
         # ---- statements ------------------------------------------------------
         buf.append(line)
-        if upper.startswith("DECLARE "):
+        if upper.startswith("DECLARE ") and not _declare_continues(line):
             flush()
         elif line.endswith(";"):
             # Don't flush if the statement ends with UNION/INTERSECT/EXCEPT
@@ -1233,7 +1308,20 @@ def _transform_tsql_body(body: str, kind: str, returns_set: bool, statement_fn=N
     while waiting:
         _close_now()
     if stack:
-        t_warns.append(f"Unbalanced BEGIN/END blocks: {stack}")
+        # A body whose BEGIN/END blocks do not balance used to be emitted
+        # truncated, which PostgreSQL rejects with "syntax error at end of
+        # input" and loses the whole routine. Close the still-open blocks so
+        # the routine at least compiles, and warn so the nesting is reviewed.
+        t_warns.append(
+            f"Unbalanced BEGIN/END blocks ({len(stack)} left open) — the missing "
+            f"block terminators were added automatically; review the converted nesting"
+        )
+        for entry in reversed(stack):
+            if isinstance(entry, tuple):
+                out.append("END IF;" if entry[0] == "if" else "END LOOP;")
+            else:
+                out.append("END;")
+        stack.clear()
 
     return out, t_warns, declared
 
@@ -1451,9 +1539,9 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
                 extra = ", ".join(_expr(a.strip()) for a in args[3:])
                 msg_expr = f"{msg_expr}, {extra}"
             return f"RAISE EXCEPTION {msg_expr};"
-    m = re.match(r"^THROW\s+(\d+)\s*,\s*([^,]+)\s*,", line, re.IGNORECASE)
-    if m:
-        return f"RAISE EXCEPTION {m.group(2).strip()};"
+    message = _throw_message(line)
+    if message is not None:
+        return f"RAISE EXCEPTION {message};"
     if upper.startswith("THROW"):
         return "RAISE EXCEPTION 'error';"
 
@@ -1513,7 +1601,7 @@ def _transform_statement(line: str, declared: dict[str, str], warnings: list[str
 def _translate_tsql_body_syntax(line: str) -> str:
     """Apply T-SQL-specific body transformations that don't go through _expr."""
     # T-SQL allows `INSERT tbl VALUES (...)` without INTO; PostgreSQL requires it.
-    line = re.sub(r"^(INSERT)\s+(?!INTO\b)(?=[\w\"\[#])", r"\1 INTO ", line, flags=re.IGNORECASE)
+    line = re.sub(r"^(INSERT)\s+(?!INTO\b)(?=[\w\"\[#@])", r"\1 INTO ", line, flags=re.IGNORECASE)
     # Column definitions inside a body CREATE TABLE keep their T-SQL types.
     line = _translate_body_create_table(line)
     # CREATE TABLE #temp; or CREATE TABLE temp; (no columns) -> CREATE TEMP TABLE temp ();
@@ -1615,6 +1703,29 @@ def _split_args_balanced(arg_string: str) -> list[str]:
     if buf:
         parts.append("".join(buf).strip())
     return parts
+
+
+def _throw_message(line: str, translate: bool = True) -> str | None:
+    """Return the message expression of a T-SQL ``THROW num, msg, state``.
+
+    The argument list is split on *top-level* commas only: real messages such
+    as ``'Name, Url and Status are required'`` contain commas, and a plain
+    ``[^,]+`` match truncated them mid-literal, emitting an unterminated
+    string that broke the rest of the routine.
+    """
+    m = re.match(r"^THROW\b\s*(.*)$", line.strip(), re.IGNORECASE | re.DOTALL)
+    if not m or not m.group(1).strip():
+        return None
+    args = _split_args_balanced(m.group(1))
+    if len(args) < 2:
+        return None
+    message = args[1].strip()
+    if not message:
+        return None
+    if message.startswith("@"):
+        name = _safe_var(message[1:])
+        return f"'%', {name}" if translate else f"'%', {message[1:]}"
+    return _replace_concat(_expr(message)) if translate else message
 
 
 def _replace_concat(text: str) -> str:

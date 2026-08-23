@@ -182,7 +182,7 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
             warnings.extend(tw)
         for check in table.check_constraints:
             statements.append(build_check_ddl(table, check, target_dialect))
-    for view in database.views:
+    for view in _views_in_dependency_order(database.views):
         stmts, tw = build_view_ddl(view, target_dialect, source, database.tables)
         statements.extend(stmts)
         warnings.extend(tw)
@@ -217,8 +217,12 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
     # grants) already carries the exact identifiers taken from the source
     # catalog — rewriting those corrupts column names that differ only in case
     # between tables (e.g. "STATUS" on one table and "status" on another).
+    # View and synonym names are relations too: a view selecting from another
+    # view emitted the reference unquoted, and PostgreSQL folded it to lower
+    # case and could not resolve the (case-preserving) migrated object.
+    related_relations = [v.name for v in database.views] + [s.name for s in database.synonyms]
     statements = [
-        _qualify_body_refs(s, database.tables, target_dialect)
+        _qualify_body_refs(s, database.tables, target_dialect, related_relations)
         if _is_body_statement(s) else s
         for s in statements
     ]
@@ -233,6 +237,53 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
             unique_warnings.append(w)
 
     return statements, unique_warnings
+
+
+def _views_in_dependency_order(views: list[View]) -> list[View]:
+    """Order views so a view is created after the views it selects from.
+
+    Extraction returns views alphabetically, so a view built on top of another
+    view was frequently emitted first and failed with "relation does not
+    exist". Dependencies are detected by looking for another view's bare name
+    inside the definition; the sort is cycle-safe and otherwise stable.
+    """
+    by_key: dict[str, View] = {}
+    for view in views:
+        by_key.setdefault(view.name.rsplit(".", 1)[-1].lower(), view)
+
+    dependencies: dict[int, list[View]] = {}
+    for view in views:
+        body = _strip_string_literals(view.definition or "")
+        own = view.name.rsplit(".", 1)[-1].lower()
+        found = []
+        for key, other in by_key.items():
+            if key == own or other is view:
+                continue
+            if re.search(rf"(?<![\w.\"\[]){re.escape(key)}\b", body, re.IGNORECASE):
+                found.append(other)
+        dependencies[id(view)] = found
+
+    order: list[View] = []
+    state: dict[int, int] = {}
+
+    def visit(view: View) -> None:
+        marker = state.get(id(view))
+        if marker == 2 or marker == 1:
+            return
+        state[id(view)] = 1
+        for dependency in dependencies.get(id(view), ()):
+            visit(dependency)
+        state[id(view)] = 2
+        order.append(view)
+
+    for view in views:
+        visit(view)
+    return order
+
+
+def _strip_string_literals(text: str) -> str:
+    """Blank out single-quoted literals so name scans never match inside them."""
+    return re.sub(r"'(?:[^']|'')*'", "''", text)
 
 
 _BODY_STMT_RE = re.compile(
@@ -1191,7 +1242,8 @@ def _anon_name(table: Table, definition: str) -> str:
     return f"{base}_chk_{digest}"
 
 
-def _qualify_table_refs(text: str, table_names: list[str], target: str) -> str:
+def _qualify_table_refs(text: str, table_names: list[str], target: str,
+                        skip: set[str] | None = None) -> str:
     """Qualify bare table references inside view/function/procedure bodies.
 
     MSSQL bodies reference ``Orders`` and resolve via the default dbo schema;
@@ -1211,8 +1263,15 @@ def _qualify_table_refs(text: str, table_names: list[str], target: str) -> str:
                 text,
                 flags=re.IGNORECASE,
             )
+    skip = skip or set()
     for tname in sorted(table_names, key=len, reverse=True):
         bare = tname.split(".")[-1]
+        # A routine parameter or local shadows a same-named relation inside the
+        # routine (`@Products` next to the synonym `dbo.Products`). Rewriting
+        # the bare name turned the variable into a relation reference. Only the
+        # explicitly schema-qualified form below is a genuine relation.
+        if bare.lower() in skip:
+            continue
         qualified = _qident(tname, target)
         text = re.sub(
             rf"(?<![.\w\"\[])\b{re.escape(bare)}\b(?![.\w\"\[])",
@@ -1292,7 +1351,8 @@ def _alias_bindings(text: str, tables_by_key: dict) -> dict:
     return bindings
 
 
-def _qualify_body_refs(text: str, tables: list, target: str) -> str:
+def _qualify_body_refs(text: str, tables: list, target: str,
+                      extra_relations: list[str] | None = None) -> str:
     """Rewrite body expressions so unquoted MSSQL references resolve in PostgreSQL.
 
     MSSQL bodies are written case-insensitively (``FROM Orders``, ``o.CustomerID``);
@@ -1340,11 +1400,20 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
         return unambiguous.get(lowered)
 
     masked, stash = _mask(text)
-    masked = _qualify_table_refs(masked, [t.name for t in tables], target)
 
-    # Bare references to a function's own parameters must stay unquoted so
-    # PL/pgSQL resolves them as variables rather than ambiguous columns.
+    # Bare references to the routine's own parameters and locals must stay
+    # unquoted so PL/pgSQL resolves them as variables rather than as columns
+    # or relations. Resolved before any rewriting so both passes can skip them.
     param_names = _signature_param_names(masked)
+
+    # The parameter list declares names and types only — it holds no table or
+    # column references, so hide it outright rather than rewriting inside it.
+    masked = _hide_signature(masked, stash)
+
+    # Column casing is resolved from real tables only (views carry no column
+    # model here); relation *names* additionally cover views and synonyms.
+    relation_names = [t.name for t in tables] + list(extra_relations or [])
+    masked = _qualify_table_refs(masked, relation_names, target, skip=param_names)
 
     def _qualified(match) -> str:
         prefix = match.group("prefix")
@@ -1372,18 +1441,102 @@ def _qualify_body_refs(text: str, tables: list, target: str) -> str:
     return _unmask(masked, stash)
 
 
+_ROUTINE_SIGNATURE_RE = re.compile(
+    r"CREATE\s+(?:OR\s+(?:REPLACE|ALTER)\s+)?(?:FUNCTION|PROCEDURE)\s+"
+    r"(?:\"[^\"]+\"|\w+)(?:\s*\.\s*(?:\"[^\"]+\"|\w+))?\s*\(",
+    re.IGNORECASE,
+)
+
+_PLPGSQL_DECLARE_RE = re.compile(
+    r"\bDECLARE\b(.*?)\bBEGIN\b", re.IGNORECASE | re.DOTALL,
+)
+
+
+def _balanced_span(text: str, open_index: int) -> str | None:
+    """Return the text inside the parentheses that open at ``open_index``.
+
+    Splitting on the first ``)`` truncates any signature containing a
+    parameterized type (``NUMERIC(18,2)``), which silently dropped every
+    parameter declared after it.
+    """
+    depth = 0
+    in_str = False
+    for i in range(open_index, len(text)):
+        ch = text[i]
+        if in_str:
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:i]
+    return None
+
+
 def _signature_param_names(statement: str) -> set[str]:
-    """Extract parameter names from `FUNCTION name(...)` signatures."""
-    m = re.search(r"CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+\w+(?:\.\w+)?\s*\((.*?)\)", statement,
-                  re.IGNORECASE | re.DOTALL)
-    if not m:
-        return set()
+    """Names PL/pgSQL resolves as variables, never as columns.
+
+    Covers routine parameters (functions *and* procedures) plus the locals of
+    the generated ``DECLARE`` block. Quoting any of them as a column reference
+    turns a parameter into the same-named table column, which silently makes
+    predicates such as ``WHERE id = id`` always true instead of raising — so
+    the set must be complete, not best-effort.
+    """
     names: set[str] = set()
-    for part in m.group(1).split(","):
-        pm = re.match(r'^\s*(?:(?:OUT|IN)\s+)?"?([\w]+)"?\s+', part)
-        if pm:
-            names.add(pm.group(1).lower())
+
+    match = _ROUTINE_SIGNATURE_RE.search(statement)
+    if match:
+        signature = _balanced_span(statement, match.end() - 1)
+        if signature:
+            for part in _split_signature_args(signature):
+                pm = re.match(
+                    r'^\s*(?:(?:INOUT|OUT|IN|VARIADIC)\s+)?"?([A-Za-z_]\w*)"?\s+\S',
+                    part, re.IGNORECASE,
+                )
+                if pm:
+                    names.add(pm.group(1).lower())
+
+    declare = _PLPGSQL_DECLARE_RE.search(statement)
+    if declare:
+        for line in declare.group(1).split(";"):
+            dm = re.match(r'^\s*"?([A-Za-z_]\w*)"?\s+\S', line)
+            if dm:
+                names.add(dm.group(1).lower())
+
     return names
+
+
+def _split_signature_args(signature: str) -> list[str]:
+    """Split a routine signature on top-level commas only."""
+    parts, buf, depth, in_str = [], [], 0, False
+    for ch in signature:
+        if in_str:
+            buf.append(ch)
+            if ch == "'":
+                in_str = False
+            continue
+        if ch == "'":
+            in_str = True
+            buf.append(ch)
+        elif ch in "([":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
 
 
 def _mask(text: str) -> tuple[str, list[str]]:
@@ -1422,7 +1575,24 @@ def _mask(text: str) -> tuple[str, list[str]]:
     return text, stash
 
 
+def _hide_signature(text: str, stash: list[str]) -> str:
+    """Stash a routine's parameter list so no rewrite pass can reach it."""
+    match = _ROUTINE_SIGNATURE_RE.search(text)
+    if not match:
+        return text
+    open_index = match.end() - 1
+    signature = _balanced_span(text, open_index)
+    if signature is None or not signature.strip():
+        return text
+    stash.append(signature)
+    end = open_index + 1 + len(signature)
+    return text[:open_index + 1] + f"\x01{len(stash) - 1}\x01" + text[end:]
+
+
 def _unmask(text: str, stash: list[str]) -> str:
-    for i, s in enumerate(stash):
+    # Restored newest-first: a stashed signature can itself contain markers for
+    # literals stashed earlier, which must be restored after it is put back.
+    for i in range(len(stash) - 1, -1, -1):
+        s = stash[i]
         text = text.replace(f"\x00{i}\x00", s).replace(f"\x01{i}\x01", s)
     return text

@@ -22,6 +22,7 @@ from engine.translators.procedure_translator import (
     _transform_plpgsql_body,
     _transform_tsql_body,
     _expr,
+    _throw_message,
     _translate_top,
     _split_args_balanced,
 )
@@ -292,9 +293,9 @@ def _translate_raiseerror(line: str) -> str:
                 return f"RAISE EXCEPTION {msg_literal}, {extra}"
             return f"RAISE EXCEPTION {msg_literal}"
         return "RAISE EXCEPTION 'error'"
-    m = re.match(r"^THROW\s+(\d+)\s*,\s*([^,]+)\s*,", line, re.IGNORECASE)
-    if m:
-        return f"RAISE EXCEPTION {m.group(2).strip()}"
+    message = _throw_message(line, translate=False)
+    if message is not None:
+        return f"RAISE EXCEPTION {message}"
     if line.upper().startswith("THROW"):
         return "RAISE EXCEPTION 'error'"
     return line
