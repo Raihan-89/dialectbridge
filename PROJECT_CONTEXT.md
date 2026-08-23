@@ -124,6 +124,13 @@ Deliberate ordering choices:
   only an object that vanished with no explanation is recorded as `failed`. When the target cannot be
   inventoried (unknown dialect, refused catalog query, a connector that returns
   nothing) the pass is skipped rather than reporting phantom losses.
+- **Per-table copy times are stored, not just streamed.** Each `data_results`
+  entry carries `duration_seconds` plus a formatted `duration_display`, mirrored
+  onto the matching row-count verification row, and the summary carries the
+  copy phase's wall-clock `data_seconds`/`data_duration` (a sum of the per-table
+  times would overcount by the worker count when tables copy in parallel). The
+  live progress payload only exists while a job runs, so a finished report used
+  to show no timings at all.
 - **Object identity is truncation-aware.** PostgreSQL caps identifiers at 63
   bytes, so a longer SQL Server name is created there in the shortened,
   hash-suffixed form `pg_ident()` produces. Reconciliation and the Verify
@@ -143,7 +150,7 @@ Deliberate ordering choices:
 - **`reset_target` option** (destructive, user opts in): PostgreSQL drops the target schemas `CASCADE`; SQL Server instead drops FKs, then tables, then views/procedures/functions/triggers inside the affected schemas (owner schemas like `dbo` cannot themselves be dropped). Re-runs are then clean.
 - **PostgreSQL `search_path`** is set to the migrated schemas so views/routines that reference tables by bare name still resolve.
 
-The report (`MigrationReport`) contains per-object results (kind, name, status, detail, rows copied/failed), a row-count verification table, warnings, and a summary. This is stored as JSON on `MigrationJob.report`. An optional progress callback reports the major phases (extract, convert, structural DDL, data copy, objects, verification and report persistence) to the web job.
+The report (`MigrationReport`) contains per-object results (kind, name, status, detail, rows copied/failed, copy duration), a row-count verification table, warnings, and a summary. This is stored as JSON on `MigrationJob.report`. An optional progress callback reports the major phases (extract, convert, structural DDL, data copy, objects, verification and report persistence) to the web job.
 
 ---
 
@@ -285,7 +292,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `python manage.py test` runs **256 tests**; `python manage.py check` reports no issues.
+Current verification: `python manage.py test` runs **260 tests**; `python manage.py check` reports no issues.
 
 ---
 

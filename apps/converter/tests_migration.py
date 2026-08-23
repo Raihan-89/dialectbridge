@@ -308,9 +308,12 @@ class MigrationPipelineSmokeTests(SimpleTestCase):
         self.assertEqual(report.summary["tables"], 1)
         self.assertEqual(report.summary["rows_copied"], 3)
         self.assertEqual(target.data["dbo.users"], [[1, "a"], [2, "b"], [3, "c"]])
-        self.assertEqual(report.verification, [{
-            "table": "dbo.users", "source_rows": 3, "target_rows": 3, "match": True,
-        }])
+        row = report.verification[0]
+        self.assertEqual(
+            {k: row[k] for k in ("table", "source_rows", "target_rows", "match")},
+            {"table": "dbo.users", "source_rows": 3, "target_rows": 3, "match": True},
+        )
+        self.assertIsNotNone(row["duration_seconds"])
 
     def test_batched_keyset_pagination_used(self):
         source = _FakeConnector({f"dbo.t{i}": [(i, str(i))] for i in range(3)}, dialect="tsql")
@@ -756,3 +759,46 @@ class LongIdentifierReconciliationTests(SimpleTestCase):
         from engine.translators.sql_builder import pg_ident
 
         self.assertEqual(_key(f"dbo.{self.LONG}"), _key(f"public.{pg_ident(self.LONG)}"))
+
+
+class CopyDurationTests(SimpleTestCase):
+    """Per-table copy times survive into the stored report.
+
+    While a migration runs the report page shows each table's elapsed time from
+    the live progress payload. That payload is gone once the job finishes, so
+    the finished report used to show no timings at all.
+    """
+
+    def _report(self):
+        source = _FakeConnector({"dbo.users": [(1, "a"), (2, "b")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        return MigrationOrchestrator(source, target, copy_data=True).run()
+
+    def test_every_copied_table_records_its_duration(self):
+        report = self._report()
+        result = report.data_results[0].to_dict()
+        self.assertIsNotNone(result["duration_seconds"])
+        self.assertGreaterEqual(result["duration_seconds"], 0.0)
+        self.assertTrue(result["duration_display"])
+
+    def test_verification_rows_carry_the_same_duration(self):
+        report = self._report()
+        self.assertEqual(
+            report.verification[0]["duration_seconds"],
+            report.data_results[0].duration_seconds,
+        )
+
+    def test_summary_reports_the_wall_clock_copy_time(self):
+        report = self._report()
+        self.assertIn("data_seconds", report.summary)
+        self.assertGreaterEqual(report.summary["data_seconds"], 0.0)
+        self.assertTrue(report.summary["data_duration"])
+
+    def test_durations_are_formatted_for_humans(self):
+        from engine.migration.orchestrator import format_duration
+
+        self.assertEqual(format_duration(None), "\u2014")
+        self.assertEqual(format_duration(0.42), "0.42s")
+        self.assertEqual(format_duration(42.5), "42.5s")
+        self.assertEqual(format_duration(82), "1m 22s")
+        self.assertEqual(format_duration(3723), "1h 02m 03s")
