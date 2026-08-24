@@ -3297,3 +3297,97 @@ class VerificationReportCsvTests(TestCase):
         body = response.content.decode()
         self.assertIn("connection lost", body)
         self.assertIn("procedures", body)
+
+
+class LongRoutineNameTests(TestCase):
+    """PostgreSQL's 63-byte identifier limit must never silently lose a routine."""
+
+    LONG = "getAttendanceReportNewReportMultipleWagesPayConnectTeamwithPaymentdates"
+
+    def _emit(self, name):
+        converted, warnings = translate_routine(
+            f"CREATE PROCEDURE dbo.{name} AS BEGIN select 1 as x; END",
+            "tsql", "postgres",
+        )
+        emitted = re.search(r"PROCEDURE (\S+?)\(", converted).group(1)
+        return emitted, warnings
+
+    def test_routines_sharing_63_bytes_stay_distinct(self):
+        """Five real procedures shared their first 63 bytes.
+
+        Emitted raw, they all truncated to one name and CREATE OR REPLACE
+        overwrote them in turn — four procedures vanished with no error.
+        """
+        names = [self.LONG, self.LONG + "All", self.LONG + "Alternates",
+                 self.LONG + "AlternatesAPI", self.LONG + "Created"]
+        emitted = [self._emit(n)[0] for n in names]
+        self.assertEqual(len(set(emitted)), len(names))
+        # PostgreSQL folds unquoted identifiers to lower case; they must still
+        # be unique after folding, not just as written.
+        self.assertEqual(len({e.lower() for e in emitted}), len(names))
+        for name in emitted:
+            self.assertLessEqual(len(name.encode("utf-8")), 63)
+
+    def test_shortened_name_is_warned_about(self):
+        emitted, warnings = self._emit(self.LONG + "Alternates")
+        self.assertNotEqual(emitted, self.LONG + "Alternates")
+        self.assertTrue(any("63-byte" in w for w in warnings), warnings)
+        self.assertTrue(any(emitted in w for w in warnings), warnings)
+
+    def test_short_names_are_left_exactly_alone(self):
+        emitted, warnings = self._emit("getAttendanceRpt")
+        self.assertEqual(emitted, "getAttendanceRpt")
+        self.assertFalse(warnings, warnings)
+
+
+class ForXmlConcatAndQueryHintTests(TestCase):
+    """Fixes for the reported sfPBI_SEA_DBrd failure."""
+
+    def test_concat_with_more_than_two_args_becomes_string_agg(self):
+        """`CONCAT(sep, a, b)` is the common real-world aggregate shape.
+
+        The splitter accepted only exactly two arguments, so this declined and
+        the untranslated `FOR XML` reached PostgreSQL as a syntax error.
+        """
+        converted, _ = translate_routine(
+            "CREATE FUNCTION dbo.f() RETURNS varchar(100) AS BEGIN RETURN "
+            "stuff((select concat(', '+char(10), count(a), "
+            "case a when 1 then ' Child' else ' Adult' end) "
+            "from t v group by a for xml path('')),1,3,''); END",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertNotIn("xml", converted.lower())
+        self.assertIn("string_agg", converted)
+        # The separator must be PostgreSQL concatenation, not T-SQL `+`.
+        self.assertIn("', ' || chr(10)", converted)
+
+    def test_leading_literal_concat_form_still_converts(self):
+        converted, _ = translate_routine(
+            "CREATE FUNCTION dbo.f() RETURNS varchar(100) AS BEGIN RETURN "
+            "stuff((select ', '+concat(char(10), '- ', x) from t "
+            "for xml path('')),1,3,''); END",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertIn("string_agg", converted)
+
+    def test_option_query_hint_is_removed_with_a_warning(self):
+        converted, warnings = translate_routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN\n"
+            "SELECT a FROM t WHERE b = 1 option(recompile)\nEND",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertNotIn("option(", converted.lower())
+        self.assertIn("SELECT a FROM t WHERE b = 1;", converted)
+        self.assertTrue(any("OPTION" in w for w in warnings), warnings)
+
+    def test_the_word_option_in_a_column_name_is_untouched(self):
+        converted, _ = translate_routine(
+            "CREATE PROCEDURE dbo.p AS BEGIN SELECT option_id, opt.option_name "
+            "FROM options opt; END",
+            "tsql", "postgres",
+        )
+        self.assertIn("option_id", converted)
+        self.assertIn("option_name", converted)

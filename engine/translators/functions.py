@@ -308,6 +308,12 @@ def _split_aggregate_expression(expr: str) -> tuple[str | None, str | None]:
         parts = _split_args(concat.group("args"))
         if len(parts) == 2:
             return parts[0].strip(), parts[1].strip()
+        if len(parts) > 2:
+            # CONCAT(sep, a, b, ...) — the separator is still the first
+            # argument; everything after it is the value being aggregated.
+            # Requiring exactly two arguments rejected the common real-world
+            # shape and left `FOR XML` untranslated.
+            return parts[0].strip(), "concat(" + ", ".join(p.strip() for p in parts[1:]) + ")"
         return None, None
     literal = _LEADING_LITERAL_RE.match(expr)
     if literal:

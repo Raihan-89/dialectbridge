@@ -330,11 +330,26 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
 
     warnings.extend(_ambiguous_variable_warnings(name, params, declared, tables))
 
+    # PostgreSQL truncates any identifier past 63 bytes. Emitting the raw name
+    # meant long routines were created under a silently shortened name, and —
+    # far worse — routines sharing their first 63 bytes truncated to the *same*
+    # name, so CREATE OR REPLACE overwrote them one after another and every copy
+    # but the last was lost without an error. pg_ident() keeps distinct names
+    # distinct by appending a hash of the full name.
+    from engine.translators.sql_builder import pg_ident
+    emitted_name = pg_ident(name)
+    if emitted_name != name:
+        warnings.append(
+            f"'{name}' is {len(name.encode('utf-8'))} bytes, past PostgreSQL's "
+            f"63-byte identifier limit — it was created as '{emitted_name}'. "
+            f"Update any caller that uses the original name."
+        )
+
     signature = ", ".join(param_list)
     if kind == "FUNCTION":
-        header = f"CREATE OR REPLACE FUNCTION {name}({signature}) RETURNS {sig_returns} AS $$"
+        header = f"CREATE OR REPLACE FUNCTION {emitted_name}({signature}) RETURNS {sig_returns} AS $$"
     else:
-        header = f"CREATE OR REPLACE PROCEDURE {name}({signature}) AS $$"
+        header = f"CREATE OR REPLACE PROCEDURE {emitted_name}({signature}) AS $$"
     footer = "$$ LANGUAGE plpgsql;"
 
     converted = _assemble_plpgsql(header, declared, transformed, footer)
@@ -1566,7 +1581,29 @@ def _contains_toplevel_keyword(text: str, word: str) -> bool:
     return False
 
 
+_TSQL_QUERY_HINT_RE = re.compile(
+    r"\s+OPTION\s*\((?:[^()]|\([^()]*\))*\)\s*(;?)\s*$", re.IGNORECASE,
+)
+
+
+def _strip_query_hints(line: str, warnings: list[str]) -> str:
+    """Drop a trailing T-SQL ``OPTION (...)`` query hint.
+
+    The clause only steers SQL Server's planner, so removing it never changes
+    results — but PostgreSQL has no equivalent and rejects it outright, taking
+    the whole routine down with it.
+    """
+    stripped = _TSQL_QUERY_HINT_RE.sub(r"\1", line)
+    if stripped != line:
+        warnings.append(
+            "Removed a T-SQL OPTION (...) query hint — PostgreSQL has no "
+            "equivalent; the statement's results are unchanged"
+        )
+    return stripped
+
+
 def _transform_statement(line: str, declared: dict[str, str], warnings: list[str], returns_set: bool, is_procedure: bool = False) -> str | None:
+    line = _strip_query_hints(line, warnings)
     # A whole statement wrapped in parentheses — `(SELECT ...)` — is how some
     # T-SQL procedures return a result set. Unwrap it so the result-select
     # handling below recognises it.
