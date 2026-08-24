@@ -32,11 +32,65 @@ PARAM_RE = re.compile(
 )
 
 
+def _quoted_span_end(sql: str, start: int) -> int:
+    """Return the index just past the quoted run beginning at *start*.
+
+    Handles `'...'` literals, `"..."` and `[...]` identifiers, including the
+    doubled-delimiter escapes (`''`, `""`, `]]`). An unterminated run consumes
+    the remainder rather than looping.
+    """
+    closer = {"'": "'", '"': '"', "[": "]"}[sql[start]]
+    i = start + 1
+    n = len(sql)
+    while i < n:
+        if sql[i] == closer:
+            if i + 1 < n and sql[i + 1] == closer:
+                i += 2           # doubled delimiter: an escaped literal one
+                continue
+            return i + 1
+        i += 1
+    return n
+
+
 def _strip_sql_comments(sql: str) -> str:
-    """Remove block comments (/* ... */) and line comments (-- ...) from SQL."""
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    sql = re.sub(r"--[^\n]*", " ", sql)
-    return sql
+    """Remove block comments (/* ... */) and line comments (-- ...) from SQL.
+
+    String literals and quoted/bracketed identifiers are copied through
+    untouched. Scanning for `--` and `/*` without tracking quotes meant a
+    literal such as `'---'` (a real placeholder in migrated procedures) looked
+    like a comment: everything from the dashes to the end of the line was
+    deleted, leaving an unterminated string that swallowed the rest of the
+    routine and made PostgreSQL report `unexpected end of function definition`.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in "'\"[":
+            end = _quoted_span_end(sql, i)
+            out.append(sql[i:end])
+            i = end
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            end = n if end == -1 else end       # keep the newline itself
+            out.append(" ")
+            i = end
+        elif sql.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(" ")
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def _blank_literals(sql: str) -> str:

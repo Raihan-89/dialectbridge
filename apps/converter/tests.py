@@ -3108,3 +3108,48 @@ class ThirdRoundMigrationFailureTests(TestCase):
         )
         self.assertIsNotNone(converted)
         self.assertFalse(warnings, warnings)
+
+    def test_dashes_inside_a_string_literal_are_not_a_comment(self):
+        """`'---'` is a placeholder value, not a line comment.
+
+        Comment stripping ran before any quote tracking, so the `--` inside the
+        literal ate the rest of the line. That left `isnull(ba.latitude,'` — an
+        unterminated string that swallowed every following statement, and
+        PostgreSQL rejected the routine with `unexpected end of function
+        definition at end of input`.
+        """
+        converted, _ = translate_routine(
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n"
+            "  INSERT INTO #T\n"
+            "  select isnull(ba.latitude,'---') as latitude\n"
+            "        ,isnull(ba.longitude,'---') as longitude\n"
+            "  from t ba\n"
+            "END",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertIn("COALESCE(ba.latitude,'---')", converted)
+        self.assertIn("COALESCE(ba.longitude,'---')", converted)
+        # The body must stay balanced: an eaten line used to drop the END.
+        self.assertEqual(converted.count("'"), 4)
+        self.assertTrue(converted.rstrip().endswith("$$ LANGUAGE plpgsql;"))
+
+    def test_real_comments_are_still_stripped(self):
+        converted, _ = translate_routine(
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n"
+            "  -- pick the row\n"
+            "  /* block\n     comment */\n"
+            "  SELECT a FROM t;\n"
+            "END",
+            "tsql", "postgres",
+        )
+        self.assertIsNotNone(converted)
+        self.assertNotIn("pick the row", converted)
+        self.assertNotIn("block", converted)
+
+    def test_comment_markers_inside_literals_and_identifiers_survive(self):
+        from engine.translators.procedure_translator import _strip_sql_comments
+        self.assertEqual(
+            _strip_sql_comments("select '/*x*/' , [we--ird], 'it''s ---' from t"),
+            "select '/*x*/' , [we--ird], 'it''s ---' from t",
+        )
