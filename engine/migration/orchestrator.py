@@ -382,6 +382,15 @@ class MigrationOrchestrator:
                                      f"Applying objects {idx}/{len(remaining_stmts)}",
                                      objects_applied=idx, total_objects=len(remaining_stmts))
 
+        # ---- 5b. account for every source object --------------------------------
+        # A routine the translator cannot convert produces a warning and *no*
+        # statement, so it never reached _apply and never appeared in the report:
+        # the object silently vanished, the run showed zero failures, and the
+        # target was quietly missing objects the user expected. Reconcile the
+        # source inventory against what was actually attempted so nothing can go
+        # missing without saying so.
+        self._record_unattempted(report, schema)
+
         # ---- 6. verify ----------------------------------------------------------
         # The per-table copy time is only known here; the live progress payload
         # that carried it is gone once the job finishes, so it is folded into
@@ -429,6 +438,10 @@ class MigrationOrchestrator:
             "data_seconds": round(copy_elapsed, 2),
             "data_duration": format_duration(copy_elapsed) if self.copy_data else "—",
             "schema_failed": sum(1 for r in report.schema_results if r.status == "failed"),
+            # Skipped objects are not failures, but they are absent from the
+            # target. Counting them keeps a clean "0 failures" from reading as
+            # "everything migrated".
+            "schema_skipped": sum(1 for r in report.schema_results if r.status == "skipped"),
             "data_failed": sum(1 for r in report.data_results if r.status == "failed"),
             "warnings": len(report.warnings),
         }
@@ -636,6 +649,47 @@ class MigrationOrchestrator:
         mover = DataMigration(self.source, self.target, table, progress_callback=on_batch)
         self._record_copy_result(report, table.name, mover.run(), started)
 
+    @staticmethod
+    def _bare(name: str) -> str:
+        return name.rsplit(".", 1)[-1].strip('"[]').lower()
+
+    def _record_unattempted(self, report: MigrationReport, schema) -> None:
+        """Record every source object that produced no target DDL at all.
+
+        Objects are only in the report because a statement was executed for
+        them. When conversion fails the builder returns no statement, so the
+        object left no trace: not a success, not a failure, just absent. Each
+        one is added here as ``skipped`` carrying the warning that explains why,
+        so the report's object list always matches the source inventory.
+        """
+        attempted = {self._bare(r.name) for r in report.schema_results if r.name}
+        groups = (
+            ("view", schema.views), ("function", schema.functions),
+            ("procedure", schema.procedures), ("trigger", schema.triggers),
+            ("sequence", schema.sequences), ("type", schema.types),
+            ("object", schema.synonyms),
+        )
+        for kind, objects in groups:
+            for obj in objects:
+                bare = self._bare(obj.name)
+                if bare in attempted:
+                    continue
+                reasons = [w for w in report.warnings if bare in w.lower()]
+                detail = (
+                    " ".join(reasons) if reasons else
+                    "No target DDL could be generated for this object, so it was "
+                    "never created on the target."
+                )
+                logger.warning(
+                    "Schema object never attempted kind=%s name=%s reason=%s",
+                    kind, obj.name, detail,
+                )
+                report.schema_results.append(
+                    ObjectResult(kind=kind, name=obj.name, status="skipped",
+                                 detail=detail[:4000])
+                )
+                attempted.add(bare)
+
     def _missing_source_dependency(self, message: str) -> str | None:
         """Return the referenced object when the failure is caused by something
         that does not exist in the *source* database either.
@@ -730,7 +784,9 @@ def _name_from_stmt(stmt: str) -> str:
     # grab the first identifier after CREATE <kind>
     m = __import__("re").match(
         r"^\s*CREATE(?:\s+OR\s+(?:ALTER|REPLACE))?\s+"
-        r"(?:VIEW|FUNCTION|PROCEDURE|TRIGGER)\s+"
+        r"(?:MATERIALIZED\s+VIEW|VIEW|FUNCTION|PROCEDURE|TRIGGER"
+        r"|SEQUENCE|DOMAIN|TYPE)\s+"
+        r"(?:IF\s+NOT\s+EXISTS\s+)?"
         r"(?:\"?\[?\w+\]?\"?\.)?\"?\[?([\w\d_]+)",
         stmt,
         flags=__import__("re").IGNORECASE,

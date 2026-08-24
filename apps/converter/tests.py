@@ -3153,3 +3153,33 @@ class ThirdRoundMigrationFailureTests(TestCase):
             _strip_sql_comments("select '/*x*/' , [we--ird], 'it''s ---' from t"),
             "select '/*x*/' , [we--ird], 'it''s ---' from t",
         )
+
+    def test_unconvertible_object_is_reported_not_silently_dropped(self):
+        """An object with no target DDL must still appear in the report.
+
+        A routine the translator declines produces a warning and no statement,
+        so it never reached _apply and left no row at all: the run showed
+        "0 schema failures" while the target was quietly missing the object.
+        """
+        from engine.migration.orchestrator import MigrationOrchestrator, MigrationReport
+
+        report = MigrationReport(source_db="s", target_db="t", started_at="now")
+        report.warnings.append("Procedure 'dbo.Ghost' could not be converted: uses FOR XML")
+        schema = Database(name="s", dialect="tsql")
+        schema.procedures.append(Routine(name="dbo.Ghost", kind="procedure", definition="x"))
+        schema.views.append(View(name="dbo.Made", definition="y"))
+        report.schema_results.append(
+            orchestrator_module.ObjectResult(kind="view", name="Made")
+        )
+
+        MigrationOrchestrator(None, None)._record_unattempted(report, schema)
+
+        ghost = [r for r in report.schema_results if r.name == "dbo.Ghost"]
+        self.assertEqual(len(ghost), 1)
+        self.assertEqual(ghost[0].status, "skipped")
+        self.assertIn("FOR XML", ghost[0].detail)
+        # The view that *was* created must not be duplicated as skipped.
+        self.assertEqual(
+            [r.status for r in report.schema_results if "made" in r.name.lower()],
+            ["success"],
+        )
