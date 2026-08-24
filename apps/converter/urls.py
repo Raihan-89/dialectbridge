@@ -30,6 +30,7 @@ urlpatterns = [
     path("migrate/<int:pk>/cancel/", web_views.migration_cancel_view, name="migration-cancel"),
     path("errors/", web_views.errors_view, name="errors"),
     path("verify/", web_views.verify_view, name="verify"),
+    path("verify/<int:pk>/report.csv", web_views.verify_report_csv_view, name="verify-report-csv"),
     path("verify/<int:pk>/<str:section>/", web_views.verify_section_view, name="verify-section"),
     path("data/", web_views.data_compare_view, name="data-compare"),
     path("data/<int:pk>/tables/", web_views.data_compare_tables_view, name="data-compare-tables"),

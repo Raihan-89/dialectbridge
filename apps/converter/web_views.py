@@ -581,6 +581,80 @@ def verify_section_view(request, pk, section):
         return JsonResponse({"error": f"Verification query failed: {exc}"}, status=500)
 
 
+_VERIFY_CSV_SKIP_FIELDS = {"name", "detail", "definition"}
+
+
+def _verify_csv_extra(value: dict | None) -> str:
+    """Flatten a side's remaining fields into one cell.
+
+    The object definition is deliberately left out — a whole view or routine
+    body per row would bury the comparison it is meant to support.
+    """
+    if not value:
+        return ""
+    parts = []
+    for key in sorted(value):
+        if key in _VERIFY_CSV_SKIP_FIELDS:
+            continue
+        item = value[key]
+        if isinstance(item, (list, tuple)):
+            item = ", ".join(str(x) for x in item)
+        parts.append(f"{key}={item}")
+    return "; ".join(parts)
+
+
+@require_GET
+def verify_report_csv_view(request, pk):
+    """Download the live source/target comparison for one migration as CSV.
+
+    Every section the Verify page can show, in one file, so a full verification
+    can be handed over or diffed between runs. `?section=views` exports a single
+    section instead of all of them.
+    """
+    job = get_object_or_404(
+        MigrationJob.objects.select_related("source", "target"), pk=pk,
+    )
+    requested = request.GET.get("section")
+    if requested and requested not in SECTION_LABELS:
+        return JsonResponse({"error": f"Unknown verification section: {requested}"}, status=400)
+    sections = [requested] if requested else list(SECTION_LABELS)
+
+    response = HttpResponse(content_type="text/csv")
+    suffix = f"-{requested}" if requested else ""
+    response["Content-Disposition"] = (
+        f'attachment; filename="migration-{job.pk}-verification{suffix}.csv"'
+    )
+    writer = csv.writer(response)
+    writer.writerow([
+        "section", "key", "status",
+        "source_name", "source_detail", "source_extra",
+        "target_name", "target_detail", "target_extra",
+    ])
+
+    for section in sections:
+        try:
+            result = compare_live(job.source, job.target, section)
+        except Exception as exc:
+            # One unreadable section must not cost the user the whole report.
+            logger.warning("Verification CSV section failed job=%s section=%s error=%s",
+                           job.pk, section, exc)
+            writer.writerow([section, "", "error", "", str(exc), "", "", "", ""])
+            continue
+        for row in result["rows"]:
+            source, target = row.get("source"), row.get("target")
+            writer.writerow([
+                section, row.get("key", ""), row.get("status", ""),
+                (source or {}).get("name", ""),
+                " ".join(str((source or {}).get("detail", "")).split()),
+                _verify_csv_extra(source),
+                (target or {}).get("name", ""),
+                " ".join(str((target or {}).get("detail", "")).split()),
+                _verify_csv_extra(target),
+            ])
+
+    return response
+
+
 def data_compare_view(request):
     """Read-only browser for comparing migrated table records."""
     jobs = MigrationJob.objects.select_related("source", "target").filter(

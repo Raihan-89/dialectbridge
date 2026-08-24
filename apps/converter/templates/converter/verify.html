@@ -83,6 +83,15 @@
             Open migration
         </button>
     </form>
+    {% if selected %}
+    <p class="actions" style="margin:12px 0 0;">
+        <a class="btn btn-outline" href="{% url 'verify-report-csv' selected.pk %}"
+           data-loading-text="Building verification report…"
+           data-loading-sub="Comparing every section live. This can take a while on large databases.">
+            Download verification report as CSV
+        </a>
+    </p>
+    {% endif %}
 </div>
 
 {% if selected %}

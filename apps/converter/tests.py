@@ -3231,3 +3231,69 @@ class MigrationReportCsvTests(TestCase):
         response = self.client.get(reverse("migrate-report-csv", args=[self.job.pk]))
         body = response.content.decode()
         self.assertIn("could not be converted: uses FOR XML", body)
+
+
+class VerificationReportCsvTests(TestCase):
+    """The live source/target comparison must be downloadable as CSV."""
+
+    def setUp(self):
+        src = DatabaseConnection.objects.create(
+            name="s", engine="mssql", host="h", database="sdb", username="u")
+        tgt = DatabaseConnection.objects.create(
+            name="t", engine="postgres", host="h", database="tdb", username="u")
+        self.job = MigrationJob.objects.create(
+            source=src, target=tgt, status=MigrationJob.Status.COMPLETED)
+
+    @staticmethod
+    def _fake_compare(source, target, section):
+        return {
+            "section": section, "label": section, "total": 1,
+            "counts": {"match": 0, "different": 0, "source_only": 1, "target_only": 0},
+            "all_match": False,
+            "rows": [{
+                "key": "dbo.v", "status": "source_only",
+                "source": {"name": "dbo.V", "detail": "View",
+                           "definition": "CREATE VIEW ...", "unique": True},
+                "target": None,
+            }],
+        }
+
+    def test_csv_exports_every_section(self):
+        with patch("apps.converter.web_views.compare_live", self._fake_compare):
+            response = self.client.get(reverse("verify-report-csv", args=[self.job.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/csv")
+        body = response.content.decode()
+        for section in ("overview", "views", "procedures", "security", "rows"):
+            self.assertIn(section, body)
+        self.assertIn("source_only", body)
+        self.assertIn("dbo.V", body)
+        # Extra fields are flattened, but definitions are never dumped.
+        self.assertIn("unique=True", body)
+        self.assertNotIn("CREATE VIEW", body)
+
+    def test_single_section_can_be_exported(self):
+        with patch("apps.converter.web_views.compare_live", self._fake_compare):
+            response = self.client.get(
+                reverse("verify-report-csv", args=[self.job.pk]), {"section": "views"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("verification-views.csv", response["Content-Disposition"])
+        self.assertNotIn("procedures", response.content.decode())
+
+    def test_unknown_section_is_rejected(self):
+        response = self.client.get(
+            reverse("verify-report-csv", args=[self.job.pk]), {"section": "nope"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_a_failing_section_does_not_lose_the_report(self):
+        def boom(source, target, section):
+            if section == "views":
+                raise ConnectorError("connection lost")
+            return self._fake_compare(source, target, section)
+
+        with patch("apps.converter.web_views.compare_live", boom):
+            response = self.client.get(reverse("verify-report-csv", args=[self.job.pk]))
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertIn("connection lost", body)
+        self.assertIn("procedures", body)
