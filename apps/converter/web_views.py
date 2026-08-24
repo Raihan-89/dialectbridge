@@ -1,3 +1,4 @@
+import csv
 import threading
 import logging
 import os
@@ -7,7 +8,7 @@ from datetime import timedelta
 from django.contrib import messages
 from django.db import close_old_connections
 from django.db.models import Q
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 
@@ -287,6 +288,59 @@ def migrate_detail_view(request, pk):
     _reap_stale_migration_jobs()
     job.refresh_from_db()
     return render(request, "converter/migrate_detail.html", {"job": job})
+
+
+@require_GET
+def migrate_report_csv_view(request, pk):
+    """Download the whole migration report as one CSV.
+
+    Every object the run touched, in one flat table, so a report can be handed
+    to someone (or diffed between runs) without copying the page by hand.
+    """
+    job = get_object_or_404(MigrationJob, pk=pk, pending_deletion_token__isnull=True)
+    report = job.report or {}
+
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = (
+        f'attachment; filename="migration-{job.pk}-report.csv"'
+    )
+    writer = csv.writer(response)
+    writer.writerow([
+        "section", "kind", "name", "status", "detail",
+        "rows_copied", "rows_failed", "source_rows", "target_rows", "duration",
+    ])
+
+    for section in ("schema_results", "data_results"):
+        for row in report.get(section, []):
+            writer.writerow([
+                section.replace("_results", ""),
+                row.get("kind", ""), row.get("name", ""), row.get("status", ""),
+                # Newlines inside a failing statement would otherwise make the
+                # cell span rows in some spreadsheet importers.
+                " ".join(str(row.get("detail", "")).split()),
+                row.get("rows_copied", ""), row.get("rows_failed", ""),
+                "", "", row.get("duration_display", ""),
+            ])
+
+    for row in report.get("verification", []):
+        writer.writerow([
+            "verification", "table", row.get("table", ""),
+            "match" if row.get("match") else "mismatch", "", "", "",
+            row.get("source_rows", ""), row.get("target_rows", ""),
+            row.get("duration_display", ""),
+        ])
+
+    for warning in report.get("warnings", []):
+        writer.writerow([
+            "warning", "", "", "", " ".join(str(warning).split()),
+            "", "", "", "", "",
+        ])
+
+    summary = report.get("summary", {})
+    for key in sorted(summary):
+        writer.writerow(["summary", "", key, "", summary[key], "", "", "", "", ""])
+
+    return response
 
 
 @require_POST

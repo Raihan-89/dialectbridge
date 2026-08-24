@@ -3183,3 +3183,51 @@ class ThirdRoundMigrationFailureTests(TestCase):
             [r.status for r in report.schema_results if "made" in r.name.lower()],
             ["success"],
         )
+
+
+class MigrationReportCsvTests(TestCase):
+    """The report must be downloadable as one flat CSV."""
+
+    def setUp(self):
+        src = DatabaseConnection.objects.create(
+            name="s", engine="mssql", host="h", database="d", username="u")
+        tgt = DatabaseConnection.objects.create(
+            name="t", engine="postgres", host="h", database="d", username="u")
+        self.job = MigrationJob.objects.create(
+            source=src, target=tgt, status=MigrationJob.Status.PARTIAL,
+            report={
+                "summary": {"tables": 1, "schema_failed": 1, "schema_skipped": 1},
+                "schema_results": [
+                    {"kind": "procedure", "name": "dbo.Ghost", "status": "skipped",
+                     "detail": "could not be converted:\nuses FOR XML"},
+                    {"kind": "view", "name": "dbo.V", "status": "success", "detail": ""},
+                ],
+                "data_results": [
+                    {"kind": "data", "name": "dbo.T", "status": "completed",
+                     "rows_copied": 5, "rows_failed": 0, "duration_display": "1.0s"},
+                ],
+                "verification": [
+                    {"table": "dbo.T", "source_rows": 5, "target_rows": 5, "match": True},
+                ],
+                "warnings": ["a warning"],
+            },
+        )
+
+    def test_csv_download_contains_every_section(self):
+        response = self.client.get(reverse("migrate-report-csv", args=[self.job.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "text/csv")
+        self.assertIn(f"migration-{self.job.pk}-report.csv", response["Content-Disposition"])
+        body = response.content.decode()
+        self.assertIn("dbo.Ghost", body)
+        self.assertIn("skipped", body)
+        self.assertIn("dbo.T", body)
+        self.assertIn("verification", body)
+        self.assertIn("a warning", body)
+        self.assertIn("schema_skipped", body)
+
+    def test_detail_newlines_do_not_break_rows(self):
+        """A failing statement spans lines; the cell must stay on one row."""
+        response = self.client.get(reverse("migrate-report-csv", args=[self.job.pk]))
+        body = response.content.decode()
+        self.assertIn("could not be converted: uses FOR XML", body)

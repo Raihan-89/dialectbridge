@@ -87,8 +87,13 @@
             <div><span class="label">Rows copied</span> {{ job.report.summary.rows_copied }}</div>
             <div><span class="label">Rows failed</span> {{ job.report.summary.rows_failed }}</div>
             <div><span class="label">Schema failures</span> {{ job.report.summary.schema_failed }}</div>
+            <div><span class="label">Skipped objects</span> {{ job.report.summary.schema_skipped|default:0 }}</div>
             {% if job.report.summary.data_duration %}<div><span class="label">Data copy time</span> {{ job.report.summary.data_duration }}</div>{% endif %}
         </div>
+
+        <p class="actions">
+            <a class="btn" href="{% url 'migrate-report-csv' job.pk %}">Download report as CSV</a>
+        </p>
 
         <h3>Verification (row counts)</h3>
         {% if job.report.verification %}
