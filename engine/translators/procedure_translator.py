@@ -509,9 +509,18 @@ def _procedure_result_cursors(transformed: list[str]) -> tuple[list[str], list[s
     return out, cursor_params
 
 
+# T-SQL marks variables with `@`, so `@Status` and a column named `Status` can
+# never be confused. Dropping the `@` erases that distinction: PostgreSQL's
+# default (#variable_conflict error) then rejects the bare name as ambiguous —
+# not when the routine is created, but every time it is *called*. Routines
+# migrated cleanly and failed in production. Declaring `use_variable` restores
+# the T-SQL reading, because every de-`@`-ed identifier was a variable.
+_VARIABLE_CONFLICT_DIRECTIVE = "#variable_conflict use_variable"
+
+
 def _assemble_plpgsql(header: str, declared: dict[str, str], transformed: list[str], footer: str) -> str:
     """Join header, optional DECLARE block, and a BEGIN...END body."""
-    body_lines = []
+    body_lines = [_VARIABLE_CONFLICT_DIRECTIVE]
     if declared:
         body_lines.append("DECLARE")
         body_lines.append(_join_declares(declared))

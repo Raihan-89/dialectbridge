@@ -185,7 +185,11 @@ def _tsql_trigger_to_plpgsql(trigger: Trigger) -> tuple[str | None, list[str]]:
     pg_events = " OR ".join(e.upper() for e in events) or "INSERT"
     fn_name = f"{name}_fn"
     function = (
+        # Same reason as routines: a de-`@`-ed T-SQL variable that matches a
+        # column name is ambiguous to PostgreSQL, and the trigger only fails
+        # when it fires. See _VARIABLE_CONFLICT_DIRECTIVE in procedure_translator.
         f"CREATE OR REPLACE FUNCTION {fn_name}() RETURNS TRIGGER AS $$\n"
+        f"#variable_conflict use_variable\n"
         f"BEGIN\n" + "\n".join("    " + ln for ln in lines) + "\n"
         f"    RETURN {pg_return};\n"
         f"END;\n$$ LANGUAGE plpgsql;"

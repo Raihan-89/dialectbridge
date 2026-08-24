@@ -3391,3 +3391,38 @@ class ForXmlConcatAndQueryHintTests(TestCase):
         )
         self.assertIn("option_id", converted)
         self.assertIn("option_name", converted)
+
+
+class VariableConflictTests(TestCase):
+    """T-SQL `@var` vs a same-named column must not become ambiguous."""
+
+    def test_routines_declare_use_variable(self):
+        """Without this, the routine creates fine and fails when *called*.
+
+        T-SQL tells `@Status` from column `Status` by the `@`. Stripping it
+        makes the bare name ambiguous, and PostgreSQL's default raises at call
+        time — so the migration reported success and the procedure was broken
+        in production.
+        """
+        converted, _ = translate_routine(
+            "CREATE PROCEDURE dbo.p @intBomasid varchar(10) AS\nBEGIN\n"
+            "  SELECT b.intBomasid FROM t AS b WHERE b.intBomasid like @intBomasid\nEND",
+            "tsql", "postgres",
+        )
+        self.assertIn("#variable_conflict use_variable", converted)
+        # It must sit inside the body, before DECLARE/BEGIN, not before AS $$.
+        directive = converted.index("#variable_conflict use_variable")
+        self.assertLess(converted.index("AS $$"), directive)
+        self.assertLess(directive, converted.index("BEGIN"))
+
+    def test_directive_precedes_the_declare_block(self):
+        converted, _ = translate_routine(
+            "CREATE PROCEDURE dbo.p AS\nBEGIN\n"
+            "  DECLARE @i int\n  SET @i = 1\n  SELECT @i\nEND",
+            "tsql", "postgres",
+        )
+        self.assertIn("DECLARE", converted)
+        self.assertLess(
+            converted.index("#variable_conflict use_variable"),
+            converted.index("DECLARE"),
+        )
