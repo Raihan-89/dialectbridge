@@ -3426,3 +3426,45 @@ class VariableConflictTests(TestCase):
             converted.index("#variable_conflict use_variable"),
             converted.index("DECLARE"),
         )
+
+
+class CopyDurationTests(TestCase):
+    """Per-table copy time must be the table's own, not the whole phase."""
+
+    def _record(self, result, started_ago):
+        from engine.migration.orchestrator import MigrationOrchestrator, MigrationReport
+        from time import monotonic
+
+        report = MigrationReport(source_db="s", target_db="t", started_at="now")
+        MigrationOrchestrator(None, None)._record_copy_result(
+            report, "dbo.T", result, monotonic() - started_ago,
+        )
+        return report.data_results[0]
+
+    def test_worker_measured_duration_wins(self):
+        """The parent hands every table to the pool at once.
+
+        A start time stamped there measures the whole copy phase, so a nine-row
+        table that finished last was reported as taking the entire run — and
+        tables finishing together all showed one identical figure.
+        """
+        row = self._record(
+            {"rows_copied": 9, "rows_failed": 0, "errors": [], "duration_seconds": 0.02},
+            started_ago=79.0,
+        )
+        self.assertEqual(row.duration_seconds, 0.02)
+        self.assertNotAlmostEqual(row.duration_seconds, 79.0, places=0)
+
+    def test_sequential_path_still_measures_from_the_start_time(self):
+        """Without a worker measurement the elapsed time is still derived."""
+        row = self._record(
+            {"rows_copied": 9, "rows_failed": 0, "errors": []}, started_ago=2.0,
+        )
+        self.assertGreaterEqual(row.duration_seconds, 1.9)
+
+    def test_a_negative_or_zero_measurement_is_clamped(self):
+        row = self._record(
+            {"rows_copied": 1, "rows_failed": 0, "errors": [], "duration_seconds": -1.0},
+            started_ago=5.0,
+        )
+        self.assertEqual(row.duration_seconds, 0.0)

@@ -19,6 +19,7 @@ import logging
 import multiprocessing as mp
 import queue as queue_mod
 import threading
+from time import monotonic
 
 logger = logging.getLogger("dialectbridge.migration")
 
@@ -78,7 +79,14 @@ def _copy_one(table):
         if total is not None:
             _on_batch(table.name, 0, 0, total)
         mover = DataMigration(source, target, table, progress_callback=_on_batch)
-        return table.name, mover.run(), None
+        # Timed here, in the worker, because this is the only place that knows
+        # when *this* table's copy actually started. The parent hands every
+        # table to the pool at once, so a start time stamped there measures the
+        # whole phase and makes a nine-row table look like it took a minute.
+        started = monotonic()
+        summary = mover.run()
+        summary["duration_seconds"] = round(max(0.0, monotonic() - started), 2)
+        return table.name, summary, None
     except BaseException as exc:                       # reported, never crashes the pool
         return table.name, None, f"{type(exc).__name__}: {exc}"
 

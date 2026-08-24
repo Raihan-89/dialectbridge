@@ -623,8 +623,16 @@ class MigrationOrchestrator:
 
     def _record_copy_result(self, report: MigrationReport, table_name: str,
                             result: dict, started: float) -> None:
-        """Fold one table's copy summary into the report (shared by both paths)."""
-        elapsed = round(max(0.0, monotonic() - started), 2)
+        """Fold one table's copy summary into the report (shared by both paths).
+
+        A parallel worker measures its own table and reports it in the summary;
+        that figure wins. The parent only knows when the whole phase began, so
+        deriving the duration here would charge every table for the time it
+        spent queued behind the others.
+        """
+        measured = result.get("duration_seconds")
+        elapsed = (round(max(0.0, measured), 2) if measured is not None
+                   else round(max(0.0, monotonic() - started), 2))
         obj = ObjectResult(
             kind="data", name=table_name,
             status="success" if not result["errors"] else "failed",
