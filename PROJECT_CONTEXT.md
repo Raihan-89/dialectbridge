@@ -189,7 +189,22 @@ The report (`MigrationReport`) contains per-object results (kind, name, status, 
 - Identity columns populated explicitly so PK values match source; table identity/sequence re-seeded past the highest value afterward.
 - If a batch insert fails, falls back row-by-row to isolate the broken row(s).
 
-### 7. `engine/migration/parallel_copy.py` — Process-based parallel copy
+### 7. `engine/migration/table_shards.py` — Splitting one big table across workers
+
+Table-level parallelism has a hard floor: the migration can never finish faster than its
+single biggest table. On the reference database one table holds 65% of all rows and ran for
+the *entire* copy phase while the other workers sat idle, so no worker count could beat it.
+`plan_shards()` cuts a table into disjoint half-open primary-key ranges that several workers
+copy at once. A table is only split when the split is provably safe and worth it: a
+**single-column integer primary key** (ranges are arithmetic, never collation-dependent) and a
+catalog row estimate past `SHARD_MIN_ROWS` (1M). Composite keys, UUID/text keys, keyless
+tables and small tables copy whole exactly as before. Row estimates come from
+`approx_row_counts()` (`sys.dm_db_partition_stats` / `pg_class.reltuples`) so planning never
+costs a full scan; if the catalog will not answer, nothing is split. The first slice has no
+lower bound and the last no upper bound, so rows inserted outside the sampled MIN/MAX while
+the migration runs still land in exactly one slice.
+
+### 8. `engine/migration/parallel_copy.py` — Process-based parallel copy
 
 Row building and COPY formatting are CPU-bound Python and hold the GIL, so copying tables on
 *threads* measured **slower** than serial (0.44x on a 3-way test); worker **processes** measured
@@ -201,7 +216,15 @@ and the connectors can be rebuilt — anything unexpected raises `ParallelCopyUn
 back to serial rather than failing a migration. Worker count defaults to `min(4, cpu_count // 2)`
 (`migration_service._default_copy_workers`), overridable with `DIALECTBRIDGE_COPY_WORKERS`.
 
-### 8. Cancellation
+Work items are `(table, shard_id, key_range)`; slices are dispatched before whole tables so
+the pool never ends up waiting on a slice queued last. Slice summaries are merged back into
+one per-table result (`_merge`) — rows summed, elapsed time taken as the **longest** slice
+rather than the sum — so the report still shows one row per table. The once-per-table work
+(dropping indexes before the load, recreating them and reseeding the identity after) is lifted
+out of the workers and done once around the whole set of slices, because slices each dropping
+the shared indexes would race each other.
+
+### 9. Cancellation
 
 `MigrationOrchestrator` takes a `cancel_check` callable and calls `_check_cancelled()` at every
 phase boundary and every table/statement, raising `MigrationCancelledError`. The web layer sets
@@ -277,7 +300,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `venv/bin/python manage.py test` runs **281 tests** (2026-08-25); `manage.py check` reports no issues.
+Current verification: `venv/bin/python manage.py test` runs **298 tests** (2026-08-25); `manage.py check` reports no issues.
 
 ---
 
@@ -286,6 +309,11 @@ Current verification: `venv/bin/python manage.py test` runs **281 tests** (2026-
 - Cross-database references: T-SQL's `Database..Object` shorthand has no PostgreSQL form. `ThisDb..Object` (the database being migrated) is rewritten to `dbo.Object`; a reference to any *other* database aborts the routine with a warning, because PostgreSQL cannot query across databases and emitting the `..` produced `syntax error at or near ".."` at CREATE time. More specific guards (`master..spt_values`, FOR XML, metadata APIs) still report their own reason first.
 - Routines past PostgreSQL's 63-byte identifier limit are created under a `pg_ident()`-shortened name. The migration report and the Verify portal both resolve that alias, so a shortened routine is reported as migrated (not `skipped`) and pairs with its source name instead of showing up as one "source only" plus one "target only" row.
 - Views and routines whose underlying tables no longer exist **in the source** are reported as `skipped`, not failed. SQL Server does not check dependencies, so real databases accumulate them; they can never be created on the target.
+- Copy worker count defaults to `cpu_count - 2` (min 2, max 8), overridable with
+  `DIALECTBRIDGE_COPY_WORKERS`. Lower it when the database servers are the bottleneck (both
+  usually share the box), raise it when they are remote.
+- A table is only split across workers when it has a single-column **integer** primary key and
+  the catalog estimates it past 1M rows. Everything else copies whole, unchanged.
 - `engine/dialects/` and `engine/parsers/` are **empty placeholders**.
 - Text-conversion mode (`service.py`) supports only `ddl`/`dml`; `procedure`/`trigger` statement types are **disabled in the web UI** ("coming soon") and return 501 from the API — even though the migration engine translates those object types.
 - Manual-review types are **flagged with warnings, never silently converted**.

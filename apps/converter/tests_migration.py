@@ -478,12 +478,12 @@ class ParallelCopyTests(SimpleTestCase):
 
     def test_default_worker_count_is_bounded_and_overridable(self):
         from apps.converter.migration_service import _default_copy_workers
-        self.assertGreaterEqual(_default_copy_workers(), 1)
-        self.assertLessEqual(_default_copy_workers(), 4)
+        self.assertGreaterEqual(_default_copy_workers(), 2)
+        self.assertLessEqual(_default_copy_workers(), 8)
         with patch.dict("os.environ", {"DIALECTBRIDGE_COPY_WORKERS": "7"}):
             self.assertEqual(_default_copy_workers(), 7)
         with patch.dict("os.environ", {"DIALECTBRIDGE_COPY_WORKERS": "nonsense"}):
-            self.assertLessEqual(_default_copy_workers(), 4)
+            self.assertLessEqual(_default_copy_workers(), 8)
 
     def test_a_single_worker_keeps_the_original_sequential_path(self):
         source = _FakeConnector({"dbo.a": [(1, "x")]}, dialect="tsql")
@@ -604,3 +604,186 @@ class CopyDurationTests(SimpleTestCase):
         self.assertEqual(format_duration(42.5), "42.5s")
         self.assertEqual(format_duration(82), "1m 22s")
         self.assertEqual(format_duration(3723), "1h 02m 03s")
+
+
+class TableShardPlanningTests(SimpleTestCase):
+    """A migration is no faster than its biggest table unless that table is
+    itself split across workers. Splitting must only happen where it is
+    provably safe: a single integer primary key and enough rows to pay for it.
+    """
+
+    def _table(self, pk_columns=("Id",), pk_type="BIGINT", extra=()):
+        columns = [Column(name, pk_type) for name in pk_columns]
+        columns.extend(extra)
+        return Table(
+            name="dbo.Big", columns=columns,
+            primary_key=Constraint(name="pk", columns=list(pk_columns)),
+        )
+
+    def _plan(self, table, rows, bounds=(1, 20_000_000)):
+        from engine.migration.table_shards import plan_shards
+        source = Mock()
+        source.key_bounds.return_value = bounds
+        return plan_shards(source, [table], {table.name.lower(): rows})
+
+    def test_a_large_single_integer_key_table_is_split(self):
+        plan = self._plan(self._table(), 19_000_000)
+        key, ranges = plan["dbo.Big"]
+        self.assertEqual(key, "Id")
+        self.assertGreater(len(ranges), 1)
+
+    def test_ranges_are_contiguous_and_cover_everything(self):
+        """Gaps would silently drop rows; overlaps would duplicate them."""
+        _key, ranges = self._plan(self._table(), 19_000_000)["dbo.Big"]
+        self.assertIsNone(ranges[0][0])          # no lower bound on the first
+        self.assertIsNone(ranges[-1][1])         # no upper bound on the last
+        for (_lo, high), (low, _hi) in zip(ranges, ranges[1:]):
+            self.assertEqual(high, low)          # each ends exactly where the next begins
+
+    def test_every_key_lands_in_exactly_one_slice(self):
+        """The invariant the whole feature rests on. A gap silently drops rows
+        and an overlap silently duplicates them — neither would fail loudly."""
+        from engine.migration.table_shards import shard_count, split_range
+        cases = {
+            "dense": list(range(1, 20_001)),
+            "sparse": list(range(1, 5_000_000, 227)),
+            "negative": list(range(-40_000, 40_000, 3)),
+            # 90% of the keys bunched at one end, as after a bulk backfill.
+            "skewed": list(range(1, 2_000)) + list(range(900_000, 920_000)),
+        }
+        for label, keys in cases.items():
+            with self.subTest(label):
+                ranges = split_range(min(keys), max(keys), shard_count(19_000_000))
+                for key in keys:
+                    hits = sum(
+                        1 for low, high in ranges
+                        if (low is None or key >= low) and (high is None or key < high)
+                    )
+                    self.assertEqual(hits, 1, f"{label} key {key} matched {hits} slices")
+
+    def test_keys_outside_the_sampled_bounds_are_still_covered(self):
+        """Rows inserted while the migration runs can fall outside the MIN/MAX
+        sampled up front; the open-ended first and last slices must catch them."""
+        from engine.migration.table_shards import split_range
+        ranges = split_range(1, 200_000, 8)
+        for key in (-99, 0, 10 ** 12):
+            hits = sum(
+                1 for low, high in ranges
+                if (low is None or key >= low) and (high is None or key < high)
+            )
+            self.assertEqual(hits, 1, key)
+
+    def test_a_small_table_is_never_split(self):
+        self.assertEqual(self._plan(self._table(), 5_000), {})
+
+    def test_a_composite_key_is_never_split(self):
+        self.assertEqual(self._plan(self._table(("TenantId", "Id")), 19_000_000), {})
+
+    def test_a_non_integer_key_is_never_split(self):
+        """Ranges over a UUID or text key would depend on collation."""
+        self.assertEqual(
+            self._plan(self._table(pk_type="UNIQUEIDENTIFIER"), 19_000_000), {},
+        )
+
+    def test_a_table_with_no_primary_key_is_never_split(self):
+        table = Table(name="dbo.Big", columns=[Column("Payload", "NVARCHAR(50)")])
+        self.assertEqual(self._plan(table, 19_000_000), {})
+
+    def test_unreadable_key_bounds_fall_back_to_a_whole_table_copy(self):
+        from engine.migration.table_shards import plan_shards
+        source = Mock()
+        source.key_bounds.side_effect = RuntimeError("catalog unavailable")
+        self.assertEqual(
+            plan_shards(source, [self._table()], {"dbo.big": 19_000_000}), {},
+        )
+
+    def test_estimates_are_optional(self):
+        from engine.migration.table_shards import estimates_for
+        self.assertEqual(estimates_for(object()), {})
+        broken = Mock()
+        broken.approx_row_counts.side_effect = RuntimeError("no catalog")
+        self.assertEqual(estimates_for(broken), {})
+
+
+class ShardedRangeReadTests(SimpleTestCase):
+    """A slice must read only its own key range."""
+
+    def test_mssql_range_predicate_is_applied_and_bound(self):
+        connector = MSSQLConnector("host", 1433, "db", "user", "password")
+        connector.fetch = Mock(return_value=[])
+        list(connector.iter_table_rows(
+            "dbo.Big", ["Id", "Payload"], ["Id"], batch_size=100,
+            key_range=("Id", 500, 900),
+        ))
+        sql, params = connector.fetch.call_args.args
+        self.assertIn("[Id] >= %s", sql)
+        self.assertIn("[Id] < %s", sql)
+        self.assertEqual(params, (500, 900))
+
+    def test_mssql_range_survives_into_the_keyset_page(self):
+        """The second page still has to stay inside the slice."""
+        connector = MSSQLConnector("host", 1433, "db", "user", "password")
+        connector.fetch = Mock(side_effect=[[(1, "a"), (2, "b")], []])
+        list(connector.iter_table_rows(
+            "dbo.Big", ["Id", "Payload"], ["Id"], batch_size=2,
+            key_range=("Id", 0, 900),
+        ))
+        sql, params = connector.fetch.call_args_list[1].args
+        self.assertIn("[Id] > %s", sql)
+        self.assertIn("[Id] < %s", sql)
+        self.assertEqual(params, (2, 0, 900))
+
+    def test_postgres_range_predicate_is_applied_and_bound(self):
+        connector = PostgresConnector("host", 5432, "db", "user", "password")
+        connector.fetch = Mock(return_value=[])
+        list(connector.iter_table_rows(
+            "dbo.Big", ["Id"], ["Id"], batch_size=100, key_range=("Id", 500, None),
+        ))
+        sql, params = connector.fetch.call_args.args
+        self.assertIn('"Id" >= %s', sql)
+        self.assertNotIn('"Id" <', sql)
+        self.assertEqual(params, (500,))
+
+    def test_an_unsliced_read_is_unchanged(self):
+        """Whole-table reads must keep calling fetch exactly as they always did,
+        so connectors that predate key ranges keep working."""
+        connector = PostgresConnector("host", 5432, "db", "user", "password")
+        connector.fetch = Mock(return_value=[])
+        list(connector.iter_table_rows("dbo.T", ["Id"], ["Id"], batch_size=100))
+        self.assertEqual(len(connector.fetch.call_args.args), 1)
+
+
+class ShardedCopyBookkeepingTests(SimpleTestCase):
+    """Slices are an implementation detail — the report shows one row per table."""
+
+    def test_slice_summaries_merge_into_one_table_result(self):
+        from engine.migration.parallel_copy import _merge
+        merged = _merge([
+            {"rows_copied": 100, "rows_failed": 0, "errors": [], "duration_seconds": 9.0},
+            {"rows_copied": 250, "rows_failed": 1, "errors": ["bad row"], "duration_seconds": 4.0},
+        ])
+        self.assertEqual(merged["rows_copied"], 350)
+        self.assertEqual(merged["rows_failed"], 1)
+        self.assertEqual(merged["errors"], ["bad row"])
+        # Slices run at the same time, so the table took as long as its slowest
+        # slice — not the sum, which would report 13s for a 9s table.
+        self.assertEqual(merged["duration_seconds"], 9.0)
+
+    def test_a_slice_does_not_manage_the_whole_table(self):
+        """Each slice dropping the shared indexes would race the others."""
+        table = Table(name="dbo.Big", columns=[Column("Id", "INT")])
+        whole = DataMigration(Mock(), Mock(), table)
+        slice_ = DataMigration(Mock(), Mock(), table, key_range=("Id", 0, 10),
+                               manage_table=False)
+        self.assertTrue(whole.manage_table)
+        self.assertFalse(slice_.manage_table)
+
+    def test_a_single_worker_never_splits_anything(self):
+        from engine.migration.parallel_copy import _build_work
+        table = Table(
+            name="dbo.Big", columns=[Column("Id", "BIGINT")],
+            primary_key=Constraint(name="pk", columns=["Id"]),
+        )
+        items, plans = _build_work(Mock(), [table], workers=1)
+        self.assertEqual(plans, {})
+        self.assertEqual(items, [(table, 0, None)])

@@ -40,11 +40,16 @@ def test_connection(connection: DatabaseConnection) -> dict:
 
 
 def _default_copy_workers() -> int:
-    """How many tables to copy at once.
+    """How many copy units (whole tables, or slices of a big one) run at once.
 
     Row building and COPY formatting are CPU-bound Python, so worker processes
-    scale nearly linearly while threads do not. Half the cores (capped at 4)
-    leaves headroom for the two database servers, which usually share the box.
+    scale nearly linearly while threads do not. Half the cores capped at 4 was
+    chosen to leave headroom for the two database servers, which usually share
+    the box — but on a 6-core machine that is 3 workers, and a worker spends a
+    good part of its time blocked on the source read rather than burning CPU.
+    Leaving two cores for the servers uses the box better without starving
+    them. ``DIALECTBRIDGE_COPY_WORKERS`` overrides this entirely; lower it if
+    the database servers are the bottleneck, raise it if they are remote.
     """
     override = os.environ.get("DIALECTBRIDGE_COPY_WORKERS")
     if override:
@@ -52,7 +57,7 @@ def _default_copy_workers() -> int:
             return max(1, int(override))
         except ValueError:
             logger.warning("Ignoring invalid DIALECTBRIDGE_COPY_WORKERS=%r", override)
-    return max(1, min(4, (os.cpu_count() or 2) // 2))
+    return max(2, min(8, (os.cpu_count() or 4) - 2))
 
 
 def run_migration(source: DatabaseConnection, target: DatabaseConnection,

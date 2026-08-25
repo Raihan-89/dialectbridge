@@ -78,12 +78,19 @@ def _prefetch(batches):
 
 class DataMigration:
     def __init__(self, source, target, table: Table, batch_size: int | None = None,
-                 progress_callback=None):
+                 progress_callback=None, key_range=None, manage_table: bool = True):
         self.source = source
         self.target = target
         self.table = table
         self.batch_size = batch_size or self._recommended_batch_size()
         self.progress_callback = progress_callback
+        # One slice of a table split across workers: ``(column, low, high)``.
+        self.key_range = key_range
+        # Index drop/recreate and identity reseeding are once-per-table jobs.
+        # When several workers each copy a slice of the same table they must
+        # not each drop the indexes out from under the others, so the caller
+        # does that work once around the whole set and clears this flag.
+        self.manage_table = manage_table
         self.rows_copied = 0
         self.rows_skipped = 0
         self.rows_failed = 0
@@ -112,7 +119,7 @@ class DataMigration:
         if self.progress_callback:
             self.progress_callback(self.table.name, 0, 0, None)
 
-        dropped_indexes = self._drop_indexes()
+        dropped_indexes = self._drop_indexes() if self.manage_table else []
 
         self._enable_identity_insert()
 
@@ -128,8 +135,9 @@ class DataMigration:
         finally:
             self._disable_identity_insert()
 
-        self._seed_identity(cols)
-        self._recreate_indexes(dropped_indexes)
+        if self.manage_table:
+            self._seed_identity(cols)
+            self._recreate_indexes(dropped_indexes)
         return self._summary()
 
     # ------------------------------------------------------------------
@@ -143,6 +151,7 @@ class DataMigration:
             source_batches = self.source.iter_table_rows(
                 self.table.name, cols, order_cols,
                 batch_size=self.batch_size, int_columns=self._int_columns(),
+                **self._range_kwarg(),
             )
             for batch in _prefetch(source_batches):
                 if batch:
@@ -159,6 +168,7 @@ class DataMigration:
         for batch in self.source.iter_table_rows(
             self.table.name, cols, order_cols,
             batch_size=self.batch_size, int_columns=self._int_columns(),
+            **self._range_kwarg(),
         ):
             if not batch:
                 continue
@@ -168,6 +178,15 @@ class DataMigration:
                 self.progress_callback(self.table.name, self.rows_copied, len(batch), None)
 
     # ------------------------------------------------------------------
+    def _range_kwarg(self) -> dict:
+        """Pass ``key_range`` only when a slice was actually asked for.
+
+        A whole-table copy then calls ``iter_table_rows`` with exactly the
+        arguments it always did, so any connector that predates key ranges —
+        including the fakes the pipeline tests run against — keeps working.
+        """
+        return {"key_range": self.key_range} if self.key_range else {}
+
     def _column_names(self) -> list[str]:
         return [c.name for c in self.table.columns if not c.is_computed]
 
@@ -208,6 +227,15 @@ class DataMigration:
             self.errors.append(f"Could not reseed identity on {self.table.name}: {exc}")
 
     # ------------------------------------------------------------------
+    def drop_table_indexes(self) -> list[str]:
+        """Public form of the once-per-table index drop, for a sharded copy."""
+        return self._drop_indexes()
+
+    def finish_table(self, dropped_indexes: list[str]) -> None:
+        """Once-per-table work a sharded copy defers until every slice lands."""
+        self._seed_identity(self._column_names())
+        self._recreate_indexes(dropped_indexes)
+
     def _drop_indexes(self) -> list[str]:
         if not hasattr(self.target, "drop_indexes"):
             return []

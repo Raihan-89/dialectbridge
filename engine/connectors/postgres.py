@@ -131,6 +131,21 @@ class _CopyTextStream(io.TextIOBase):
         return "".join(chunks)
 
 
+def _key_range_predicate(key_range) -> tuple[str, list]:
+    """Render a half-open ``[lo, hi)`` bound on one key column."""
+    if not key_range:
+        return "", []
+    column, low, high = key_range
+    conds, params = [], []
+    if low is not None:
+        conds.append(f'"{column}" >= %s')
+        params.append(low)
+    if high is not None:
+        conds.append(f'"{column}" < %s')
+        params.append(high)
+    return " AND ".join(conds), params
+
+
 class PostgresConnector(DatabaseConnector):
     dialect = "postgres"
 
@@ -196,12 +211,16 @@ class PostgresConnector(DatabaseConnector):
     def _extract_schema(self):
         return extract_schema(self)
 
-    def iter_table_rows(self, table_name, columns, order_columns, batch_size=5000, int_columns=None):
+    def iter_table_rows(self, table_name, columns, order_columns, batch_size=5000,
+                        int_columns=None, key_range=None):
         qident = ", ".join(f'"{c}"' for c in columns)
         order_clause = ""
         if order_columns:
             order_clause = " ORDER BY " + ", ".join(f'"{c}"' for c in order_columns)
         tbl = self.quote_ident(table_name)
+        # See MSSQLConnector.iter_table_rows — one half-open slice of the key so
+        # several workers can read disjoint parts of one large table at once.
+        range_sql, range_params = _key_range_predicate(key_range)
 
         if not order_columns:
             # Keep one cursor open and stream the complete result. OFFSET-based
@@ -210,7 +229,11 @@ class PostgresConnector(DatabaseConnector):
             self._ensure_conn()
             try:
                 with self._conn.cursor() as cur:
-                    cur.execute(f"SELECT {qident} FROM {tbl}")
+                    if range_sql:
+                        cur.execute(f"SELECT {qident} FROM {tbl} WHERE {range_sql}",
+                                    tuple(range_params))
+                    else:
+                        cur.execute(f"SELECT {qident} FROM {tbl}")
                     while True:
                         rows = cur.fetchmany(batch_size)
                         if not rows:
@@ -227,14 +250,23 @@ class PostgresConnector(DatabaseConnector):
                 quoted_keys = ", ".join(f'"{column}"' for column in order_columns)
                 placeholders = ", ".join(["%s"] * len(order_columns))
                 conds = f"({quoted_keys}) > ({placeholders})"
+                params = list(last_key)
+                if range_sql:
+                    conds = f"{conds} AND {range_sql}"
+                    params.extend(range_params)
                 sql = (
                     f"SELECT {qident} FROM {tbl} WHERE {conds} {order_clause} "
                     f"LIMIT {batch_size}"
                 )
-                rows = self.fetch(sql, tuple(last_key))
+                rows = self.fetch(sql, tuple(params))
             else:
-                sql = f"SELECT {qident} FROM {tbl} {order_clause} LIMIT {batch_size}"
-                rows = self.fetch(sql)
+                if range_sql:
+                    sql = (f"SELECT {qident} FROM {tbl} WHERE {range_sql} "
+                           f"{order_clause} LIMIT {batch_size}")
+                    rows = self.fetch(sql, tuple(range_params))
+                else:
+                    sql = f"SELECT {qident} FROM {tbl} {order_clause} LIMIT {batch_size}"
+                    rows = self.fetch(sql)
             if not rows:
                 break
             yield rows
@@ -245,6 +277,24 @@ class PostgresConnector(DatabaseConnector):
     def count_rows(self, table_name: str) -> int:
         row = self.fetchone(f"SELECT COUNT(*) FROM {self.quote_ident(table_name)}")
         return to_int(row[0]) if row else 0
+
+    def approx_row_counts(self) -> dict[str, int]:
+        """Planner row-count estimates for every table — see the MSSQL twin."""
+        rows = self.fetch(
+            "SELECT n.nspname, c.relname, c.reltuples::bigint "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relkind IN ('r', 'p')"
+        )
+        return {f"{schema}.{table}".lower(): max(0, to_int(count or 0))
+                for schema, table, count in rows}
+
+    def key_bounds(self, table_name: str, column: str) -> tuple | None:
+        row = self.fetchone(
+            f'SELECT MIN("{column}"), MAX("{column}") FROM {self.quote_ident(table_name)}'
+        )
+        if not row or row[0] is None or row[1] is None:
+            return None
+        return to_int(row[0]), to_int(row[1])
 
     def set_identity_insert(self, table_name: str, on: bool) -> None:
         # No explicit toggle needed: our converted identity columns are
