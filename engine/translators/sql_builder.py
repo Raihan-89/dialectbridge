@@ -188,12 +188,14 @@ def build_database_ddl(database: Database, target_dialect: str) -> tuple[list[st
         warnings.extend(tw)
 
     for fn in database.functions:
-        stmts, tw = build_function_ddl(fn, target_dialect, database.tables, database.types)
+        stmts, tw = build_function_ddl(fn, target_dialect, database.tables, database.types,
+                                       database_name=database.name)
         statements.extend(stmts)
         warnings.extend(tw)
 
     for proc in database.procedures:
-        stmts, tw = build_procedure_ddl(proc, target_dialect, database.tables, database.types)
+        stmts, tw = build_procedure_ddl(proc, target_dialect, database.tables, database.types,
+                                        database_name=database.name)
         statements.extend(stmts)
         warnings.extend(tw)
 
@@ -648,20 +650,24 @@ def build_view_ddl(view: View, target: str, source: str, tables: list | None = N
 
 
 def build_function_ddl(fn: Routine, target: str, tables: list | None = None,
-                       user_types: list | None = None) -> tuple[list[str], list[str]]:
+                       user_types: list | None = None,
+                       database_name: str | None = None) -> tuple[list[str], list[str]]:
     from engine.translators.procedure_translator import translate_routine
     converted, warnings = translate_routine(fn.definition, source=f"{fn.kind}", target=target,
-                                            tables=tables, user_types=user_types)
+                                            tables=tables, user_types=user_types,
+                                            database_name=database_name)
     if converted:
         return [converted], warnings
     return [], [f"Function '{fn.name}' could not be converted: {warnings}"]
 
 
 def build_procedure_ddl(proc: Routine, target: str, tables: list | None = None,
-                        user_types: list | None = None) -> tuple[list[str], list[str]]:
+                        user_types: list | None = None,
+                        database_name: str | None = None) -> tuple[list[str], list[str]]:
     from engine.translators.procedure_translator import translate_routine
     converted, warnings = translate_routine(proc.definition, source="procedure", target=target,
-                                            tables=tables, user_types=user_types)
+                                            tables=tables, user_types=user_types,
+                                            database_name=database_name)
     if converted:
         return [converted], warnings
     return [], [f"Procedure '{proc.name}' could not be converted: {warnings}"]

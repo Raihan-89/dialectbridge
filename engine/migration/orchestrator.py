@@ -25,7 +25,7 @@ from time import monotonic
 
 from engine.connectors.base import ConnectorError
 from engine.migration.data_mover import DataMigration
-from engine.translators.sql_builder import build_database_ddl
+from engine.translators.sql_builder import build_database_ddl, pg_ident
 
 _PRE_DATA_PREFIXES = ("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX",
                       "ALTER TABLE")
@@ -661,6 +661,34 @@ class MigrationOrchestrator:
     def _bare(name: str) -> str:
         return name.rsplit(".", 1)[-1].strip('"[]').lower()
 
+    @classmethod
+    def _name_aliases(cls, name: str) -> set[str]:
+        """Every name the target may have used for this source object.
+
+        Currently that is the name itself plus the pg_ident() truncation used
+        for identifiers past PostgreSQL's 63-byte limit. pg_ident() is a no-op
+        for shorter names, so this collapses to a single alias for almost every
+        object.
+        """
+        raw = name.rsplit(".", 1)[-1].strip('"[]')
+        return {raw.lower(), pg_ident(raw).lower()}
+
+    @classmethod
+    def _mentions(cls, warning: str, name: str) -> bool:
+        """True when *warning* is about this object rather than a longer name
+        that merely starts with it.
+
+        A plain substring test filed every warning for
+        ``getAttendanceReportNewReportMultipleWages...`` under the shorter
+        ``getAttendanceReport`` as well, so one object's report row carried a
+        dozen other objects' reasons.
+        """
+        lowered = warning.lower()
+        return any(
+            re.search(rf"(?<![\w]){re.escape(alias)}(?![\w])", lowered)
+            for alias in cls._name_aliases(name)
+        )
+
     def _record_unattempted(self, report: MigrationReport, schema) -> None:
         """Record every source object that produced no target DDL at all.
 
@@ -680,9 +708,15 @@ class MigrationOrchestrator:
         for kind, objects in groups:
             for obj in objects:
                 bare = self._bare(obj.name)
-                if bare in attempted:
+                # A routine whose name is past PostgreSQL's 63-byte limit is
+                # created under the pg_ident()-shortened name, so the report
+                # row carries the short name while the source inventory still
+                # holds the long one. Without the alias the object looked
+                # unattempted and was reported "skipped" even though it had
+                # migrated successfully.
+                if attempted.intersection(self._name_aliases(obj.name)):
                     continue
-                reasons = [w for w in report.warnings if bare in w.lower()]
+                reasons = [w for w in report.warnings if self._mentions(w, obj.name)]
                 detail = (
                     " ".join(reasons) if reasons else
                     "No target DDL could be generated for this object, so it was "

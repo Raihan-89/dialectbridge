@@ -11,6 +11,8 @@ from itertools import zip_longest
 from typing import Callable
 from uuid import UUID
 
+from engine.translators.sql_builder import pg_ident
+
 from .migration_service import connector_for
 
 
@@ -157,7 +159,31 @@ def _comparable(value: dict | None) -> dict | None:
     return {k: v for k, v in value.items() if k not in {"name", "table", "detail", "current", "definition"}}
 
 
+def _truncation_aliases(source: dict, target: dict) -> dict:
+    """Map source keys onto the shortened name PostgreSQL actually created.
+
+    An object whose name is past PostgreSQL's 63-byte limit is migrated under
+    the pg_ident() truncation, so a plain key comparison listed the long source
+    name as "source only" and the short target name as "target only" — one
+    migrated routine showing up as two failures.
+    """
+    remap = {}
+    for key, value in source.items():
+        if key in target:
+            continue
+        name = (value or {}).get("name")
+        if not name:
+            continue
+        short = _key(pg_ident(name.rsplit(".", 1)[-1].strip('[]"')))
+        if short != key and short in target and short not in source:
+            remap[key] = short
+    return remap
+
+
 def _pair(source: dict, target: dict) -> list[dict]:
+    remap = _truncation_aliases(source, target)
+    if remap:
+        source = {remap.get(key, key): value for key, value in source.items()}
     rows = []
     for key in sorted(set(source) | set(target)):
         left, right = source.get(key), target.get(key)

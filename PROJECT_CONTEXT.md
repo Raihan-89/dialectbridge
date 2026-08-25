@@ -277,12 +277,15 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `venv/bin/python manage.py test` runs **243 tests** (2026-08-24); `manage.py check` reports no issues.
+Current verification: `venv/bin/python manage.py test` runs **281 tests** (2026-08-25); `manage.py check` reports no issues.
 
 ---
 
 ## Known Limitations / Design Notes
 
+- Cross-database references: T-SQL's `Database..Object` shorthand has no PostgreSQL form. `ThisDb..Object` (the database being migrated) is rewritten to `dbo.Object`; a reference to any *other* database aborts the routine with a warning, because PostgreSQL cannot query across databases and emitting the `..` produced `syntax error at or near ".."` at CREATE time. More specific guards (`master..spt_values`, FOR XML, metadata APIs) still report their own reason first.
+- Routines past PostgreSQL's 63-byte identifier limit are created under a `pg_ident()`-shortened name. The migration report and the Verify portal both resolve that alias, so a shortened routine is reported as migrated (not `skipped`) and pairs with its source name instead of showing up as one "source only" plus one "target only" row.
+- Views and routines whose underlying tables no longer exist **in the source** are reported as `skipped`, not failed. SQL Server does not check dependencies, so real databases accumulate them; they can never be created on the target.
 - `engine/dialects/` and `engine/parsers/` are **empty placeholders**.
 - Text-conversion mode (`service.py`) supports only `ddl`/`dml`; `procedure`/`trigger` statement types are **disabled in the web UI** ("coming soon") and return 501 from the API — even though the migration engine translates those object types.
 - Manual-review types are **flagged with warnings, never silently converted**.

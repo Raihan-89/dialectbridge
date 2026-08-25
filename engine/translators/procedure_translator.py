@@ -134,15 +134,63 @@ _TSQL_METADATA_API_RE = re.compile(
     re.IGNORECASE,
 )
 
+# T-SQL's `Database..Object` shorthand elides the schema and names a database
+# explicitly. PostgreSQL has no `..` syntax at all, so a body carrying one
+# reached the server verbatim and died with `syntax error at or near ".."`.
+# When the database named is the one being migrated the reference really means
+# `dbo.Object` and is rewritten in place; a genuinely different database cannot
+# be reached from PostgreSQL at all, so the routine is reported for a manual
+# rewrite rather than shipped as SQL that can never compile.
+_CROSS_DB_REF_RE = re.compile(
+    r"(?<![\w.\]@])(?:\[(?P<db_b>[^\]]+)\]|(?P<db>[A-Za-z_][\w$]*))"
+    r"\s*\.\s*\.\s*"
+    r"(?:\[(?P<obj_b>[^\]]+)\]|(?P<obj>[A-Za-z_][\w$]*))"
+)
+
+
+def _rewrite_cross_database_refs(sql: str, database_name: str | None) -> tuple[str, list[str]]:
+    """Resolve `Database..Object` references.
+
+    Returns the body with same-database references rewritten to `dbo.Object`,
+    plus the sorted names of any *other* databases referenced. Literals are
+    blanked (length-preserving) before scanning so a `'..'` inside a string is
+    never mistaken for the construct.
+    """
+    scannable = _blank_literals(sql)
+    external: set[str] = set()
+    pieces: list[str] = []
+    last = 0
+    for match in _CROSS_DB_REF_RE.finditer(scannable):
+        db = match.group("db_b") or match.group("db")
+        bracketed = match.group("obj_b")
+        obj = bracketed or match.group("obj")
+        if database_name and db.casefold() == database_name.casefold():
+            pieces.append(sql[last:match.start()])
+            # Keep the brackets when the source used them: `[Lookup Subj]`
+            # dropped bare would split into two tokens downstream.
+            pieces.append(f"dbo.[{obj}]" if bracketed else f"dbo.{obj}")
+            last = match.end()
+        else:
+            external.add(db)
+    pieces.append(sql[last:])
+    return "".join(pieces), sorted(external)
+
 
 def _tsql_to_plpgsql(sql: str, tables: list | None = None,
-                     user_types: list | None = None) -> tuple[str | None, list[str]]:
+                     user_types: list | None = None,
+                     database_name: str | None = None) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
 
     sql = _strip_sql_comments(sql)
 
     if not sql.strip():
         return None, ["Routine definition is empty — object may be encrypted or inaccessible"]
+
+    # Same-database `ThisDb..Object` references are just `dbo.Object`; resolve
+    # them now so the guards below and the parser never see the `..`. Genuinely
+    # external databases are reported after the more specific guards, which
+    # name a better reason for the very shapes that use `master..`.
+    sql, external_databases = _rewrite_cross_database_refs(sql, database_name)
 
     # `master..spt_values` is a SQL Server internal numbers table. Routines
     # built on it are the dynamic-SQL + PIVOT report generators, which have no
@@ -187,6 +235,15 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
             f"uses SQL Server-only metadata function(s) {', '.join(unportable)}, "
             f"which have no PostgreSQL equivalent — this routine scripts SQL "
             f"Server metadata and must be rewritten by hand"
+        ]
+
+    if external_databases:
+        return None, [
+            "references object(s) in another database ("
+            + ", ".join(f"{db}.." for db in external_databases)
+            + ") — PostgreSQL cannot query across databases; migrate that "
+            "database into a schema (or expose it through a foreign data "
+            "wrapper) and rewrite this routine by hand"
         ]
 
     # ---- header -----------------------------------------------------------
@@ -2598,7 +2655,8 @@ _TSQL_KEYWORDS = frozenset(
 
 def translate_routine(sql: str, source: str = "procedure", target: str = "postgres",
                       tables: list | None = None,
-                      user_types: list | None = None) -> tuple[str | None, list[str]]:
+                      user_types: list | None = None,
+                      database_name: str | None = None) -> tuple[str | None, list[str]]:
     """Translate a CREATE FUNCTION/PROCEDURE between dialects.
 
     source is 'procedure' or 'function' (used as a hint when T-SQL header
@@ -2607,7 +2665,7 @@ def translate_routine(sql: str, source: str = "procedure", target: str = "postgr
     replaces the awkward `SETOF record`. Returns (converted_sql, warnings).
     """
     if target == "postgres":
-        return _tsql_to_plpgsql(sql, tables, user_types)
+        return _tsql_to_plpgsql(sql, tables, user_types, database_name)
     return _plpgsql_to_tsql(sql, user_types)
 
 

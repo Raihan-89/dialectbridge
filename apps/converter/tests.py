@@ -4,6 +4,7 @@ from django.utils import timezone
 from rest_framework import status
 from unittest.mock import patch
 from datetime import timedelta
+from types import SimpleNamespace
 import re
 import threading
 
@@ -18,7 +19,9 @@ from engine.service import convert_sql, UnsupportedStatementTypeError
 from engine.translators.ddl_translator import convert_ddl
 from engine.translators.functions import translate_functions
 from engine.translators.procedure_translator import _repair_block_structure, translate_routine
-from engine.translators.sql_builder import build_database_ddl, build_security_ddl, convert_type
+from engine.translators.sql_builder import (
+    build_database_ddl, build_security_ddl, convert_type, pg_ident,
+)
 from engine.translators.trigger_translator import translate_trigger
 from .models import ConversionJob, DatabaseConnection, MigrationError, MigrationJob
 from . import web_views
@@ -3468,3 +3471,128 @@ class CopyDurationTests(TestCase):
             started_ago=5.0,
         )
         self.assertEqual(row.duration_seconds, 0.0)
+
+
+class CrossDatabaseReferenceTests(TestCase):
+    """`Database..Object` is T-SQL-only syntax PostgreSQL cannot parse at all.
+
+    The reported ``sfPBI_SEA_DBrd`` failure shipped ``MC_Lookup..Lookup_Subj``
+    straight through and died on the target with
+    ``syntax error at or near ".."``.
+    """
+
+    def _proc(self, body, **kwargs):
+        return translate_routine(
+            f"CREATE PROCEDURE dbo.P AS BEGIN {body} END",
+            "procedure", "postgres", **kwargs,
+        )
+
+    def test_other_database_is_reported_not_emitted(self):
+        converted, warnings = self._proc(
+            "SELECT a FROM dbo.Base s LEFT JOIN MC_Lookup..Lookup_Subj l ON l.id = s.a;",
+            database_name="PBW_SNSOP_RO",
+        )
+        self.assertIsNone(converted)
+        self.assertTrue(any("MC_Lookup.." in w for w in warnings), warnings)
+        self.assertTrue(any("another database" in w for w in warnings), warnings)
+
+    def test_own_database_reference_is_rewritten_to_dbo(self):
+        """`ThisDb..Tbl` just means `dbo.Tbl`; the routine migrates normally."""
+        converted, warnings = self._proc(
+            "SELECT a FROM PBW_SNSOP_RO..Lookup_Subj;", database_name="PBW_SNSOP_RO",
+        )
+        self.assertIsNotNone(converted)
+        self.assertNotIn("..", converted)
+        self.assertIn("Lookup_Subj", converted)
+        self.assertFalse(any("another database" in w for w in warnings), warnings)
+
+    def test_own_database_match_ignores_case_and_brackets(self):
+        converted, _ = self._proc(
+            "SELECT a FROM [PBW_SNSOP_RO]..[Lookup Subj];", database_name="pbw_snsop_ro",
+        )
+        self.assertIsNotNone(converted)
+        self.assertNotIn("..", converted)
+        self.assertIn('"Lookup Subj"', converted)
+
+    def test_dots_inside_a_string_literal_are_not_a_reference(self):
+        converted, warnings = self._proc("SELECT 'a..b' AS x;", database_name="X")
+        self.assertIsNotNone(converted)
+        self.assertIn("'a..b'", converted)
+        self.assertFalse(any("another database" in w for w in warnings), warnings)
+
+    def test_unknown_source_database_still_never_emits_the_dots(self):
+        """Without a database name the reference cannot be resolved — report it
+        rather than emit SQL that can only fail at CREATE time."""
+        converted, warnings = self._proc("SELECT a FROM Other..T;")
+        self.assertIsNone(converted)
+        self.assertTrue(any("Other.." in w for w in warnings), warnings)
+
+
+class UnattemptedObjectReportingTests(TestCase):
+    """`_record_unattempted` must not report migrated objects as skipped."""
+
+    LONG = "getAttendanceReportNewReportMultipleWagesPayConnectTeamByHouseHoldNumber"
+
+    def _report(self, source_names, applied_names, warnings=()):
+        from engine.migration.orchestrator import (
+            MigrationOrchestrator, MigrationReport, ObjectResult,
+        )
+        report = MigrationReport()
+        report.warnings = list(warnings)
+        report.schema_results = [ObjectResult(kind="procedure", name=n) for n in applied_names]
+        schema = SimpleNamespace(
+            views=[], functions=[], triggers=[], sequences=[], types=[], synonyms=[],
+            procedures=[SimpleNamespace(name=n) for n in source_names],
+        )
+        MigrationOrchestrator._record_unattempted(
+            MigrationOrchestrator.__new__(MigrationOrchestrator), report, schema,
+        )
+        return {r.name: r for r in report.schema_results}
+
+    def test_a_routine_created_under_its_truncated_name_is_not_skipped(self):
+        """It migrated — the report row just carried the shortened name, so the
+        source inventory found no match and filed it as skipped."""
+        short = pg_ident(self.LONG)
+        self.assertNotEqual(short, self.LONG)
+        rows = self._report([f"dbo.{self.LONG}"], [short])
+        self.assertNotIn(f"dbo.{self.LONG}", rows)
+
+    def test_a_genuinely_missing_routine_is_still_skipped(self):
+        rows = self._report(["dbo.NeverBuilt"], ["SomethingElse"])
+        self.assertEqual(rows["dbo.NeverBuilt"].status, "skipped")
+
+    def test_warnings_are_not_stolen_by_longer_object_names(self):
+        """`getAttendanceReport` is a prefix of a dozen other routines; a plain
+        substring test gave it all of their reasons."""
+        rows = self._report(
+            ["dbo.getAttendanceReport"],
+            [],
+            warnings=[
+                "Routine 'getAttendanceReportNewReportMultipleWagesTotal': unrelated",
+                "Procedure 'dbo.getAttendanceReport' could not be converted: [...]",
+            ],
+        )
+        detail = rows["dbo.getAttendanceReport"].detail
+        self.assertIn("could not be converted", detail)
+        self.assertNotIn("unrelated", detail)
+
+
+class VerificationTruncatedNameTests(TestCase):
+    """The verify portal must pair a long source name with its migrated form."""
+
+    LONG = "getAttendanceReportNewReportMultipleWagesPayConnectTeamByHouseHoldNumber"
+
+    def test_truncated_target_routine_pairs_with_its_source(self):
+        from apps.converter.verification_service import _pair
+        short = pg_ident(self.LONG)
+        source = {self.LONG.casefold(): {"name": f"dbo.{self.LONG}", "returns": None}}
+        target = {short.casefold(): {"name": f"dbo.{short.lower()}", "returns": None}}
+        rows = _pair(source, target)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "match")
+        self.assertEqual(rows[0]["source"]["name"], f"dbo.{self.LONG}")
+
+    def test_a_genuinely_missing_routine_still_reads_as_source_only(self):
+        from apps.converter.verification_service import _pair
+        rows = _pair({"gone": {"name": "dbo.gone"}}, {})
+        self.assertEqual(rows[0]["status"], "source_only")
