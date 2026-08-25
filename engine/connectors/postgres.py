@@ -278,15 +278,16 @@ class PostgresConnector(DatabaseConnector):
         row = self.fetchone(f"SELECT COUNT(*) FROM {self.quote_ident(table_name)}")
         return to_int(row[0]) if row else 0
 
-    def approx_row_counts(self) -> dict[str, int]:
-        """Planner row-count estimates for every table — see the MSSQL twin."""
+    def approx_table_stats(self) -> dict[str, tuple]:
+        """``{table: (rows, bytes)}`` planner estimates — see the MSSQL twin."""
         rows = self.fetch(
-            "SELECT n.nspname, c.relname, c.reltuples::bigint "
+            "SELECT n.nspname, c.relname, c.reltuples::bigint, "
+            "pg_total_relation_size(c.oid) "
             "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE c.relkind IN ('r', 'p')"
         )
-        return {f"{schema}.{table}".lower(): max(0, to_int(count or 0))
-                for schema, table, count in rows}
+        return {f"{schema}.{table}".lower(): (max(0, to_int(count or 0)), to_int(size or 0))
+                for schema, table, count, size in rows}
 
     def key_bounds(self, table_name: str, column: str) -> tuple | None:
         row = self.fetchone(

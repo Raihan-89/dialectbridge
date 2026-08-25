@@ -927,12 +927,21 @@ def _build_grant(perm: Permission, target: str) -> str | None:
                 schema = parts[0] if len(parts) == 2 else "public"
                 routine = parts[-1]
                 grant_option = " WITH GRANT OPTION" if perm.with_grant else ""
+                # Match the routine case-insensitively, and under the shortened
+                # name too. PostgreSQL folds an unquoted CREATE PROCEDURE name
+                # to lower case, so `p.proname = 'sp_ValidUser'` matched nothing
+                # and the DO block granted nothing at all — silently, because a
+                # loop over zero rows is not an error. A routine past 63 bytes
+                # is stored under its pg_ident() truncation, which needs the
+                # same treatment.
+                names = {routine.lower(), pg_ident(routine).lower()}
+                name_list = ", ".join(_sql_string(n) for n in sorted(names))
                 return (
                     "DO $$ DECLARE r record; BEGIN FOR r IN "
                     "SELECT p.oid::regprocedure::text AS signature FROM pg_proc p "
                     "JOIN pg_namespace n ON n.oid = p.pronamespace "
-                    f"WHERE n.nspname = {_sql_string(schema)} "
-                    f"AND p.proname = {_sql_string(routine)} LOOP "
+                    f"WHERE lower(n.nspname) = {_sql_string(schema.lower())} "
+                    f"AND lower(p.proname) IN ({name_list}) LOOP "
                     f"EXECUTE format('GRANT EXECUTE ON ROUTINE %s TO %I{grant_option}', "
                     f"r.signature, {_sql_string(perm.principal)}); END LOOP; END $$"
                 )

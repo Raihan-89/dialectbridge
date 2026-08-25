@@ -2301,8 +2301,11 @@ END
         stmts, _ = build_security_ddl(db, "postgres")
         self.assertIn('GRANT SELECT ON "dbo"."Inventory" TO "app_user"', stmts)
         routine_grant = next(s for s in stmts if "pg_proc" in s)
-        self.assertIn("n.nspname = 'dbo'", routine_grant)
-        self.assertIn("p.proname = 'fn_CheckStockAvailability'", routine_grant)
+        # Matched case-insensitively: PostgreSQL folds the unquoted CREATE
+        # PROCEDURE name to lower case, so a case-sensitive proname comparison
+        # matched nothing and the grant silently did nothing at all.
+        self.assertIn("lower(n.nspname) = 'dbo'", routine_grant)
+        self.assertIn("lower(p.proname) IN ('fn_checkstockavailability')", routine_grant)
         self.assertIn("GRANT EXECUTE ON ROUTINE %s TO %I", routine_grant)
 
 
@@ -3596,3 +3599,34 @@ class VerificationTruncatedNameTests(TestCase):
         from apps.converter.verification_service import _pair
         rows = _pair({"gone": {"name": "dbo.gone"}}, {})
         self.assertEqual(rows[0]["status"], "source_only")
+
+
+class RoutineGrantCaseTests(TestCase):
+    """A GRANT EXECUTE that resolves no routine is not an error — it is silence.
+
+    The reported run showed `_sssnpgreenuser: EXECUTE on dbo.sp_ValidUser` as
+    present in the source and missing from the target with nothing in the error
+    report, because the DO block's loop simply ran zero times.
+    """
+
+    def _grant(self, object_name, principal="_sssnpgreenuser"):
+        from engine.translators.sql_builder import _build_grant
+        return _build_grant(
+            Permission(principal=principal, securable="procedure",
+                       object_name=object_name, action="EXECUTE", grant_type="GRANT"),
+            "postgres",
+        )
+
+    def test_mixed_case_routine_is_matched(self):
+        grant = self._grant("dbo.sp_ValidUser")
+        self.assertIn("lower(p.proname) IN ('sp_validuser')", grant)
+
+    def test_over_long_routine_is_matched_under_its_shortened_name(self):
+        long_name = ("InsUpdBeneficiaryWagesFromToDateLatestUSDSSPNew"
+                     "withSupervisoidlatlong")
+        grant = self._grant(f"dbo.{long_name}")
+        self.assertIn(pg_ident(long_name).lower(), grant)
+        self.assertIn(long_name.lower(), grant)
+
+    def test_schema_is_matched_case_insensitively_too(self):
+        self.assertIn("lower(n.nspname) = 'dbo'", self._grant("DBO.sp_ValidUser"))

@@ -620,11 +620,11 @@ class TableShardPlanningTests(SimpleTestCase):
             primary_key=Constraint(name="pk", columns=list(pk_columns)),
         )
 
-    def _plan(self, table, rows, bounds=(1, 20_000_000)):
+    def _plan(self, table, rows, bounds=(1, 20_000_000), size_bytes=0):
         from engine.migration.table_shards import plan_shards
         source = Mock()
         source.key_bounds.return_value = bounds
-        return plan_shards(source, [table], {table.name.lower(): rows})
+        return plan_shards(source, [table], {table.name.lower(): (rows, size_bytes)})
 
     def test_a_large_single_integer_key_table_is_split(self):
         plan = self._plan(self._table(), 19_000_000)
@@ -694,15 +694,32 @@ class TableShardPlanningTests(SimpleTestCase):
         source = Mock()
         source.key_bounds.side_effect = RuntimeError("catalog unavailable")
         self.assertEqual(
-            plan_shards(source, [self._table()], {"dbo.big": 19_000_000}), {},
+            plan_shards(source, [self._table()], {"dbo.big": (19_000_000, 0)}), {},
         )
 
     def test_estimates_are_optional(self):
         from engine.migration.table_shards import estimates_for
         self.assertEqual(estimates_for(object()), {})
         broken = Mock()
-        broken.approx_row_counts.side_effect = RuntimeError("no catalog")
+        broken.approx_table_stats.side_effect = RuntimeError("no catalog")
         self.assertEqual(estimates_for(broken), {})
+
+    def test_a_big_blob_table_is_split_despite_a_small_row_count(self):
+        """The measured run: 2,451 attachment rows took 91s at 27 rows/s while
+        18.9M narrow rows took 42s. Row count alone left every blob table whole
+        and they became the critical path."""
+        plan = self._plan(self._table(), rows=2_451, size_bytes=3 * 1024 ** 3)
+        self.assertIn("dbo.Big", plan)
+        self.assertGreater(len(plan["dbo.Big"][1]), 1)
+
+    def test_a_small_table_is_not_split_by_either_measure(self):
+        self.assertEqual(self._plan(self._table(), rows=5_000, size_bytes=8 * 1024 ** 2), {})
+
+    def test_slice_count_takes_the_larger_of_rows_and_bytes(self):
+        from engine.migration.table_shards import shard_count
+        self.assertEqual(shard_count(0, 0), 2)                       # never zero
+        self.assertGreater(shard_count(2_451, 3 * 1024 ** 3), 2)     # sized by bytes
+        self.assertGreater(shard_count(19_000_000, 0), 2)            # sized by rows
 
 
 class ShardedRangeReadTests(SimpleTestCase):

@@ -33,6 +33,15 @@ ROWS_PER_SHARD = 1_500_000
 # More shards than this stops helping and starts adding round trips.
 MAX_SHARDS = 16
 
+# Rows are a poor proxy for how long a table takes to copy. A measured run had
+# 2,451 attachment rows take 91s (27 rows/s) while 18.9M narrow rows took 42s
+# (443,000 rows/s) — a blob table is slow per *row* because each row carries
+# megabytes. Splitting on row count alone left every one of those tables whole
+# and they became the critical path. So a table is also split once it is simply
+# large on disk, whatever its row count.
+SHARD_MIN_BYTES = 256 * 1024 * 1024
+BYTES_PER_SHARD = 192 * 1024 * 1024
+
 _INT_KEY_TYPES = {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT",
                   "INT2", "INT4", "INT8", "SERIAL", "BIGSERIAL", "SMALLSERIAL"}
 
@@ -50,8 +59,20 @@ def _integer_key(table) -> str | None:
     return name if base in _INT_KEY_TYPES else None
 
 
-def shard_count(rows: int) -> int:
-    return max(2, min(MAX_SHARDS, -(-rows // ROWS_PER_SHARD)))
+def shard_count(rows: int, size_bytes: int = 0) -> int:
+    """How many slices to cut a table into.
+
+    Sized both ways — by rows and by bytes — and the larger wins, so a narrow
+    fact table and a fat blob table each get enough slices to keep the pool
+    busy without either being cut into needless fragments.
+    """
+    by_rows = -(-rows // ROWS_PER_SHARD) if rows else 0
+    by_bytes = -(-size_bytes // BYTES_PER_SHARD) if size_bytes else 0
+    return max(2, min(MAX_SHARDS, max(by_rows, by_bytes)))
+
+
+def worth_splitting(rows: int, size_bytes: int) -> bool:
+    return rows >= SHARD_MIN_ROWS or size_bytes >= SHARD_MIN_BYTES
 
 
 def split_range(low: int, high: int, shards: int) -> list[tuple]:
@@ -74,11 +95,14 @@ def split_range(low: int, high: int, shards: int) -> list[tuple]:
 
 
 def plan_shards(source, tables, estimates: dict) -> dict:
-    """Return ``{table_name: (key_column, [(lo, hi), ...])}`` for big tables."""
+    """Return ``{table_name: (key_column, [(lo, hi), ...])}`` for big tables.
+
+    ``estimates`` maps a lower-cased table name to ``(rows, bytes)``.
+    """
     plans = {}
     for table in tables:
-        rows = estimates.get(table.name.lower(), 0)
-        if rows < SHARD_MIN_ROWS:
+        rows, size_bytes = estimates.get(table.name.lower(), (0, 0))
+        if not worth_splitting(rows, size_bytes):
             continue
         key = _integer_key(table)
         if key is None:
@@ -91,21 +115,21 @@ def plan_shards(source, tables, estimates: dict) -> dict:
             continue
         if not bounds:
             continue
-        ranges = split_range(bounds[0], bounds[1], shard_count(rows))
+        ranges = split_range(bounds[0], bounds[1], shard_count(rows, size_bytes))
         if len(ranges) < 2:
             continue
         plans[table.name] = (key, ranges)
-        logger.info("Table %s (~%d rows) split into %d key ranges on %s",
-                    table.name, rows, len(ranges), key)
+        logger.info("Table %s (~%d rows, ~%d MB) split into %d key ranges on %s",
+                    table.name, rows, size_bytes // (1024 * 1024), len(ranges), key)
     return plans
 
 
 def estimates_for(source) -> dict:
-    """Catalog row estimates, or an empty dict when unavailable."""
-    if not hasattr(source, "approx_row_counts"):
+    """Catalog ``(rows, bytes)`` estimates, or an empty dict when unavailable."""
+    if not hasattr(source, "approx_table_stats"):
         return {}
     try:
-        return source.approx_row_counts()
+        return source.approx_table_stats()
     except Exception as exc:
-        logger.warning("Row-count estimates unavailable (%s) — no table will be split", exc)
+        logger.warning("Table estimates unavailable (%s) — no table will be split", exc)
         return {}

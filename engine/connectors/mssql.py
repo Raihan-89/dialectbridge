@@ -199,22 +199,29 @@ class MSSQLConnector(DatabaseConnector):
         row = self.fetchone(f"SELECT COUNT_BIG(*) FROM {self.quote_ident(table_name)}")
         return to_int(row[0]) if row else 0
 
-    def approx_row_counts(self) -> dict[str, int]:
-        """Row-count estimates for every table, from the catalog.
+    def approx_table_stats(self) -> dict[str, tuple]:
+        """``{table: (rows, bytes)}`` estimates for every table, from the catalog.
 
         Used only to decide which tables are big enough to be worth splitting
         across workers. An exact COUNT of every table would itself cost a full
         scan of the largest ones — the very thing this is meant to speed up.
+        Bytes matter as much as rows: a table of 2,400 attachment blobs copies
+        far slower than a million narrow rows, and row count alone never
+        revealed that.
         """
         rows = self.fetch(
-            "SELECT s.name, t.name, SUM(p.row_count) "
+            "SELECT s.name, t.name, SUM(p.row_count), "
+            "SUM(p.reserved_page_count) * 8192 "
             "FROM sys.dm_db_partition_stats p "
             "JOIN sys.tables t ON t.object_id = p.object_id "
             "JOIN sys.schemas s ON s.schema_id = t.schema_id "
             "WHERE p.index_id IN (0, 1) "
             "GROUP BY s.name, t.name"
         )
-        return {f"{schema}.{table}".lower(): to_int(count or 0) for schema, table, count in rows}
+        return {
+            f"{schema}.{table}".lower(): (to_int(count or 0), to_int(size or 0))
+            for schema, table, count, size in rows
+        }
 
     def key_bounds(self, table_name: str, column: str) -> tuple | None:
         row = self.fetchone(
