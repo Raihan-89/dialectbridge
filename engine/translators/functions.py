@@ -43,9 +43,14 @@ def _find_calls(text: str):
         if m:
             ident = m.group(0)
             j = i + len(ident)
-            # skip whitespace
+            # Skip *any* whitespace between the name and its parenthesis, not
+            # just literal spaces. SQL Server's formatter routinely breaks the
+            # line there, so real view bodies contain `ISNULL\r\n  (x, 0)` —
+            # which the scanner did not recognise as a call, leaving ISNULL
+            # (and every other builtin written that way) untranslated to fail
+            # on PostgreSQL as "function isnull(...) does not exist".
             k = j
-            while k < n and text[k] == " ":
+            while k < n and text[k] in " \t\r\n\f\v":
                 k += 1
             if k < n and text[k] == "(":
                 depth = 0

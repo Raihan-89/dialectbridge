@@ -304,12 +304,13 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `venv/bin/python manage.py test` runs **335 tests** (2026-08-25); `manage.py check` reports no issues.
+Current verification: `venv/bin/python manage.py test` runs **342 tests** (2026-08-25); `manage.py check` reports no issues.
 
 ---
 
 ## Known Limitations / Design Notes
 
+- The builtin-call scanner (`functions._find_calls`) skips **any** whitespace between a function name and its `(`, not just literal spaces. SQL Server's formatter breaks the line there, so real view bodies carry `ISNULL\r\n   (x, 0)`; those were not recognised as calls at all and reached PostgreSQL untranslated as `function isnull(...) does not exist`.
 - A routine variable that shares a name with a migrated column is **renamed with a `v_` prefix** (params and DECLAREd locals alike). T-SQL separates `@Status` from the column `Status` with the sigil; PL/pgSQL has none, so the de-sigiled `WHERE Status = @Status` became `WHERE Status = Status` — and `#variable_conflict use_variable` resolves *both* sides to the variable, making it `x = x`, true for every row. `UPDATE ... SET col = @col` self-assigned the same way. Both compiled and returned wrong answers silently. Translation is a two-pass process because the collision set is only complete once every DECLARE has been seen, but the body must be written with the final names.
 - `master..spt_values` used purely as a **numbers table** is converted to `generate_series(0, 2047)` (the `type = 'P'` filter is dropped with it). Only a routine that also builds its result with **PIVOT or dynamic SQL** is refused — rejecting every mention of `spt_values` over-claimed, and told the user the routine "builds a dynamic PIVOT" whether it did or not.
 - A view/routine whose dependency is missing is now classified: **dropped** (nothing can be done) vs **present but unreadable by the migration login** (`object_exists()` probes the source server). `INFORMATION_SCHEMA` hides objects the caller has no permission on, so a restricted account extracts a partial schema and every view over the hidden tables looks broken.

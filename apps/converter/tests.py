@@ -3901,3 +3901,46 @@ class DeferredObjectSqlTests(TestCase):
         }])
         for line in self._download(job).splitlines():
             self.assertLess(len(line), 120, line)
+
+
+class FunctionCallAcrossNewlinesTests(TestCase):
+    """A builtin call may be written with its parenthesis on the next line.
+
+    SQL Server's formatter does this routinely, so real view bodies contain
+    `ISNULL\r\n   (x, 0)`. The call scanner skipped only literal spaces, so it
+    did not recognise those as calls at all and left them untranslated — to
+    fail on PostgreSQL as `function isnull(...) does not exist`.
+    """
+
+    def _translated(self, expr):
+        return translate_functions(expr, "tsql", "postgres")
+
+    def test_newline_before_the_parenthesis(self):
+        self.assertIn("COALESCE", self._translated("ISNULL\n(x, 0)"))
+
+    def test_windows_line_ending_and_indentation(self):
+        """Exactly the shape found in the migrated view bodies."""
+        self.assertIn("COALESCE", self._translated("ISNULL\r\n                    (x, 0)"))
+
+    def test_tab_before_the_parenthesis(self):
+        self.assertIn("COALESCE", self._translated("ISNULL\t(x, 0)"))
+
+    def test_a_space_separated_call_still_works(self):
+        self.assertIn("COALESCE", self._translated("ISNULL (x, 0)"))
+
+    def test_other_builtins_benefit_too(self):
+        self.assertIn("LENGTH", self._translated("LEN\n(name)"))
+        self.assertNotIn("GETDATE", self._translated("GETDATE\n()"))
+
+    def test_nothing_but_the_call_name_changes(self):
+        """The rebuild collapses the whitespace before '(' — it must not drop
+        any of the surrounding SQL."""
+        source = "SELECT ISNULL\n  ((SELECT Cnt FROM t WHERE a = b), 0) AS Total FROM x"
+        out = self._translated(source)
+        self.assertIn("(SELECT Cnt FROM t WHERE a = b)", out)
+        self.assertIn("AS Total FROM x", out)
+        self.assertNotIn("ISNULL", out)
+
+    def test_a_literal_containing_a_newline_and_paren_is_untouched(self):
+        source = "SELECT 'ISNULL\n(' AS label"
+        self.assertEqual(self._translated(source), source)
