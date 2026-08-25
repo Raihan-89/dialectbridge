@@ -808,7 +808,10 @@ END
             fn, source="function", target="postgres", tables=db.tables
         )
         self.assertIn("'Product name: '  ||  d.ProductName", conv)
-        self.assertIn("FROM dbo.Prices WHERE ProductId = ProductId ORDER BY Date DESC LIMIT 1", conv)
+        # `WHERE ProductId = ProductId` compared the variable against itself,
+        # which #variable_conflict use_variable resolves to true for every row.
+        # The parameter is renamed so the column and the variable stay distinct.
+        self.assertIn("FROM dbo.Prices WHERE ProductId = v_ProductId ORDER BY Date DESC LIMIT 1", conv)
         self.assertNotIn("SELECT TOP", conv)
 
     def test_numeric_addition_keeps_plus(self):
@@ -2776,7 +2779,13 @@ class ReportedMigrationFailureTests(TestCase):
         )]
         statements, warnings = build_database_ddl(database, "postgres")
         procedure = next(s for s in statements if "PROCEDURE" in s)
-        self.assertIn("sp_Updatehelpdesk(int_fbid INTEGER, remarks VARCHAR(250))", procedure)
+        # Both parameters share a name with a column of the table they update.
+        # Left as written, the body read `SET "remarks" = remarks` (a
+        # self-assignment) and `WHERE "int_fbid" = int_fbid` (always true), so
+        # the procedure rewrote every row with its own value.
+        self.assertIn("sp_Updatehelpdesk(v_int_fbid INTEGER, v_remarks VARCHAR(250))", procedure)
+        self.assertIn('"remarks" = v_remarks', procedure)
+        self.assertIn('"int_fbid" = v_int_fbid', procedure)
         self.assertNotIn('"remarks" = "remarks"', procedure)
         self.assertTrue(
             any("share a name with a table column" in w for w in warnings), warnings,
@@ -3740,3 +3749,78 @@ class SptValuesNumbersTableTests(TestCase):
             "SELECT v.number FROM master..spt_values v WHERE v.type = 'P';"
         )
         self.assertFalse(any("another database" in w for w in warnings), warnings)
+
+
+class VariableColumnCollisionTests(TestCase):
+    """A parameter sharing a name with a column silently broke the routine.
+
+    T-SQL keeps `@password` and the column `password` apart with the sigil.
+    PL/pgSQL has none, so `WHERE password = @password` de-sigils to
+    `WHERE password = password` — and `#variable_conflict use_variable`
+    resolves *both* sides to the variable, making it `x = x`, true for every
+    row. The routine compiled and returned wrong answers with no error.
+    """
+
+    USERS = Table(name="dbo.tbl_Users", columns=[
+        Column("user_id", "NVARCHAR(50)"), Column("password", "NVARCHAR(200)"),
+        Column("status", "INT"),
+    ])
+
+    def _convert(self, body, params="@user_id nvarchar(50), @password nvarchar(200)"):
+        return translate_routine(
+            f"CREATE PROCEDURE dbo.p {params}\nAS\nBEGIN\n{body}\nEND",
+            "procedure", "postgres", tables=[self.USERS],
+        )
+
+    def test_a_predicate_no_longer_compares_a_variable_to_itself(self):
+        converted, _ = self._convert(
+            "SELECT * FROM tbl_Users WHERE user_id = @user_id AND password = @password;"
+        )
+        self.assertIn("user_id = v_user_id", converted)
+        self.assertIn("password = v_password", converted)
+        self.assertNotIn("user_id = user_id", converted)
+        self.assertNotIn("password = password", converted)
+
+    def test_an_update_no_longer_assigns_a_column_to_itself(self):
+        converted, _ = self._convert(
+            "UPDATE tbl_Users SET password = @password WHERE user_id = @user_id;"
+        )
+        self.assertIn("v_password", converted)
+        self.assertNotIn('"password" = "password"', converted)
+
+    def test_the_renamed_parameter_appears_in_the_signature(self):
+        converted, _ = self._convert("SELECT 1;")
+        self.assertIn("v_user_id", converted.split("AS $$")[0])
+        self.assertIn("v_password", converted.split("AS $$")[0])
+
+    def test_a_declared_local_that_collides_is_renamed_too(self):
+        converted, _ = self._convert(
+            "DECLARE @status int;\nSET @status = 1;\n"
+            "SELECT * FROM tbl_Users WHERE status = @status;",
+            params="@user_id nvarchar(50)",
+        )
+        self.assertIn("status = v_status", converted)
+        self.assertNotIn("status = status", converted)
+
+    def test_a_non_colliding_parameter_is_left_exactly_alone(self):
+        """Only the colliding names move; everything else keeps its name."""
+        converted, _ = self._convert(
+            "SELECT * FROM tbl_Users WHERE user_id = @lookup;",
+            params="@lookup nvarchar(50)",
+        )
+        self.assertIn("lookup", converted)
+        self.assertNotIn("v_lookup", converted)
+
+    def test_the_collision_is_still_reported(self):
+        _converted, warnings = self._convert("SELECT 1;")
+        self.assertTrue(any("were renamed" in w for w in warnings), warnings)
+
+    def test_a_routine_with_no_schema_context_is_unchanged(self):
+        """Without table metadata there is nothing to collide with."""
+        converted, warnings = translate_routine(
+            "CREATE PROCEDURE dbo.p @password nvarchar(50) AS BEGIN SELECT @password; END",
+            "procedure", "postgres",
+        )
+        self.assertIn("password", converted)
+        self.assertNotIn("v_password", converted)
+        self.assertFalse(warnings, warnings)

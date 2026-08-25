@@ -13,6 +13,8 @@ the builtin-function translator.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import re
 
 from engine.translators.functions import translate_functions
@@ -232,7 +234,20 @@ def _rewrite_cross_database_refs(sql: str, database_name: str | None) -> tuple[s
 
 def _tsql_to_plpgsql(sql: str, tables: list | None = None,
                      user_types: list | None = None,
-                     database_name: str | None = None) -> tuple[str | None, list[str]]:
+                     database_name: str | None = None,
+                     _rename: set[str] | None = None) -> tuple[str | None, list[str]]:
+    # Which variables collide with a column is only known once the body has been
+    # walked and every DECLARE seen, but the body has to be written with the
+    # final names. So the first pass discovers the collisions and the second
+    # re-runs the same pure translation with the renames applied.
+    original_sql = sql
+    with _renaming_vars(_rename if _rename is not None else set()):
+        return _translate_tsql_body(original_sql, sql, tables, user_types,
+                                    database_name, _rename)
+
+
+def _translate_tsql_body(original_sql: str, sql: str, tables, user_types,
+                         database_name, _rename) -> tuple[str | None, list[str]]:
     warnings: list[str] = []
 
     sql = _strip_sql_comments(sql)
@@ -455,6 +470,11 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
         transformed, cursor_params = _procedure_result_cursors(transformed)
         param_list.extend(cursor_params)
 
+    if _rename is None:
+        collisions = _colliding_variables(params, declared, tables)
+        if collisions:
+            return _tsql_to_plpgsql(original_sql, tables, user_types, database_name,
+                                    _rename={c.lower() for c in collisions})
     warnings.extend(_ambiguous_variable_warnings(name, params, declared, tables))
 
     # PostgreSQL truncates any identifier past 63 bytes. Emitting the raw name
@@ -509,6 +529,20 @@ def _ambiguous_variable_warnings(routine: str, params: list[tuple[str, str, bool
     PostgreSQL rejects the reference at run time. The conversion cannot pick a
     side safely, so the collision is reported instead of guessed.
     """
+    clashing = _colliding_variables(params, declared, tables)
+    if not clashing:
+        return []
+    return [
+        f"Routine '{routine}': variable(s) {', '.join(clashing)} share a name with a "
+        f"table column and were renamed with a 'v_' prefix so the column and the "
+        f"variable stay distinct; callers passing arguments by name must use the "
+        f"new names"
+    ]
+
+
+def _colliding_variables(params: list[tuple[str, str, bool]],
+                         declared: dict[str, str], tables: list | None) -> list[str]:
+    """Routine variables that share a name with a column in the migrated schema."""
     if not tables:
         return []
     columns = {
@@ -517,14 +551,7 @@ def _ambiguous_variable_warnings(routine: str, params: list[tuple[str, str, bool
         for column in table.columns
     }
     names = [pname for pname, _type, _out in params] + list(declared)
-    clashing = sorted({n for n in names if n.lower() in columns}, key=str.lower)
-    if not clashing:
-        return []
-    return [
-        f"Routine '{routine}': variable(s) {', '.join(clashing)} share a name with a "
-        f"table column — PostgreSQL cannot tell the variable from the column, so "
-        f"qualify the column (or rename the parameter) before using this routine"
-    ]
+    return sorted({n for n in names if n.lower() in columns}, key=str.lower)
 
 
 def _parse_tsql_table_return(returns: str) -> tuple[str | None, list[tuple[str, str]]]:
@@ -823,9 +850,37 @@ _PLPGSQL_RESERVED_VARS = frozenset(
 )
 
 
+# Variables this routine must rename because they collide with a migrated
+# column name. Set for the duration of one routine translation by
+# _renaming_vars(); empty for the common case where nothing collides.
+_COLLIDING_VARS: set[str] = set()
+
+
+@contextmanager
+def _renaming_vars(names: set[str]):
+    global _COLLIDING_VARS
+    previous = _COLLIDING_VARS
+    _COLLIDING_VARS = names
+    try:
+        yield
+    finally:
+        _COLLIDING_VARS = previous
+
+
 def _safe_var(name: str) -> str:
-    """Rename a variable/parameter whose name PL/pgSQL reserves."""
-    return f"v_{name}" if name.lower() in _PLPGSQL_RESERVED_VARS else name
+    """Rename a variable/parameter PL/pgSQL cannot otherwise resolve.
+
+    Two reasons a name is unusable as written: PL/pgSQL reserves it, or it is
+    also a column name in the migrated schema. T-SQL keeps `@Status` and the
+    column `Status` apart with the sigil; PL/pgSQL has no sigil, so the
+    de-sigiled `WHERE Status = Status` is a variable compared against itself —
+    which `#variable_conflict use_variable` resolves to `true` for every row.
+    A predicate that silently matched everything is far worse than a rename.
+    """
+    lowered = name.lower()
+    if lowered in _PLPGSQL_RESERVED_VARS or lowered in _COLLIDING_VARS:
+        return f"v_{name}"
+    return name
 
 
 def _join_declares(declared: dict[str, str]) -> str:
