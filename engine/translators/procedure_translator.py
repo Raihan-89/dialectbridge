@@ -118,6 +118,60 @@ def _routine_error_context(sql: str, max_len: int = 80) -> str:
 # ---------------------------------------------------------------------------
 
 _SPT_VALUES_RE = re.compile(r"\bspt_values\b", re.IGNORECASE)
+_PIVOT_RE = re.compile(r"\b(?:UN)?PIVOT\s*\(", re.IGNORECASE)
+_DYNAMIC_SQL_RE = re.compile(
+    r"\b(?:sp_executesql|EXEC(?:UTE)?\s*\()", re.IGNORECASE
+)
+# `master..spt_values`, `master.dbo.spt_values` or a bare `spt_values`,
+# optionally aliased. type='P' holds the integers 0..2047, which is the only
+# use of the table that has a portable meaning.
+_SPT_VALUES_SOURCE_RE = re.compile(
+    r"\b(?:master\s*\.\s*(?:dbo)?\s*\.\s*)?\[?spt_values\]?"
+    r"(?:\s+(?:AS\s+)?(?!WHERE\b|ON\b|GROUP\b|ORDER\b|CROSS\b|INNER\b|LEFT\b|"
+    r"RIGHT\b|JOIN\b|UNION\b|HAVING\b)(\[?\w+\]?))?",
+    re.IGNORECASE,
+)
+# The `type = 'P'` filter selects the numbers rows; generate_series replaces
+# the table outright, so the predicate has to go with it — without stranding
+# the AND that joined it to the rest of the WHERE clause.
+_SPT_TYPE_PRED = r"(?:\w+\s*\.\s*)?\[?type\]?\s*=\s*N?'P'"
+_SPT_WHERE_AND_RE = re.compile(rf"\bWHERE\s+{_SPT_TYPE_PRED}\s+AND\s+", re.IGNORECASE)
+_SPT_AND_RE = re.compile(rf"\s+AND\s+{_SPT_TYPE_PRED}", re.IGNORECASE)
+_SPT_WHERE_ONLY_RE = re.compile(
+    rf"\s*\bWHERE\s+{_SPT_TYPE_PRED}"
+    rf"(?=\s*(?:;|\)|$|\bGROUP\b|\bORDER\b|\bHAVING\b|\bEND\b))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _drop_spt_type_predicate(sql: str) -> str:
+    sql = _SPT_WHERE_AND_RE.sub("WHERE ", sql)      # WHERE type='P' AND x  -> WHERE x
+    sql = _SPT_AND_RE.sub("", sql)                   # x AND type='P'        -> x
+    return _SPT_WHERE_ONLY_RE.sub("", sql)           # WHERE type='P'        -> (gone)
+
+
+def _spt_values_to_generate_series(sql: str) -> tuple[str, str | None]:
+    """Rewrite the numbers-table use of spt_values into generate_series().
+
+    ``master..spt_values`` (type 'P') is just the integers 0..2047 in a column
+    named ``number``. PostgreSQL spells that ``generate_series(0, 2047)``, so a
+    routine using it purely as a source of numbers converts cleanly.
+    """
+    blanked = _blank_literals(sql)
+    matches = list(_SPT_VALUES_SOURCE_RE.finditer(blanked))
+    if not matches:
+        return sql, ("references spt_values in a form this converter does not "
+                     "recognise; rewrite it by hand using generate_series()")
+    pieces, last = [], 0
+    for match in matches:
+        alias = match.group(1) or "spt_values"
+        alias = alias.strip("[]")
+        pieces.append(sql[last:match.start()])
+        pieces.append(f"generate_series(0, 2047) AS {alias}(number)")
+        last = match.end()
+    pieces.append(sql[last:])
+    # Drop the now-meaningless `type = 'P'` filter.
+    return _drop_spt_type_predicate("".join(pieces)), None
 
 # SQL Server metadata/scripting functions with no PostgreSQL counterpart. A
 # routine using one of these is a T-SQL admin script, not portable logic.
@@ -186,22 +240,38 @@ def _tsql_to_plpgsql(sql: str, tables: list | None = None,
     if not sql.strip():
         return None, ["Routine definition is empty — object may be encrypted or inaccessible"]
 
+    # `master..spt_values` is a SQL Server internal numbers table. Rejecting
+    # every routine that mentions it over-claimed: plenty use it only to
+    # generate a run of numbers or dates, which is exactly generate_series().
+    # Only a routine that *also* builds its result with PIVOT or dynamic SQL
+    # is genuinely unconvertible, so the two cases are now separated.
+    if _SPT_VALUES_RE.search(scannable_for_spt := _blank_literals(sql)):
+        blockers = []
+        if _PIVOT_RE.search(scannable_for_spt):
+            blockers.append("PIVOT")
+        if _DYNAMIC_SQL_RE.search(scannable_for_spt):
+            blockers.append("dynamic SQL")
+        if blockers:
+            return None, [
+                "references master..spt_values (a SQL Server internal numbers "
+                f"table) and builds its result with {' and '.join(blockers)}, "
+                "which PostgreSQL has no equivalent for; rewrite it by hand "
+                "using generate_series()"
+            ]
+        sql, spt_warning = _spt_values_to_generate_series(sql)
+        if spt_warning:
+            return None, [spt_warning]
+        warnings.append(
+            "master..spt_values was converted to generate_series(0, 2047); "
+            "verify the generated range covers what the routine expects"
+        )
+
     # Same-database `ThisDb..Object` references are just `dbo.Object`; resolve
     # them now so the guards below and the parser never see the `..`. Genuinely
     # external databases are reported after the more specific guards, which
     # name a better reason for the very shapes that use `master..`.
     sql, external_databases = _rewrite_cross_database_refs(sql, database_name)
 
-    # `master..spt_values` is a SQL Server internal numbers table. Routines
-    # built on it are the dynamic-SQL + PIVOT report generators, which have no
-    # PostgreSQL form at all. Emitting a guessed translation would compile but
-    # never run correctly, so the routine is reported for manual rewrite.
-    if _SPT_VALUES_RE.search(sql):
-        return None, [
-            "references master..spt_values (a SQL Server internal numbers "
-            "table) — this routine builds a dynamic PIVOT and has no "
-            "PostgreSQL equivalent; rewrite it by hand using generate_series()"
-        ]
 
     # Routines built on SQL Server's own metadata/scripting API cannot run on
     # PostgreSQL at all. Emitting a guessed translation produced thousands of
@@ -2041,6 +2111,26 @@ def _throw_message(line: str, translate: bool = True) -> str | None:
     return _replace_concat(_expr(message)) if translate else message
 
 
+_INTERVAL_LITERAL_RE = re.compile(r"\bINTERVAL\s+'[^']*'", re.IGNORECASE)
+_INTERVAL_MASK = "\x00INTERVAL{}\x00"
+
+
+def _mask_interval_literals(text: str) -> tuple[str, list[str]]:
+    saved: list[str] = []
+
+    def _stash(match):
+        saved.append(match.group(0))
+        return _INTERVAL_MASK.format(len(saved) - 1)
+
+    return _INTERVAL_LITERAL_RE.sub(_stash, text), saved
+
+
+def _restore_interval_literals(text: str, saved: list[str]) -> str:
+    for index, original in enumerate(saved):
+        text = text.replace(_INTERVAL_MASK.format(index), original)
+    return text
+
+
 def _replace_concat(text: str) -> str:
     """Convert T-SQL '+' string concatenation to PL/pgSQL '||', leaving '+'
     characters inside string literals untouched."""
@@ -2125,9 +2215,17 @@ def _expr(text: str) -> str:
     # T-SQL '+' is overloaded: numeric addition vs string concatenation. Only
     # treat it as concatenation when a string literal is present, so arithmetic
     # like `@i + 1` keeps its plus sign.
-    if "'" in text:
-        text = _replace_concat(text)
-    return text
+    #
+    # The builtin translator has already run, and it renders DATEADD as
+    # `date + n * INTERVAL '1 day'`. That quoted interval is not a string
+    # literal, but it looked like one: every `+` on the line then became `||`,
+    # so DATEADD produced `date || interval`, which PostgreSQL evaluates to
+    # *text*. It compiled, so the wrong type was returned silently. Mask the
+    # interval literals out of the decision and out of the rewrite.
+    masked, intervals = _mask_interval_literals(text)
+    if "'" in masked:
+        masked = _replace_concat(masked)
+    return _restore_interval_literals(masked, intervals)
 
 
 # ---------------------------------------------------------------------------

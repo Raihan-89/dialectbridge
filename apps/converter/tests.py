@@ -2583,16 +2583,22 @@ class RealWorldMigrationRegressionTests(TestCase):
         self.assertIn("LIMIT 10000", out)
         self.assertNotIn("10000SELECT", out)
 
-    def test_spt_values_routine_is_reported_instead_of_mistranslated(self):
-        """master..spt_values drives dynamic-SQL PIVOT reports that have no
-        PostgreSQL form; a guessed translation would compile but never run."""
+    def test_spt_values_as_a_plain_numbers_table_is_converted(self):
+        """This shape has no PIVOT and no dynamic SQL — it is just a run of
+        numbers, which is exactly generate_series(). Refusing it (and telling
+        the user it 'builds a dynamic PIVOT') over-claimed."""
         converted, warnings = translate_routine(
             "CREATE PROCEDURE dbo.p AS BEGIN\n"
             "SELECT Date=DATEADD(day,number,@S) INTO #D FROM master..spt_values WHERE type='p'\n"
             "END", source="procedure", target="postgres")
-        self.assertIsNone(converted)
-        self.assertIn("spt_values", warnings[0])
-        self.assertIn("generate_series", warnings[0])
+        self.assertIsNotNone(converted)
+        self.assertIn("generate_series(0, 2047)", converted)
+        self.assertNotIn("spt_values", converted.replace("AS spt_values(number)", ""))
+        self.assertNotIn("type=", converted)
+        # Date arithmetic, not string concatenation.
+        self.assertIn("INTERVAL '1 day'", converted)
+        self.assertNotIn("||", converted)
+        self.assertTrue(any("generate_series" in w for w in warnings), warnings)
 
 
 class ReportedMigrationFailureTests(TestCase):
@@ -3630,3 +3636,107 @@ class RoutineGrantCaseTests(TestCase):
 
     def test_schema_is_matched_case_insensitively_too(self):
         self.assertIn("lower(n.nspname) = 'dbo'", self._grant("DBO.sp_ValidUser"))
+
+
+class DateArithmeticConcatTests(TestCase):
+    """DATEADD must produce date arithmetic, not string concatenation.
+
+    The builtin translator renders DATEADD as `date + n * INTERVAL '1 day'`.
+    The '+'-means-concatenation heuristic then saw that quoted interval, took it
+    for a string literal and rewrote every '+' on the line to '||' — so the
+    routine returned *text* instead of a date. It compiled, so nothing failed.
+    """
+
+    def _body(self, statement):
+        converted, _ = translate_routine(
+            f"CREATE PROCEDURE dbo.p @start date AS BEGIN {statement} END",
+            "procedure", "postgres",
+        )
+        return converted
+
+    def test_dateadd_keeps_its_plus(self):
+        body = self._body("SELECT DATEADD(day, 5, @start) AS d;")
+        self.assertIn("INTERVAL '1 day'", body)
+        self.assertNotIn("||", body)
+
+    def test_dateadd_inside_a_larger_expression_keeps_its_plus(self):
+        body = self._body("SELECT DATEADD(month, @n + 1, @start) AS d;")
+        self.assertNotIn("||", body)
+
+    def test_genuine_string_concatenation_still_becomes_a_pipe(self):
+        body = self._body("SELECT 'Name: ' + @start AS label;")
+        self.assertIn("||", body)
+
+    def test_plain_arithmetic_still_keeps_its_plus(self):
+        body = self._body("SELECT @n + 1 AS total;")
+        self.assertNotIn("||", body)
+
+
+class SptValuesNumbersTableTests(TestCase):
+    """`master..spt_values` used purely as a numbers table is generate_series().
+
+    Rejecting every routine that merely mentioned it over-claimed: the report
+    told the user each one 'builds a dynamic PIVOT' whether it did or not.
+    """
+
+    def _translate(self, body):
+        return translate_routine(
+            f"CREATE PROCEDURE dbo.p @start date AS BEGIN {body} END",
+            "procedure", "postgres",
+        )
+
+    def test_numbers_table_use_is_converted(self):
+        converted, warnings = self._translate(
+            "SELECT DATEADD(day, v.number, @start) AS d "
+            "FROM master..spt_values v WHERE v.type = 'P' AND v.number < 30;"
+        )
+        self.assertIsNotNone(converted)
+        self.assertIn("generate_series(0, 2047) AS v(number)", converted)
+        self.assertNotIn("spt_values", converted)
+        self.assertTrue(any("generate_series" in w for w in warnings), warnings)
+
+    def test_the_type_filter_is_removed_without_stranding_its_and(self):
+        converted, _ = self._translate(
+            "SELECT v.number FROM master..spt_values v "
+            "WHERE v.type = 'P' AND v.number < 30;"
+        )
+        self.assertIn("WHERE v.number < 30", converted)
+        self.assertNotIn("WHERE  AND", converted)
+        self.assertNotIn(") AND", converted)
+
+    def test_a_trailing_type_filter_is_also_removed(self):
+        converted, _ = self._translate(
+            "SELECT v.number FROM master..spt_values v "
+            "WHERE v.number < 30 AND v.type = 'P';"
+        )
+        self.assertIn("v.number < 30", converted)
+        self.assertNotIn("type", converted.lower().replace("result_cursor", ""))
+
+    def test_a_lone_type_filter_leaves_no_empty_where(self):
+        converted, _ = self._translate(
+            "SELECT v.number FROM master..spt_values v WHERE v.type = 'P';"
+        )
+        self.assertNotIn("WHERE", converted.upper().replace("WHERE V.NUMBER", ""))
+
+    def test_pivot_is_still_refused(self):
+        converted, warnings = self._translate(
+            "SELECT * FROM master..spt_values PIVOT (COUNT(number) FOR type IN ([P])) p;"
+        )
+        self.assertIsNone(converted)
+        self.assertIn("PIVOT", warnings[0])
+
+    def test_dynamic_sql_is_still_refused(self):
+        converted, warnings = self._translate(
+            "DECLARE @s nvarchar(max); SELECT @s = 'x' FROM master..spt_values; "
+            "EXEC sp_executesql @s;"
+        )
+        self.assertIsNone(converted)
+        self.assertIn("dynamic SQL", warnings[0])
+
+    def test_spt_values_is_not_reported_as_a_cross_database_reference(self):
+        """It is spelled `master..spt_values`; the cross-database guard would
+        otherwise claim it before the numbers-table rewrite ever ran."""
+        _converted, warnings = self._translate(
+            "SELECT v.number FROM master..spt_values v WHERE v.type = 'P';"
+        )
+        self.assertFalse(any("another database" in w for w in warnings), warnings)

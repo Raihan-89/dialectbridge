@@ -801,6 +801,87 @@ class ShardedCopyBookkeepingTests(SimpleTestCase):
             name="dbo.Big", columns=[Column("Id", "BIGINT")],
             primary_key=Constraint(name="pk", columns=["Id"]),
         )
-        items, plans = _build_work(Mock(), [table], workers=1)
+        items, plans, _estimates = _build_work(Mock(), [table], workers=1)
         self.assertEqual(plans, {})
         self.assertEqual(items, [(table, 0, None)])
+
+
+class BalancedSliceBoundaryTests(SimpleTestCase):
+    """Equal-width key ranges assume a dense key. Real identity columns are
+    gappy, and on the measured run one of sixteen equal-width slices carried
+    5.7x the average and became the critical path by itself.
+    """
+
+    def test_quantiles_are_preferred_over_equal_width(self):
+        from engine.migration.table_shards import _balanced_ranges
+        source = Mock()
+        source.key_quantiles.return_value = [1, 100, 5000, 900_000]
+        ranges = _balanced_ranges(source, "dbo.Big", "Id", 4)
+        source.key_bounds.assert_not_called()
+        self.assertEqual(ranges, [(None, 100), (100, 5000), (5000, 900_000), (900_000, None)])
+
+    def test_equal_width_is_the_fallback_when_quantiles_fail(self):
+        from engine.migration.table_shards import _balanced_ranges
+        source = Mock()
+        source.key_quantiles.side_effect = RuntimeError("no window functions")
+        source.key_bounds.return_value = (1, 4001)
+        self.assertGreater(len(_balanced_ranges(source, "dbo.Big", "Id", 4)), 1)
+
+    def test_a_gappy_key_still_balances_by_row_count(self):
+        """The real shape: 90% of rows bunched in a narrow band of the key
+        range. Equal-width puts them all in one slice; quantiles do not."""
+        from engine.migration.table_shards import ranges_from_boundaries, split_range
+        keys = sorted(list(range(1, 1000)) + list(range(9_000_000, 9_009_000)))
+
+        def heaviest(ranges):
+            counts = [
+                sum(1 for k in keys
+                    if (lo is None or k >= lo) and (hi is None or k < hi))
+                for lo, hi in ranges
+            ]
+            return max(counts) / (len(keys) / len(ranges))
+
+        even = split_range(keys[0], keys[-1], 8)
+        quantiles = ranges_from_boundaries(
+            [keys[i * len(keys) // 8] for i in range(1, 8)]
+        )
+        self.assertGreater(heaviest(even), 3.0)      # equal-width is badly skewed
+        self.assertLess(heaviest(quantiles), 1.5)    # quantiles are near-even
+
+    def test_duplicate_boundaries_collapse_instead_of_making_empty_slices(self):
+        from engine.migration.table_shards import ranges_from_boundaries
+        self.assertEqual(ranges_from_boundaries([7, 7, 7]), [(None, 7), (7, None)])
+
+    def test_boundaries_still_cover_every_key(self):
+        from engine.migration.table_shards import ranges_from_boundaries
+        ranges = ranges_from_boundaries([10, 20, 30])
+        for key in (-5, 10, 15, 30, 10 ** 9):
+            hits = sum(
+                1 for lo, hi in ranges
+                if (lo is None or key >= lo) and (hi is None or key < hi)
+            )
+            self.assertEqual(hits, 1, key)
+
+
+class SplitTableFinalizeTests(SimpleTestCase):
+    """Index rebuilds for split tables belong in the pool, not the parent."""
+
+    def test_finalize_runs_in_a_worker_and_reports_failure_rather_than_raising(self):
+        from engine.migration import parallel_copy
+        table = Table(name="dbo.Big", columns=[Column("Id", "INT")])
+        broken = Mock()
+        broken.recreate_indexes.side_effect = RuntimeError("index rebuild failed")
+        with patch.dict(parallel_copy._WORKER,
+                        {"source": Mock(), "target": broken}, clear=False):
+            name, error = parallel_copy._finalize_one((table, ["CREATE INDEX ..."]))
+        self.assertEqual(name, "dbo.Big")
+        self.assertIsNone(error)   # data_mover swallows index errors by design
+
+    def test_progress_total_comes_from_the_estimate_not_a_count(self):
+        """An exact COUNT(*) meant a full scan of the biggest tables, serially,
+        before a single row had been copied."""
+        import inspect
+        from engine.migration import parallel_copy
+        body = inspect.getsource(parallel_copy.copy_tables)
+        self.assertNotIn("source.count_rows", body)
+        self.assertIn("estimates.get", body)

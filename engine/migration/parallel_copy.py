@@ -108,6 +108,24 @@ def _copy_one(item):
         return table.name, shard_id, None, f"{type(exc).__name__}: {exc}"
 
 
+def _finalize_one(item):
+    """Recreate a split table's indexes and reseed its identity, in a worker.
+
+    Doing this in the parent serialised the most expensive index builds in the
+    migration behind a single thread while every worker sat idle — 60% of the
+    measured copy phase was parent-side serial work.
+    """
+    from engine.migration.data_mover import DataMigration
+
+    table, dropped_indexes = item
+    try:
+        mover = DataMigration(_WORKER["source"], _WORKER["target"], table)
+        mover.finish_table(dropped_indexes)
+        return table.name, None
+    except BaseException as exc:
+        return table.name, f"{type(exc).__name__}: {exc}"
+
+
 def _merge(summaries: list[dict]) -> dict:
     """Fold one table's slice summaries back into a single table result."""
     merged = {"rows_copied": 0, "rows_failed": 0, "rows_skipped": 0, "errors": [],
@@ -125,16 +143,17 @@ def _merge(summaries: list[dict]) -> dict:
     return merged
 
 
-def _build_work(source, tables, workers: int) -> tuple[list, dict]:
-    """Return the work items to dispatch and the shard plan that produced them."""
+def _build_work(source, tables, workers: int) -> tuple[list, dict, dict]:
+    """Return the work items, the shard plan, and the catalog row estimates."""
     tables = list(tables)
     if workers < 2 or len(tables) == 0:
-        return [(table, 0, None) for table in tables], {}
+        return [(table, 0, None) for table in tables], {}, {}
     try:
-        plans = plan_shards(source, tables, estimates_for(source))
+        estimates = estimates_for(source)
+        plans = plan_shards(source, tables, estimates)
     except Exception as exc:
         logger.warning("Shard planning failed (%s) — every table copied whole", exc)
-        return [(table, 0, None) for table in tables], {}
+        return [(table, 0, None) for table in tables], {}, {}
 
     items = []
     for table in tables:
@@ -148,7 +167,7 @@ def _build_work(source, tables, workers: int) -> tuple[list, dict]:
     # Longest first: a big table's slices should start before the pool fills up
     # with short tables, or the run ends waiting on a slice dispatched last.
     items.sort(key=lambda item: item[2] is None)
-    return items, plans
+    return items, plans, estimates
 
 
 def copy_tables(source, target, tables, workers: int, on_progress, on_table_done):
@@ -160,7 +179,7 @@ def copy_tables(source, target, tables, workers: int, on_progress, on_table_done
     work starts if the pool cannot be created.
     """
     tables = list(tables)
-    items, plans = _build_work(source, tables, workers)
+    items, plans, estimates = _build_work(source, tables, workers)
     by_name = {table.name: table for table in tables}
 
     source_spec = connector_spec(source)
@@ -194,14 +213,17 @@ def copy_tables(source, target, tables, workers: int, on_progress, on_table_done
                 pass
         raise ParallelCopyUnavailable(str(exc)) from exc
 
-    # A slice cannot report the whole table's size, so the parent counts a
-    # split table once up front — otherwise the progress bar for the very
-    # biggest table would be the only one with no total.
+    # A slice cannot report the whole table's size, so the parent supplies the
+    # total for a split table. It uses the catalog estimate already gathered
+    # for planning: an exact COUNT(*) here meant a full scan of the very
+    # largest tables, serially, before a single row had been copied.
     for name in plans:
-        try:
-            on_progress(name, 0, 0, source.count_rows(name))
-        except Exception:
-            pass
+        estimated = estimates.get(name.lower(), (0, 0))[0]
+        if estimated:
+            try:
+                on_progress(name, 0, 0, estimated)
+            except Exception:
+                pass
 
     stop = threading.Event()
     # Slices of one table report their own running totals; the table's progress
@@ -233,6 +255,7 @@ def copy_tables(source, target, tables, workers: int, on_progress, on_table_done
         expected[_table.name] = expected.get(_table.name, 0) + 1
     collected: dict[str, list[dict]] = {}
     failures: dict[str, str] = {}
+    finalizers: list = []
 
     try:
         for name, shard_id, result, error in pool.imap_unordered(_copy_one, items):
@@ -246,11 +269,20 @@ def copy_tables(source, target, tables, workers: int, on_progress, on_table_done
             # Every slice of this table has landed: put its indexes back and
             # reseed its identity before reporting it done.
             if name in plans:
-                try:
-                    DataMigration(source, target, by_name[name]).finish_table(dropped.get(name, []))
-                except Exception as exc:
-                    logger.warning("Could not restore indexes on %s (%s)", name, exc)
+                finalizers.append(
+                    pool.apply_async(_finalize_one, ((by_name[name], dropped.get(name, [])),))
+                )
             on_table_done(name, _merge(collected.get(name, [])), failures.get(name))
+        # Index rebuilds were dispatched as they became ready and have been
+        # running alongside the remaining copies; make sure they all land
+        # before the caller moves on to constraints and verification.
+        for pending in finalizers:
+            try:
+                finalized, error = pending.get()
+                if error:
+                    logger.warning("Could not restore indexes on %s (%s)", finalized, error)
+            except Exception as exc:
+                logger.warning("Index restore failed (%s)", exc)
         pool.close()
         pool.join()
     except BaseException:

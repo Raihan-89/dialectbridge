@@ -75,6 +75,25 @@ def worth_splitting(rows: int, size_bytes: int) -> bool:
     return rows >= SHARD_MIN_ROWS or size_bytes >= SHARD_MIN_BYTES
 
 
+def ranges_from_boundaries(boundaries: list) -> list[tuple]:
+    """Turn interior cut points into half-open ``[lo, hi)`` slices.
+
+    The first slice has no lower bound and the last no upper bound, so together
+    they still cover every key — including rows inserted outside the sampled
+    values while the migration runs.
+    """
+    cuts = sorted({b for b in boundaries if b is not None})
+    if not cuts:
+        return []
+    edges = [None, *cuts, None]
+    slices = []
+    for low, high in zip(edges, edges[1:]):
+        if low is not None and high is not None and low >= high:
+            continue                      # collapsed by duplicate keys
+        slices.append((low, high))
+    return slices if len(slices) > 1 else []
+
+
 def split_range(low: int, high: int, shards: int) -> list[tuple]:
     """Cut ``[low, high]`` into ``shards`` half-open ``[lo, hi)`` slices.
 
@@ -107,21 +126,38 @@ def plan_shards(source, tables, estimates: dict) -> dict:
         key = _integer_key(table)
         if key is None:
             continue
-        try:
-            bounds = source.key_bounds(table.name, key)
-        except Exception as exc:
-            logger.warning("Cannot read key bounds for %s (%s) — copying whole",
-                           table.name, exc)
-            continue
-        if not bounds:
-            continue
-        ranges = split_range(bounds[0], bounds[1], shard_count(rows, size_bytes))
+        parts = shard_count(rows, size_bytes)
+        ranges = _balanced_ranges(source, table.name, key, parts)
         if len(ranges) < 2:
             continue
         plans[table.name] = (key, ranges)
         logger.info("Table %s (~%d rows, ~%d MB) split into %d key ranges on %s",
                     table.name, rows, size_bytes // (1024 * 1024), len(ranges), key)
     return plans
+
+
+def _balanced_ranges(source, table_name: str, key: str, parts: int) -> list[tuple]:
+    """Slice boundaries for one table, best available method first.
+
+    Quantiles balance by row count and are what a gappy key needs; equal-width
+    arithmetic is the fallback for a connector that cannot compute them.
+    """
+    try:
+        boundaries = source.key_quantiles(table_name, key, parts)
+        ranges = ranges_from_boundaries(boundaries[1:])   # drop the minimum
+        if len(ranges) > 1:
+            return ranges
+    except Exception as exc:
+        logger.warning("Quantile boundaries unavailable for %s (%s) — using equal-width",
+                       table_name, exc)
+    try:
+        bounds = source.key_bounds(table_name, key)
+    except Exception as exc:
+        logger.warning("Cannot read key bounds for %s (%s) — copying whole", table_name, exc)
+        return []
+    if not bounds:
+        return []
+    return split_range(bounds[0], bounds[1], parts)
 
 
 def estimates_for(source) -> dict:

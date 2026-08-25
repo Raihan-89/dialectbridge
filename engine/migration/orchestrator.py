@@ -143,6 +143,7 @@ class MigrationOrchestrator:
         self.parallel_workers = max(1, int(parallel_workers or 1))
         self._table_progress: dict = {}
         self._source_objects: set[str] = set()
+        self._visibility_cache: dict[str, bool] = {}
 
     def _check_cancelled(self) -> None:
         if self.cancel_check is not None and self.cancel_check():
@@ -732,14 +733,15 @@ class MigrationOrchestrator:
                 )
                 attempted.add(bare)
 
-    def _missing_source_dependency(self, message: str) -> str | None:
-        """Return the referenced object when the failure is caused by something
-        that does not exist in the *source* database either.
+    def _missing_source_dependency(self, message: str) -> tuple | None:
+        """Classify a failure caused by a relation the target does not have.
 
-        Real databases accumulate views and routines whose underlying tables
-        were dropped long ago; SQL Server keeps them because it does not check
-        dependencies. They can never be created on the target, so they are
-        reported as skipped rather than as migration failures.
+        Returns ``(reference, hidden)``. ``hidden`` is True when the source
+        server can still see the object even though it never reached the
+        extracted schema — which means it was not dropped at all, the migration
+        login simply cannot read it. That distinction matters: a dropped table
+        is the user's dead metadata and nothing can be done, while a hidden one
+        is a permissions problem they can fix and re-run.
         """
         match = _MISSING_RELATION_RE.search(message)
         if not match:
@@ -747,7 +749,20 @@ class MigrationOrchestrator:
         reference = match.group(1)
         if reference.rsplit(".", 1)[-1].lower() in self._source_objects:
             return None
-        return reference
+        return reference, self._visible_in_source(reference)
+
+    def _visible_in_source(self, reference: str) -> bool:
+        """Ask the source server whether it can see this object at all."""
+        if not hasattr(self.source, "object_exists"):
+            return False
+        if reference in self._visibility_cache:
+            return self._visibility_cache[reference]
+        try:
+            visible = bool(self.source.object_exists(reference))
+        except Exception:
+            visible = False
+        self._visibility_cache[reference] = visible
+        return visible
 
     def _apply(self, report: MigrationReport, kind: str, stmt: str, object_name: str | None = None) -> None:
         name = object_name or _name_from_stmt(stmt)
@@ -757,10 +772,18 @@ class MigrationOrchestrator:
         except ConnectorError as exc:
             missing = self._missing_source_dependency(str(exc))
             if missing:
-                detail = (
-                    f"References '{missing}', which does not exist in the source "
-                    f"database — the object was skipped"
-                )
+                reference, hidden = missing
+                if hidden:
+                    detail = (
+                        f"References '{reference}', which exists in the source but was "
+                        f"not extracted — the migration login cannot read it. Grant it "
+                        f"access to that object and re-run; the object was skipped"
+                    )
+                else:
+                    detail = (
+                        f"References '{reference}', which does not exist in the source "
+                        f"database — the object was skipped"
+                    )
                 logger.warning("Schema object skipped kind=%s name=%s reason=%s", kind, name, detail)
                 report.schema_results.append(
                     ObjectResult(kind=kind, name=name, status="skipped", detail=detail)

@@ -289,6 +289,23 @@ class PostgresConnector(DatabaseConnector):
         return {f"{schema}.{table}".lower(): (max(0, to_int(count or 0)), to_int(size or 0))
                 for schema, table, count, size in rows}
 
+    def object_exists(self, name: str) -> bool:
+        """Whether the server can see this relation at all — see the MSSQL twin."""
+        try:
+            row = self.fetchone("SELECT to_regclass(%s)", (name,))
+        except ConnectorError:
+            return False
+        return bool(row and row[0] is not None)
+
+    def key_quantiles(self, table_name: str, column: str, parts: int) -> list:
+        """Row-count-balanced slice boundaries — see the MSSQL twin."""
+        rows = self.fetch(
+            f'SELECT MIN(k) FROM (SELECT k, NTILE({int(parts)}) OVER (ORDER BY k) AS g '
+            f'FROM (SELECT "{column}" AS k FROM {self.quote_ident(table_name)} '
+            f'WHERE "{column}" IS NOT NULL) s) t GROUP BY g ORDER BY g'
+        )
+        return [to_int(r[0]) for r in rows if r and r[0] is not None]
+
     def key_bounds(self, table_name: str, column: str) -> tuple | None:
         row = self.fetchone(
             f'SELECT MIN("{column}"), MAX("{column}") FROM {self.quote_ident(table_name)}'
