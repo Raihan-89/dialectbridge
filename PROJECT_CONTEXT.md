@@ -274,6 +274,8 @@ checkpoint, not instantly.
 | Verify | `/verify/` | Live read-only source/target comparison for overview, tables, columns, views, functions, procedures, triggers, indexes, constraints, sequences, types, synonyms, security and row counts. Definitions are expandable in place. |
 | Data | `/data/` | Live side-by-side table-row browser. Aligns by a shared primary key where available, highlights differing values, paginates at 50 rows, and offers exhaustive whole-table fingerprint verification with downloadable JSON evidence. |
 
+`/migrate/{pk}/deferred.sql` downloads every object that did not reach the target as runnable SQL — the generated PostgreSQL DDL where one was produced, each under a comment saying why it did not land, plus the original source definition (commented out) for objects the translator could not convert at all. PostgreSQL resolves relation names at `CREATE VIEW` and stores the parsed dependency graph rather than the text, so a view over a dropped table cannot be created there however faithfully it is translated; the SQL is handed back rather than lost.
+
 Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tables/`, `/data/{pk}/rows/` and `/data/{pk}/checksum/`.
 
 ### Bridge (`migration_service.py`)
@@ -302,7 +304,7 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `venv/bin/python manage.py test` runs **329 tests** (2026-08-25); `manage.py check` reports no issues.
+Current verification: `venv/bin/python manage.py test` runs **335 tests** (2026-08-25); `manage.py check` reports no issues.
 
 ---
 

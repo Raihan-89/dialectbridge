@@ -32,6 +32,10 @@ _PRE_DATA_PREFIXES = ("CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX",
 _FK_PREFIXES = ("ALTER TABLE",)
 _PRE_TABLE_PREFIXES = ("CREATE DOMAIN", "CREATE TYPE", "CREATE SEQUENCE")
 logger = logging.getLogger("dialectbridge.migration")
+# Per-object cap on the SQL carried in the report. Enough for a real view or
+# routine, bounded so a pathological definition cannot bloat the stored JSON.
+_MAX_KEPT_SQL = 20_000
+
 _MISSING_RELATION_RE = re.compile(
     r'relation "([^"]+)" does not exist', re.IGNORECASE,
 )
@@ -66,6 +70,11 @@ class ObjectResult:
     rows_copied: int = 0
     rows_failed: int = 0
     duration_seconds: float | None = None
+    # The SQL this object would have needed. Kept for anything that did not
+    # land so the user can apply it later instead of losing it: the generated
+    # target DDL where one was produced, otherwise the original source
+    # definition for an object the translator could not convert at all.
+    sql: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +86,7 @@ class ObjectResult:
             "rows_failed": self.rows_failed,
             "duration_seconds": self.duration_seconds,
             "duration_display": format_duration(self.duration_seconds),
+            "sql": self.sql,
         }
 
 
@@ -729,7 +739,11 @@ class MigrationOrchestrator:
                 )
                 report.schema_results.append(
                     ObjectResult(kind=kind, name=obj.name, status="skipped",
-                                 detail=detail[:4000])
+                                 detail=detail[:4000],
+                                 # No target DDL exists for these — the translator
+                                 # produced none — so keep the original source
+                                 # definition to hand-convert from.
+                                 sql=(getattr(obj, "definition", "") or "")[:_MAX_KEPT_SQL])
                 )
                 attempted.add(bare)
 
@@ -786,7 +800,8 @@ class MigrationOrchestrator:
                     )
                 logger.warning("Schema object skipped kind=%s name=%s reason=%s", kind, name, detail)
                 report.schema_results.append(
-                    ObjectResult(kind=kind, name=name, status="skipped", detail=detail)
+                    ObjectResult(kind=kind, name=name, status="skipped", detail=detail,
+                                 sql=stmt[:_MAX_KEPT_SQL])
                 )
                 report.warnings.append(f"{kind.title()} '{name}': {detail}")
                 return
@@ -795,6 +810,7 @@ class MigrationOrchestrator:
                 ObjectResult(
                     kind=kind, name=name, status="failed",
                     detail=f"{exc}; Statement: {stmt}"[:4000],
+                    sql=stmt[:_MAX_KEPT_SQL],
                 )
             )
 

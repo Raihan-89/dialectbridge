@@ -93,6 +93,10 @@
 
         <p class="actions">
             <a class="btn" href="{% url 'migrate-report-csv' job.pk %}">Download report as CSV</a>
+            {% if job.report.summary.schema_skipped or job.report.summary.schema_failed %}
+            <a class="btn" href="{% url 'migrate-deferred-sql' job.pk %}"
+               title="SQL for every object that did not reach the target, ready to run once its dependencies exist">Download objects not created (.sql)</a>
+            {% endif %}
         </p>
 
         <h3>Verification (row counts)</h3>

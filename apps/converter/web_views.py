@@ -291,6 +291,81 @@ def migrate_detail_view(request, pk):
 
 
 @require_GET
+def migrate_deferred_sql_view(request, pk):
+    """Download every object that did not reach the target, as runnable SQL.
+
+    PostgreSQL resolves names when a view is created and stores the parsed
+    dependency graph, not the text, so a view over a table that no longer
+    exists cannot be created there however faithfully it is translated. That is
+    a reason to hand the SQL back, not to lose it: this script carries the
+    exact DDL for everything that was skipped or failed, each statement under a
+    comment saying why, ready to run once its dependencies are in place.
+    Objects the translator could not convert at all carry their original source
+    definition instead, commented out, to hand-convert from.
+    """
+    job = get_object_or_404(MigrationJob, pk=pk, pending_deletion_token__isnull=True)
+    report = job.report or {}
+
+    pending = [
+        row for row in report.get("schema_results", [])
+        if row.get("status") in ("skipped", "failed") and row.get("sql")
+    ]
+
+    lines = [
+        f"-- DialectBridge — objects not created by migration #{job.pk}",
+        f"-- {len(pending)} object(s). Each is preceded by the reason it did not land.",
+        "-- Statements that are commented out could not be translated; they are the",
+        "-- original source definition, kept so nothing is lost.",
+        "",
+    ]
+    for row in pending:
+        sql = (row.get("sql") or "").strip()
+        lines.append(f"-- {'-' * 70}")
+        lines.append(f"-- {row.get('kind', 'object')}: {row.get('name', '')}  [{row.get('status')}]")
+        for detail_line in _wrap_comment(row.get("detail", "")):
+            lines.append(f"-- {detail_line}")
+        lines.append("")
+        # A converted statement is runnable as-is. A source definition is not:
+        # it is still T-SQL, so it goes in commented out rather than handing the
+        # user a script that fails the moment they run it.
+        if _looks_translated(sql):
+            lines.append(sql if sql.rstrip().endswith(";") else sql + ";")
+        else:
+            lines.extend("-- " + line for line in sql.splitlines())
+        lines.append("")
+
+    response = HttpResponse("\n".join(lines), content_type="text/plain; charset=utf-8")
+    response["Content-Disposition"] = (
+        f'attachment; filename="migration-{job.pk}-deferred.sql"'
+    )
+    return response
+
+
+def _wrap_comment(text: str, width: int = 100) -> list:
+    """Break a reason across comment lines without splitting words."""
+    words = str(text or "").split()
+    if not words:
+        return []
+    lines, current = [], words[0]
+    for word in words[1:]:
+        if len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current += " " + word
+    lines.append(current)
+    return lines
+
+
+def _looks_translated(sql: str) -> bool:
+    """Whether this is generated PostgreSQL DDL rather than the T-SQL original."""
+    head = sql.lstrip()[:200].upper()
+    return head.startswith(("CREATE OR REPLACE", "CREATE MATERIALIZED", "CREATE EVENT",
+                            "CREATE SEQUENCE", "CREATE DOMAIN", "CREATE TYPE",
+                            "CREATE INDEX", "CREATE UNIQUE", "ALTER TABLE", "GRANT", "DO $$"))
+
+
+@require_GET
 def migrate_report_csv_view(request, pk):
     """Download the whole migration report as one CSV.
 

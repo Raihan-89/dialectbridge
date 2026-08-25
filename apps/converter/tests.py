@@ -3824,3 +3824,80 @@ class VariableColumnCollisionTests(TestCase):
         self.assertIn("password", converted)
         self.assertNotIn("v_password", converted)
         self.assertFalse(warnings, warnings)
+
+
+class DeferredObjectSqlTests(TestCase):
+    """Nothing that fails to reach the target may be lost.
+
+    PostgreSQL resolves relation names when a view is created, so a view over a
+    dropped table cannot be created there however faithfully it is translated.
+    The SQL is still worth handing back, ready to run once the dependency is in
+    place.
+    """
+
+    def _job(self, schema_results):
+        return MigrationJob.objects.create(
+            source=DatabaseConnection.objects.create(
+                name="s", engine="mssql", role="source", host="h", database="d"),
+            target=DatabaseConnection.objects.create(
+                name="t", engine="postgres", role="target", host="h", database="d"),
+            status="completed",
+            report={"schema_results": schema_results,
+                    "summary": {"schema_skipped": len(schema_results)}},
+        )
+
+    def _download(self, job):
+        response = self.client.get(reverse("migrate-deferred-sql", args=[job.pk]))
+        self.assertEqual(response.status_code, 200)
+        return response.content.decode()
+
+    def test_a_skipped_view_keeps_its_generated_ddl(self):
+        job = self._job([{
+            "kind": "view", "name": "dbo.Vw_WageInvoice", "status": "skipped",
+            "detail": "References 'dbo.tbl_beneficiarydet', which does not exist",
+            "sql": 'CREATE OR REPLACE VIEW "dbo"."Vw_WageInvoice" AS SELECT 1',
+        }])
+        body = self._download(job)
+        self.assertIn('CREATE OR REPLACE VIEW "dbo"."Vw_WageInvoice" AS SELECT 1;', body)
+        self.assertIn("dbo.tbl_beneficiarydet", body)
+
+    def test_an_unconvertible_routine_is_included_but_commented_out(self):
+        """Its source is still T-SQL — handing it back runnable would give the
+        user a script that fails on the first statement."""
+        job = self._job([{
+            "kind": "procedure", "name": "dbo.getAttendanceRpt", "status": "skipped",
+            "detail": "builds its result with dynamic SQL",
+            "sql": "CREATE PROCEDURE dbo.getAttendanceRpt AS\nBEGIN\n  SELECT 1\nEND",
+        }])
+        body = self._download(job)
+        self.assertIn("-- CREATE PROCEDURE dbo.getAttendanceRpt AS", body)
+        self.assertIn("--   SELECT 1", body)
+
+    def test_successful_objects_are_not_included(self):
+        job = self._job([
+            {"kind": "view", "name": "ok", "status": "success", "sql": "CREATE OR REPLACE VIEW ok AS SELECT 1"},
+            {"kind": "view", "name": "bad", "status": "skipped", "detail": "x",
+             "sql": "CREATE OR REPLACE VIEW bad AS SELECT 1"},
+        ])
+        body = self._download(job)
+        self.assertIn("bad", body)
+        self.assertNotIn("VIEW ok", body)
+
+    def test_the_download_is_a_named_sql_attachment(self):
+        job = self._job([{"kind": "view", "name": "v", "status": "skipped",
+                          "detail": "x", "sql": "CREATE OR REPLACE VIEW v AS SELECT 1"}])
+        response = self.client.get(reverse("migrate-deferred-sql", args=[job.pk]))
+        self.assertIn("text/plain", response["Content-Type"])
+        self.assertIn(f"migration-{job.pk}-deferred.sql", response["Content-Disposition"])
+
+    def test_a_clean_run_produces_an_empty_but_valid_script(self):
+        body = self._download(self._job([]))
+        self.assertIn("0 object(s)", body)
+
+    def test_a_long_reason_is_wrapped_across_comment_lines(self):
+        job = self._job([{
+            "kind": "view", "name": "v", "status": "skipped",
+            "detail": "word " * 60, "sql": "CREATE OR REPLACE VIEW v AS SELECT 1",
+        }])
+        for line in self._download(job).splitlines():
+            self.assertLess(len(line), 120, line)
