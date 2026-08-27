@@ -514,6 +514,144 @@ class ParallelCopyTests(SimpleTestCase):
         self.assertIn("boom", failed[0].detail)
 
 
+class LiveCopyProgressTests(SimpleTestCase):
+    """The portal showed the *previously* copied table and then froze.
+
+    The parallel copy path updated its in-memory table map on every batch but
+    never emitted, so the job's persisted progress only moved when a table
+    finished — and that emit named the table which had just ended rather than
+    the ones still running. Tables copying right now were filtered out of the
+    payload entirely, so several could migrate without ever being displayed.
+    """
+
+    def _run(self, script, tables=("dbo.a", "dbo.b")):
+        """Run a migration whose parallel copy is driven by ``script``."""
+        source = _FakeConnector({name: [(1, "x")] for name in tables}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        emitted = []
+
+        def callback(pct, stage, data=None):
+            if data and "table_progress" in data:
+                emitted.append(data)
+
+        orchestrator = MigrationOrchestrator(
+            source, target, copy_data=True, parallel_workers=2,
+            progress_callback=callback,
+        )
+        with patch("engine.migration.parallel_copy.copy_tables", script), \
+                patch("engine.migration.orchestrator._PROGRESS_MIN_INTERVAL", 0):
+            orchestrator.run()
+        return emitted
+
+    @staticmethod
+    def _ok(rows):
+        return {"rows_copied": rows, "rows_failed": 0, "errors": []}
+
+    def _running(self, emitted, table):
+        return [d for d in emitted
+                if d.get("current_table") == table
+                and not d["table_progress"][table].get("done")]
+
+    def test_progress_is_emitted_while_a_table_is_still_copying(self):
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            for rows_so_far in (2, 3, 4):
+                on_progress("dbo.a", rows_so_far, 1, 10)
+            on_done("dbo.a", self._ok(4), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        emitted = self._run(script)
+        mid = self._running(emitted, "dbo.a")
+        self.assertEqual([d["current_table_rows"] for d in mid], [2, 3, 4])
+        self.assertEqual([d["table_progress"]["dbo.a"]["rows_copied"] for d in mid],
+                         [2, 3, 4])
+
+    def test_a_finished_table_is_not_reported_as_the_one_in_progress(self):
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            on_progress("dbo.a", 1, 1, 10)
+            on_progress("dbo.b", 1, 1, 10)
+            on_done("dbo.a", self._ok(1), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        emitted = self._run(script)
+        after_first = [d for d in emitted if d["stage"] == "Copied 1/2 tables"]
+        self.assertTrue(after_first, "no emit when the first table finished")
+        self.assertEqual(after_first[-1]["current_table"], "dbo.b")
+        self.assertEqual(after_first[-1]["active_tables"], ["dbo.b"])
+
+    def test_queued_tables_are_not_listed_as_running(self):
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            on_progress("dbo.a", 1, 1, 10)      # only dbo.a has been picked up
+            on_done("dbo.a", self._ok(1), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        first = self._run(script)[0]
+        self.assertEqual(first["active_tables"], ["dbo.a"])
+        self.assertTrue(first["table_progress"]["dbo.b"]["pending"])
+
+    def test_a_queued_table_is_not_charged_for_the_time_it_waited(self):
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            on_progress("dbo.a", 1, 1, 10)
+            on_done("dbo.a", self._ok(1), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        queued = self._run(script)[0]["table_progress"]["dbo.b"]
+        self.assertNotIn("elapsed_seconds", queued)
+
+    def test_the_bar_advances_while_one_long_table_copies(self):
+        """Counting whole tables froze the bar for the table holding most rows."""
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            on_progress("dbo.a", 250, 250, 1000)
+            on_progress("dbo.a", 750, 500, 1000)
+            on_done("dbo.a", self._ok(1000), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        mid = self._running(self._run(script), "dbo.a")
+        self.assertEqual(len(mid), 2)
+        self.assertLess(mid[0]["percent"], mid[1]["percent"])
+
+    def test_emits_are_throttled_so_every_batch_is_not_a_database_write(self):
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            for rows_so_far in range(1, 51):
+                on_progress("dbo.a", rows_so_far, 1, 100)
+            on_done("dbo.a", self._ok(50), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        source = _FakeConnector({"dbo.a": [(1, "x")], "dbo.b": [(2, "y")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        emitted = []
+        orchestrator = MigrationOrchestrator(
+            source, target, copy_data=True, parallel_workers=2,
+            progress_callback=lambda pct, stage, data=None: emitted.append(stage),
+        )
+        with patch("engine.migration.parallel_copy.copy_tables", script):
+            orchestrator.run()
+
+        copying = [s for s in emitted if s.startswith("Copying data: dbo.a")]
+        self.assertLess(len(copying), 50, "every batch was persisted")
+
+    def test_the_payload_never_shares_the_live_table_map(self):
+        """json.dumps ran on the live dict while the pump thread mutated it."""
+        def script(src, tgt, tables, workers, on_progress, on_done):
+            on_progress("dbo.a", 1, 1, 10)
+            on_done("dbo.a", self._ok(1), None)
+            on_done("dbo.b", self._ok(1), None)
+
+        source = _FakeConnector({"dbo.a": [(1, "x")], "dbo.b": [(2, "y")]}, dialect="tsql")
+        target = _FakeConnector({}, dialect="postgres")
+        seen = []
+        orchestrator = MigrationOrchestrator(
+            source, target, copy_data=True, parallel_workers=2,
+            progress_callback=lambda pct, stage, data=None: seen.append(data),
+        )
+        with patch("engine.migration.parallel_copy.copy_tables", script):
+            orchestrator.run()
+
+        payloads = [d["table_progress"] for d in seen if d and "table_progress" in d]
+        self.assertTrue(payloads)
+        for payload in payloads:
+            self.assertIsNot(payload, orchestrator._table_progress)
+
+
 class TableDurationReportingTests(SimpleTestCase):
     """The UI showed the running table as `29685080m 17s`: it subtracted a
     monotonic() reading from the browser's epoch clock. The elapsed time is now

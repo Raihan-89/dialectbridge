@@ -226,6 +226,17 @@ rather than the sum — so the report still shows one row per table. The once-pe
 out of the workers and done once around the whole set of slices, because slices each dropping
 the shared indexes would race each other.
 
+Per-batch progress is persisted as it arrives, not only when a table finishes. The pump thread
+folds each batch into the shared table map and emits it, throttled to `_PROGRESS_MIN_INTERVAL`
+(0.4s) so several workers reporting every batch cannot turn into a database write many times a
+second — the portal polls at 800ms, so anything finer is invisible anyway. The emitted payload is
+a snapshot rather than the live dict, because the pump thread mutates the map while the emitting
+side serializes it. A table is registered as `pending` when the pool is built and only becomes
+*running* once a worker reports its first batch, so a queued table is neither listed as in flight
+nor charged for the time it waited. The overall percentage counts a running table's partial rows
+(`_copy_fraction`) instead of whole tables only, which used to freeze the bar for the entire copy
+of the one table holding most of the rows.
+
 ### 9. Cancellation
 
 `MigrationOrchestrator` takes a `cancel_check` callable and calls `_check_cancelled()` at every
@@ -269,7 +280,7 @@ checkpoint, not instantly.
 | Connections | `/connections/` | Create/test/delete saved connections. |
 | Migrate | `/migrate/` | Pick source + target connections, start a background web migration, and browse complete history by serial number. Prevents a second web migration while one is running. |
 | Migration report | `/migrate/{pk}/` | Persisted summary, live progress while running, row-count verification, schema/data results, warnings and captured errors. |
-| Migration status | `/migrate/{pk}/status/` | Lightweight JSON polled by the report page (`status`, stage, percentage, finished flag). |
+| Migration status | `/migrate/{pk}/status/` | Lightweight JSON polled by the report page (`status`, stage, percentage, finished flag, plus `table_progress` / `active_tables` for every table finished or currently copying). |
 | Errors | `/errors/` | Per-object migration failures across all jobs, filterable by kind/job/keyword, with counts per object kind. |
 | Verify | `/verify/` | Live read-only source/target comparison for overview, tables, columns, views, functions, procedures, triggers, indexes, constraints, sequences, types, synonyms, security and row counts. Definitions are expandable in place. |
 | Data | `/data/` | Live side-by-side table-row browser. Aligns by a shared primary key where available, highlights differing values, paginates at 50 rows, and offers exhaustive whole-table fingerprint verification with downloadable JSON evidence. |
@@ -302,9 +313,10 @@ Supporting read-only JSON routes are `/verify/{pk}/{section}/`, `/data/{pk}/tabl
   - Second reported batch (`SecondRoundMigrationFailureTests`): `END;`/`BEGIN TRY;` written with a semicolon still close/open their block; a misplaced `ELSE` gets its missing `END;` from the block-repair pass; a `(` inside a string literal no longer desynchronises the call scanner (which silently deleted SQL); `CHAR(n)` becomes `chr(n)` in value position but stays a type after `AS`/in DDL; `STUFF((SELECT sep + col ... FOR XML PATH('')), 1, n, '')` becomes `string_agg`; other `FOR XML` shapes and SQL Server metadata scripting (`QUOTENAME`/`PARSENAME`/...) are reported for manual rewrite instead of guessed.
   - View dependencies (`ViewDependencyTests`): a view selecting from another view is schema-qualified and quoted, and is created after the view it depends on (cycles still emit every view).
 - `apps/converter/tests_migration.py` — end-to-end migration pipeline smoke tests using an in-memory fake connector (no live DB): full pipeline + row verification, batched inserts, `reset_target` schema drops, complete keyless streaming, composite-key pagination, non-leading key columns and SQL Server `DATETIME2` binding.
+  - Live copy progress (`LiveCopyProgressTests`): the parallel path emits while a table is still copying (row counts climbing mid-table), a finished table hands "in progress" over to one still running, queued tables are neither listed as running nor charged for their wait, the percentage advances during one long table, emits are throttled rather than one per batch, and the payload is a snapshot rather than the live table map.
 - `apps/converter/tests_verification.py` — live-comparison service tests: schema/name pairing, table discovery, primary-key row alignment, changed-value detection and order-independent exhaustive fingerprints.
 
-Current verification: `venv/bin/python manage.py test` runs **342 tests** (2026-08-25); `manage.py check` reports no issues.
+Current verification: `venv/bin/python manage.py test` runs **350 tests** (2026-08-27); `manage.py check` reports no issues.
 
 ---
 

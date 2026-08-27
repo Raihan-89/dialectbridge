@@ -1187,6 +1187,41 @@ class MigrationProgressViewTests(TestCase):
         self.assertEqual(response.json()["progress_stage"], "Copying table data")
         self.assertFalse(response.json()["finished"])
 
+    def test_status_endpoint_reports_every_table_being_copied(self):
+        """A parallel copy has several tables in flight at once.
+
+        The payload used to be filtered down to finished tables plus the single
+        `current_table` name, so every other worker's table was invisible and
+        4-5 tables could migrate without ever appearing on the page.
+        """
+        import json
+        self.job.progress_stage = json.dumps({
+            "stage": "Copying data: dbo.orders (1200 rows)",
+            "percent": 48,
+            "tables_copied": 1,
+            "total_tables": 4,
+            "current_table": "dbo.orders",
+            "current_table_rows": 1200,
+            "active_tables": ["dbo.orders", "dbo.items"],
+            "table_progress": {
+                "dbo.done": {"rows_copied": 9, "done": True},
+                "dbo.orders": {"rows_copied": 1200, "done": False},
+                "dbo.items": {"rows_copied": 30, "done": False},
+                "dbo.queued": {"rows_copied": 0, "done": False, "pending": True},
+            },
+        })
+        self.job.save(update_fields=["progress_stage"])
+
+        payload = self.client.get(reverse("migrate-status", args=[self.job.pk])).json()
+
+        self.assertEqual(payload["progress_stage"], "Copying data: dbo.orders (1200 rows)")
+        self.assertEqual(payload["active_tables"], ["dbo.orders", "dbo.items"])
+        self.assertEqual(
+            set(payload["table_progress"]), {"dbo.done", "dbo.orders", "dbo.items"},
+        )
+        self.assertEqual(payload["table_progress"]["dbo.items"]["rows_copied"], 30)
+        self.assertNotIn("dbo.queued", payload["table_progress"])
+
     def test_history_serial_links_to_full_saved_report(self):
         self.job.status = MigrationJob.Status.COMPLETED
         self.job.progress_percent = 100

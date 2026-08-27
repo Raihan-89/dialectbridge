@@ -484,6 +484,7 @@ def migrate_status_view(request, pk):
     current_table_rows = 0
     current_table_total = 0
     table_progress = {}
+    active_tables = []
 
     if progress_stage and progress_stage.startswith("{"):
         try:
@@ -495,10 +496,14 @@ def migrate_status_view(request, pk):
             current_table = pdata.get("current_table", "")
             current_table_rows = pdata.get("current_table_rows", 0)
             current_table_total = pdata.get("current_table_total") or 0
-            # Filter table_progress to only done + current table for display
+            active_tables = pdata.get("active_tables") or []
+            # Every table that has finished or is actually being copied. Keying
+            # this off a single "current" name hid every other table a parallel
+            # copy had in flight, so several tables could migrate without ever
+            # appearing on the page. `pending` marks one that is only queued.
             raw_tp = pdata.get("table_progress", {})
             for tname, tdata in raw_tp.items():
-                if tdata.get("done") or tname == current_table:
+                if tdata.get("done") or not tdata.get("pending"):
                     table_progress[tname] = tdata
         except (json.JSONDecodeError, TypeError):
             pass
@@ -518,6 +523,7 @@ def migrate_status_view(request, pk):
         "current_table_rows": current_table_rows,
         "current_table_total": current_table_total,
         "table_progress": table_progress,
+        "active_tables": active_tables,
         "started_at": job.started_at.isoformat() if job.started_at else None,
     })
 
@@ -537,6 +543,7 @@ def migration_cancel_view(request, pk):
 def _run_migration_job(job_id: int) -> None:
     """Run a web-started migration outside the request and persist progress."""
     close_old_connections()
+    runner_thread = threading.current_thread()
     try:
         job = MigrationJob.objects.select_related("source", "target").get(pk=job_id)
         MigrationJob.objects.filter(pk=job_id).update(worker_pid=os.getpid())
@@ -547,7 +554,15 @@ def _run_migration_job(job_id: int) -> None:
 
         def progress(percent, stage, **kwargs):
             import json
-            if cancel_check():
+            # Batch progress during a parallel copy is reported from the pool's
+            # pump thread, which owns no Django connection. Close it after each
+            # write rather than leaving a second SQLite handle open all run.
+            on_runner = threading.current_thread() is runner_thread
+            if not on_runner:
+                close_old_connections()
+            # Only the runner thread may abort the migration: raising in the
+            # pump thread would kill the pump and leave the copy running.
+            if on_runner and cancel_check():
                 raise MigrationCancelledError("Migration cancelled by user")
             data = kwargs.get("data") or {}
             if data:

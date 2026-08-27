@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import re
+import threading
 from time import monotonic
 
 from engine.connectors.base import ConnectorError
@@ -35,6 +36,11 @@ logger = logging.getLogger("dialectbridge.migration")
 # Per-object cap on the SQL carried in the report. Enough for a real view or
 # routine, bounded so a pathological definition cannot bloat the stored JSON.
 _MAX_KEPT_SQL = 20_000
+
+# Per-batch copy callbacks fire many times a second across every worker and each
+# emit costs a database write. The portal polls at 800ms, so persisting more
+# often than this buys nothing the user can see.
+_PROGRESS_MIN_INTERVAL = 0.4
 
 _MISSING_RELATION_RE = re.compile(
     r'relation "([^"]+)" does not exist', re.IGNORECASE,
@@ -152,6 +158,12 @@ class MigrationOrchestrator:
         # only it knows whether the connectors can be rebuilt in a child.
         self.parallel_workers = max(1, int(parallel_workers or 1))
         self._table_progress: dict = {}
+        # A parallel copy reports batch progress from the pool's pump thread
+        # while the main thread finishes tables, so both the dict and the emit
+        # are shared state.
+        self._progress_lock = threading.Lock()
+        self._last_progress_emit = 0.0
+        self._current_table = ""
         self._source_objects: set[str] = set()
         self._visibility_cache: dict[str, bool] = {}
 
@@ -184,15 +196,62 @@ class MigrationOrchestrator:
             end = finished if (entry.get("done") and finished is not None) else now
             entry["elapsed_seconds"] = round(max(0.0, end - started), 3)
 
-    def _progress_phase(self, base: float, weight: float, stage: str, **extra) -> None:
-        """Emit progress as a weighted mix across the overall pipeline."""
+    def _table_progress_snapshot(self) -> dict:
+        """A stamped, private copy of the per-table progress.
+
+        The payload must never be the live dict: a parallel copy mutates it
+        from the pump thread while the emitting side serializes it, which
+        raises "dictionary changed size during iteration" mid-migration.
+        """
+        with self._progress_lock:
+            snapshot = {name: dict(entry) for name, entry in self._table_progress.items()}
+        self._stamp_elapsed(snapshot)
+        return snapshot
+
+    def _copy_fraction(self, total_tables: int) -> float:
+        """Completed-table equivalent, counting a running table's partial rows.
+
+        Whole tables used to be the only unit that moved the bar, so the one
+        table holding most of the rows left it frozen for its entire copy.
+        """
+        with self._progress_lock:
+            entries = [dict(entry) for entry in self._table_progress.values()]
+        done = 0.0
+        for entry in entries:
+            if entry.get("done"):
+                done += 1.0
+                continue
+            total = entry.get("total_rows")
+            if total:
+                done += min(1.0, (entry.get("rows_copied") or 0) / total)
+        return done / max(total_tables, 1)
+
+    def _progress_phase(self, base: float, weight: float, stage: str, *,
+                        throttle: bool = False, **extra) -> None:
+        """Emit progress as a weighted mix across the overall pipeline.
+
+        ``throttle`` rate-limits the emit to ``_PROGRESS_MIN_INTERVAL``. Only
+        the per-batch copy callbacks pass it: every worker reports every batch,
+        and each emit is a database write on the web job.
+        """
+        if self.progress_callback is None:
+            return
+        now = monotonic()
+        if throttle and (now - self._last_progress_emit) < _PROGRESS_MIN_INTERVAL:
+            return
+        self._last_progress_emit = now
         pct = min(100, max(0, int(base + weight)))
-        if self.progress_callback:
-            table_progress = extra.get("table_progress")
-            if table_progress:
-                self._stamp_elapsed(table_progress)
-            data = {"percent": pct, "stage": stage, **extra}
-            self.progress_callback(pct, stage, data=data)
+        if "table_progress" in extra:
+            snapshot = self._table_progress_snapshot()
+            extra["table_progress"] = snapshot
+            # A table nobody has picked up yet must not be listed as running:
+            # the parallel path registers every table before work starts.
+            extra.setdefault("active_tables", [
+                name for name, entry in snapshot.items()
+                if not entry.get("done") and not entry.get("pending")
+            ])
+        data = {"percent": pct, "stage": stage, **extra}
+        self.progress_callback(pct, stage, data=data)
 
     # --------------------------------------------------------------------------
     def run(self) -> MigrationReport:
@@ -305,21 +364,21 @@ class MigrationOrchestrator:
 
             def _on_table_batch(table_name: str, rows_so_far: int, batch_rows: int, total_expected: int | None) -> None:
                 self._check_cancelled()
-                tp = self._table_progress.get(table_name, {})
-                tp["rows_copied"] = rows_so_far
-                tp["current_batch"] = batch_rows
-                if total_expected is not None:
-                    tp["total_rows"] = total_expected
-                self._table_progress[table_name] = tp
-
-                copied_tables = sum(1 for v in self._table_progress.values() if v.get("done"))
-                base = 35
-                weight = (copied_tables / max(total_to_copy, 1)) * 40
-                self._progress_phase(base, weight,
+                with self._progress_lock:
+                    tp = self._table_progress.setdefault(table_name, {})
+                    tp["rows_copied"] = rows_so_far
+                    tp["current_batch"] = batch_rows
+                    if total_expected is not None:
+                        tp["total_rows"] = total_expected
+                    table_total = tp.get("total_rows")
+                    copied_tables = sum(1 for v in self._table_progress.values() if v.get("done"))
+                self._current_table = table_name
+                self._progress_phase(35, self._copy_fraction(total_to_copy) * 40,
                                      f"Copying data: {table_name} ({rows_so_far} rows)",
+                                     throttle=True,
                                      tables_copied=copied_tables, total_tables=total_to_copy,
                                      current_table=table_name, current_table_rows=rows_so_far,
-                                     current_table_total=total_expected,
+                                     current_table_total=table_total,
                                      table_progress=self._table_progress)
 
             if self.parallel_workers > 1 and total_to_copy > 1 and self._copy_tables_parallel(
@@ -590,34 +649,75 @@ class MigrationOrchestrator:
 
         total = len(tables)
         for index, table in enumerate(tables, 1):
+            # `pending` until a worker actually picks the table up. Stamping
+            # every table as started here listed all of them as in flight and
+            # charged a queued table for the whole time it sat in the queue.
             self._table_progress[table.name] = {
-                "index": index, "rows_copied": 0, "done": False,
-                "table_started": monotonic(),
+                "index": index, "rows_copied": 0, "done": False, "pending": True,
             }
 
+        def _start(entry: dict) -> None:
+            """Mark a table as actually running (callers hold the lock)."""
+            if entry.pop("pending", False) or "table_started" not in entry:
+                entry["table_started"] = monotonic()
+
         def _progress(table_name, rows_so_far, batch_rows, total_expected):
-            entry = self._table_progress.setdefault(table_name, {})
-            entry["rows_copied"] = rows_so_far
-            entry["current_batch"] = batch_rows
-            if total_expected is not None:
-                entry["total_rows"] = total_expected
+            with self._progress_lock:
+                entry = self._table_progress.setdefault(table_name, {})
+                _start(entry)
+                entry["rows_copied"] = rows_so_far
+                entry["current_batch"] = batch_rows
+                if total_expected is not None:
+                    entry["total_rows"] = total_expected
+                table_total = entry.get("total_rows")
+                finished = sum(1 for v in self._table_progress.values() if v.get("done"))
+            self._current_table = table_name
+            # Persisting only on completion was the whole bug: the portal
+            # learned of a table when it *finished*, so it kept showing the
+            # previously copied table and its final count until the next one
+            # landed — for the biggest table, the entire copy phase.
+            self._progress_phase(
+                35, self._copy_fraction(total) * 40,
+                f"Copying data: {table_name} ({rows_so_far} rows)",
+                throttle=True,
+                tables_copied=finished, total_tables=total,
+                current_table=table_name, current_table_rows=rows_so_far,
+                current_table_total=table_total,
+                table_progress=self._table_progress,
+            )
 
         def _done(table_name, result, error):
             self._check_cancelled()
-            entry = self._table_progress.setdefault(table_name, {})
-            entry["done"] = True
-            entry["table_finished"] = monotonic()
             if error is not None:
                 result = {"rows_copied": 0, "rows_failed": 0, "errors": [error]}
-            entry["rows_copied"] = result["rows_copied"]
-            self._record_copy_result(report, table_name, result,
-                                     entry.get("table_started", monotonic()))
-            finished = sum(1 for v in self._table_progress.values() if v.get("done"))
+            with self._progress_lock:
+                entry = self._table_progress.setdefault(table_name, {})
+                _start(entry)
+                entry["done"] = True
+                entry["table_finished"] = monotonic()
+                entry["rows_copied"] = result["rows_copied"]
+                started = entry["table_started"]
+                just_finished = dict(entry)
+                finished = sum(1 for v in self._table_progress.values() if v.get("done"))
+                running = [
+                    (name, dict(v)) for name, v in self._table_progress.items()
+                    if not v.get("done") and not v.get("pending")
+                ]
+            self._record_copy_result(report, table_name, result, started)
+            # The table that just finished must not be reported as the one in
+            # progress — naming it is what made the portal display an
+            # already-copied table. Hand over to one that is still running.
+            if self._current_table in (table_name, ""):
+                self._current_table = running[0][0] if running else ""
+            shown = next((v for name, v in running if name == self._current_table),
+                         just_finished)
             self._progress_phase(
-                35, (finished / max(total, 1)) * 40,
+                35, self._copy_fraction(total) * 40,
                 f"Copied {finished}/{total} tables",
                 tables_copied=finished, total_tables=total,
-                current_table=table_name, current_table_rows=entry["rows_copied"],
+                current_table=self._current_table or table_name,
+                current_table_rows=shown.get("rows_copied", 0),
+                current_table_total=shown.get("total_rows"),
                 table_progress=self._table_progress,
             )
 

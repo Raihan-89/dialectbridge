@@ -30,7 +30,7 @@ Two capabilities in one Django app:
 - Row-level Data explorer with primary-key alignment, changed-value highlighting, pagination and full-table canonical SHA-256 fingerprint verification
 - Downloadable whole-table verification reports
 - Read-only pre-migration assessment with compatibility blockers, warnings and generated target-DDL preview
-- Background web migrations with persisted phase/percentage progress and live polling
+- Background web migrations with persisted phase/percentage progress and live polling, showing every table currently being copied and its row count as it climbs
 - Complete migration history: each migration serial links back to its saved full report
 - Captured migration errors on a dedicated **Errors** page (`/errors/`), filterable by object kind / job / keyword
 - Optional destructive `reset_target` mode for clean re-runs

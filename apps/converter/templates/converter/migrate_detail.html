@@ -519,9 +519,14 @@
             tablesValue.textContent = data.tables_copied || 0;
             tablesTotal.textContent = data.total_tables;
         }
+        const active = data.active_tables || [];
         if (data.current_table) {
             currentStat.style.display = '';
-            currentTable.textContent = data.current_table;
+            // Several tables copy at once in the worker pool, so naming only
+            // one made it look as though the rest were not running.
+            currentTable.textContent = active.length > 1
+                ? data.current_table + ' +' + (active.length - 1) + ' more'
+                : data.current_table;
         }
         if (data.current_table_rows > 0) {
             rowsStat.style.display = '';
@@ -536,7 +541,10 @@
             for (const name of keys) {
                 const t = tp[name];
                 const isDone = t.done;
-                const isCurrent = name === data.current_table && !isDone;
+                // The payload carries finished and in-flight tables only, so
+                // anything not done is being copied right now. Matching a single
+                // `current_table` name left every other worker's table unmarked.
+                const isCurrent = !isDone;
                 const rowCls = isCurrent ? ' current' : '';
                 const statusCls = isDone ? ' done' : (isCurrent ? ' active' : '');
                 const rows = t.rows_copied != null ? formatRows(t.rows_copied) : '…';
